@@ -1,6 +1,16 @@
 from valuationagent.application.document_retrieval import rank_document_blocks
 
 
+def test_dated_issuer_total_is_retrieved_ahead_of_share_change_history():
+    rows = [
+        {"block_id": "history", "location": {"page": 71},
+         "text": "股份总数 6,366,098,705 -198,000 6,365,900,705"},
+        {"block_id": "dated", "location": {"page": 2},
+         "text": "截至2025年4月8日，公司总股本 6,365,900,705股。"},
+    ]
+    assert rank_document_blocks(rows, "股份总数")[0]["block_id"] == "dated"
+
+
 def block(key, text, page):
     return {"block_id": key, "text": text, "location": {"page": page}}
 

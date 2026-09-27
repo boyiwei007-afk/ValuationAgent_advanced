@@ -112,11 +112,26 @@ class FinancialSnapshot(ApiModel):
     change_operating_nwc: JsonDecimal | None = None
     cash_and_non_operating_assets: JsonDecimal | None = Field(default=None, ge=0)
     interest_bearing_debt: JsonDecimal | None = Field(default=None, ge=0)
-    common_shares: JsonDecimal = Field(gt=0)
+    common_shares: JsonDecimal | None = Field(default=None, gt=0)
+    diluted_shares: JsonDecimal | None = Field(default=None, gt=0)
     # Per-share denominator can be disclosed after the fiscal baseline.
     # This date is explicit so a later issuer total is not disguised as the
     # year-end balance-sheet share count.
     common_shares_as_of: date | None = None
+    diluted_shares_as_of: date | None = None
+    # Explicit enterprise-value to common-equity bridge inputs.  ``None``
+    # means the line was not established; it must never be silently read as
+    # zero by an extractor.  Values may also remain in ``statement_items`` for
+    # backwards-compatible evidence replay.
+    lease_liabilities: JsonDecimal | None = Field(default=None, ge=0)
+    interest_bearing_debt_includes_leases: bool | None = None
+    minority_interest: JsonDecimal | None = None
+    preferred_equity: JsonDecimal | None = Field(default=None, ge=0)
+    associates_and_non_operating_investments: JsonDecimal | None = Field(
+        default=None, ge=0
+    )
+    unfunded_pension: JsonDecimal | None = Field(default=None, ge=0)
+    non_operating_provisions: JsonDecimal | None = Field(default=None, ge=0)
     net_income_parent: JsonDecimal | None = None
     ebitda: JsonDecimal | None = None
     source_label: str = "user_structured_input"
@@ -157,6 +172,7 @@ class PeerCompany(ApiModel):
     peer_tier: Literal["core", "broad", "user"] = "user"
     rationale: str = "user-provided comparable"
     as_of_date: date | None = None
+    financial_period_end: date | None = None
     multiple_basis: Literal["FY", "TTM", "forward", "unknown"] = "unknown"
     evidence: dict[str, list[EvidenceRef]] = Field(default_factory=dict)
 
@@ -212,6 +228,16 @@ class AssumptionInputs(ApiModel):
     )
     exit_multiple: JsonDecimal | None = Field(default=None, gt=0, le=Decimal("100"))
     tax_transition_years: int | None = Field(default=None, ge=0, le=10)
+    stable_roic: JsonDecimal | None = Field(
+        default=None, gt=Decimal("0.001"), le=Decimal("1")
+    )
+    market_inputs_as_of: date | None = None
+    market_inputs_source: str = Field(default="", max_length=500)
+    market_inputs_stale_after_days: int = Field(default=31, ge=1, le=366)
+    lease_treatment: Literal["capitalized"] = "capitalized"
+    equity_bridge_policy: Literal[
+        "use_disclosed_book_values", "require_market_values"
+    ] = "use_disclosed_book_values"
 
     @field_validator("revenue_growth", "ebit_margin")
     @classmethod
@@ -314,6 +340,15 @@ class ValuationRequest(ApiModel):
                 snapshot.period_end <= snapshot.common_shares_as_of <= self.valuation_date
             ):
                 raise ValueError("issuer share-count date must fall between the financial period end and valuation date")
+            if snapshot.diluted_shares_as_of and not (
+                snapshot.period_end <= snapshot.diluted_shares_as_of <= self.valuation_date
+            ):
+                raise ValueError("diluted share-count date must fall between the financial period end and valuation date")
+        if (
+            self.assumptions.market_inputs_as_of
+            and self.assumptions.market_inputs_as_of > self.valuation_date
+        ):
+            raise ValueError("market input date cannot be later than the valuation date")
         if not self.requested_methods:
             self.requested_methods = list(self.methods)
         if not set(self.methods) <= set(self.requested_methods):
@@ -424,6 +459,12 @@ class DcfResult(ApiModel):
     exit_multiple_cross_check: JsonDecimal | None = None
     exit_multiple_per_share: JsonDecimal | None = None
     terminal_method_gap: JsonDecimal | None = None
+    terminal_nopat: JsonDecimal | None = None
+    terminal_reinvestment_rate: JsonDecimal | None = None
+    terminal_reinvestment: JsonDecimal | None = None
+    terminal_fcff: JsonDecimal | None = None
+    stable_roic: JsonDecimal | None = None
+    bridge_unmeasured_items: list[str] = Field(default_factory=list)
 
 
 class MultipleResult(ApiModel):
@@ -482,6 +523,11 @@ class DataQualityAssessment(ApiModel):
     industry_metadata_completeness: str = "unknown"
     peer_sample_quality: str = "not_requested"
     confidence: Literal["high", "medium", "low"] = "low"
+    result_grade: Literal["A", "B", "C", "D"] = "C"
+    market_input_quality: Literal[
+        "verified_current", "verified_stale", "unverified", "not_applicable"
+    ] = "unverified"
+    degraded_fields: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 

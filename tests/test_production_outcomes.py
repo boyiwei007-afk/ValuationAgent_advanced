@@ -117,6 +117,24 @@ def test_peer_date_and_denominator_mismatch_are_blocked(changes, code):
     assert any(f.rule_id == code for f in validate_peer_inputs(req, [peer]))
 
 
+def test_peer_fiscal_period_and_mixed_pricing_dates_are_blocked():
+    req = request().model_copy(update={"methods": ["pe"]})
+    peers = [
+        PeerCompany(
+            ticker="TEST1", name="同业一", pe="12", multiple_basis="FY",
+            as_of_date=date(2026, 9, 20),
+            financial_period_end=date(2024, 12, 31),
+        ),
+        PeerCompany(
+            ticker="TEST2", name="同业二", pe="13", multiple_basis="FY",
+            as_of_date=date(2026, 9, 21),
+            financial_period_end=req.financials.period_end,
+        ),
+    ]
+    rules = {finding.rule_id for finding in validate_peer_inputs(req, peers)}
+    assert {"PEER_FISCAL_PERIOD", "PEER_MIXED_PRICING_DATES"} <= rules
+
+
 def test_duplicate_peers_are_not_counted_as_independent_companies():
     req = request().model_copy(update={"methods": ["pe"]})
     peers = [PeerCompany(ticker=t, name="合成同业", pe="12") for t in ["600123", "600123.SH", "600125"]]

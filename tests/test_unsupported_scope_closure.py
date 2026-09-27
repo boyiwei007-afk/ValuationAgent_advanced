@@ -5,9 +5,9 @@ from test_research_sessions import ScriptedModel
 
 
 def risk_fact(**updates):
-    values = dict(fact_id="fixture_risk", metric="少数股东权益", raw_value="10", normalized_value="100000",
+    values = dict(fact_id="fixture_risk", metric="受限货币资金", raw_value="10", normalized_value="100000",
                   unit="万元", period="2025", scope="consolidated", block_id="file_test:1",
-                  quote="少数股东权益 10 9", status="proposed")
+                  quote="受限货币资金 10 9", status="proposed")
     values.update(updates)
     return FactCandidate(**values)
 
@@ -29,11 +29,11 @@ def test_other_selected_equity_method_can_still_collect_its_own_inputs(tmp_path)
 
 def test_unsupported_scope_stops_tool_loop_with_saved_report(tmp_path):
     model = ScriptedModel([("propose_facts", {"candidates": [{
-        "metric": "少数股东权益", "raw_value": "10", "unit": "万元", "period": "2025",
-        "scope": "consolidated", "block_id": "file_test:1", "quote": "少数股东权益 10 9",
+        "metric": "受限货币资金", "raw_value": "10", "unit": "万元", "period": "2025",
+        "scope": "consolidated", "block_id": "file_test:1", "quote": "受限货币资金 10 9",
     }]})])
     service, session, source = configured_service(tmp_path, model)
-    source["text"] += "\n少数股东权益 10 9"
+    source["text"] += "\n受限货币资金 10 9"
     service.store.save_research_blocks(session.session_id, "file_test", [source])
     state = service.turn(session.session_id, ResearchTurn(content="开始自动化DCF估值"))
     assert state["session"]["question"] is None

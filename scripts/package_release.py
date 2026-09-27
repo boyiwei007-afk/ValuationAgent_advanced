@@ -1,7 +1,7 @@
 """Package the inspected working tree, never .env, databases or local history.
 
 python scripts/package_release.py --include-current-acceptance
-python scripts/package_release.py --verify output/release/ValuationAgent-20260927-v11.zip
+python scripts/package_release.py --verify output/release/ValuationAgent-20260927-v14.zip
 """
 import argparse
 import hashlib
@@ -88,11 +88,12 @@ def verify(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output', type=Path, default=ROOT / 'output/release/ValuationAgent-20260927-v11.zip')
+    parser.add_argument('--output', type=Path, default=ROOT / 'output/release/ValuationAgent-20260927-v14.zip')
     parser.add_argument('--verify', type=Path)
     parser.add_argument('--include-acceptance', action='store_true', help='Include only this dated synthetic acceptance fixture and public-source probe metadata')
     parser.add_argument('--include-current-acceptance', action='store_true', help='Include only 2026-09-26 synthetic reports and bounded live-check metadata')
     parser.add_argument('--include-real-acceptance', action='store_true', help='Include 2026-09-27 real-company summaries and public source hashes, never annual-report PDFs or databases')
+    parser.add_argument('--include-submission-acceptance', action='store_true', help='Include v13 independent no-data arithmetic acceptance and real-company research summary')
     args = parser.parse_args()
     if args.verify:
         print(json.dumps(verify(args.verify), indent=2))
@@ -178,9 +179,21 @@ def main():
         entries['acceptance/v9/verified-zero-upload/600887/acceptance.json'] = (real_root / 'zero-upload-verified-20260927/600887/acceptance.json').read_bytes()
         entries['acceptance/v9/final-closure/000333/acceptance.json'] = (real_root / 'closure-20260927/000333/acceptance.json').read_bytes()
         entries['acceptance/v9/final-zero-upload-closure/600887/acceptance.json'] = (real_root / 'zero-upload-closure-20260927/600887/acceptance.json').read_bytes()
+    if args.include_submission_acceptance:
+        local = ROOT / 'output/acceptance-20260927-v13'
+        for name in ('acceptance.json', 'no-data-outcome.json', 'no-data-outcome.html',
+                     'no-data-outcome.pdf', 'unfinished-run-diagnostic.pdf'):
+            entries['acceptance/v13/local/' + name] = (local / name).read_bytes()
+        real_root = ROOT / 'var/real-company-20260926'
+        entries['acceptance/v13/real-upload/600887/acceptance.json'] = (
+            real_root / 'v13-share-recheck-20260927/600887/acceptance.json'
+        ).read_bytes()
+        entries['acceptance/v13/sources/600887/manifest.json'] = (
+            real_root / 'sources/600887/manifest.json'
+        ).read_bytes()
     for name, data in entries.items():
         validate_entry(name, data)
-    manifest = {'schema': 'valuationagent-release-v1', 'version': '0.5.0-real-data-20260927-v11',
+    manifest = {'schema': 'valuationagent-release-v1', 'version': '0.5.0-independent-acceptance-20260927-v14',
                 'source': 'inspected working tree, including uncommitted changes',
                 'excludes': ['environment configuration except root .env.example', 'recognized credentials',
                              'keys and certificates', 'user data directories', 'databases and journals',

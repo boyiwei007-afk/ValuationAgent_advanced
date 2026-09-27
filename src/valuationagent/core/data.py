@@ -155,14 +155,14 @@ class LocalDataProvider:
             payload, meta = self.read_json(
                 store, request.assumption_file_ids, "assumptions"
             )
-            if assumptions.model_dump(exclude_none=True):
+            if assumptions.model_dump(exclude_none=True, exclude_defaults=True):
                 raise ValueError(
                     "文件假设与手工假设不能同时生效，请通过复核选择一个来源。"
                 )
             assumptions = AssumptionInputs.model_validate(
                 payload.get("assumptions", payload)
             )
-            for key in assumptions.model_dump(exclude_none=True):
+            for key in assumptions.model_dump(exclude_none=True, exclude_defaults=True):
                 evidence[key] = [
                     EvidenceRef(
                         evidence_id=f"{meta['file_id']}:{key}",
@@ -172,7 +172,7 @@ class LocalDataProvider:
                     )
                 ]
         elif request.assumption_source == "manual" and not assumptions.model_dump(
-            exclude_none=True
+            exclude_none=True, exclude_defaults=True
         ):
             raise ValueError("已选择手工假设，但尚未填写任何假设。")
         return DataBundle(

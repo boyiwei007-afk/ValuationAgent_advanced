@@ -13,6 +13,11 @@ from valuationagent.finance.industry import (
 )
 from valuationagent.finance.reference import ReferenceFinancialModel
 from valuationagent.finance.integrity import validate_equity_bridge_inputs
+from valuationagent.finance.production import (
+    effective_capitalized_debt,
+    normalized_terminal_cash_flow,
+    resolve_equity_bridge,
+)
 from valuationagent.finance.revenue import FinanceTeamRevenueModel
 from valuationagent.schemas.models import (
     AssumptionSet,
@@ -72,7 +77,7 @@ class FinanceTeamModel:
     """Deterministic implementation of the supplied non-financial A-share model."""
 
     plugin_id = "finance_team_nonfinancial_fcff_relative"
-    version = "1.3.0-finance-team-20260925"
+    version = "1.4.0-finance-team-production-20260927"
     supports_incremental_inputs = True
 
     def __init__(self, registry: IndustryParameterRegistry | None = None):
@@ -124,8 +129,16 @@ class FinanceTeamModel:
         self, request: ValuationRequest, financials: FinancialSnapshot
     ) -> list[ValidationFinding]:
         bridge_findings = validate_equity_bridge_inputs(request, financials)
-        if bridge_findings:
-            return [*self.reference.validate(request, financials), *bridge_findings]
+        blocking_bridge = [item for item in bridge_findings if item.severity == "blocking"]
+        if blocking_bridge:
+            return [
+                *self.reference.validate(
+                    request,
+                    financials,
+                    allow_dcf_driver_degradation=True,
+                ),
+                *bridge_findings,
+            ]
         if self._use_reference_compatibility(request):
             findings = self.reference.validate(request, financials)
             if request.mode != "demo":
@@ -141,7 +154,12 @@ class FinanceTeamModel:
                     )
                 )
             return findings
-        findings = self.reference.validate(request, financials)
+        findings = self.reference.validate(
+            request,
+            financials,
+            allow_dcf_driver_degradation=True,
+        )
+        findings.extend(bridge_findings)
         if "dcf" not in request.methods or any(f.severity == "blocking" for f in findings):
             return findings
         try:
@@ -165,14 +183,38 @@ class FinanceTeamModel:
             )
             return findings
         raw_history = [*request.historical_financials, financials]
-        from valuationagent.schemas.models import required_financial_metrics
+        historical_core = {"revenue", "ebit_margin"}
+        degradable_dcf_fields = {
+            "depreciation_amortization",
+            "capital_expenditure",
+            "change_operating_nwc",
+        }
+        degraded_years: dict[str, list[int]] = {
+            key: [] for key in degradable_dcf_fields
+        }
         for row in raw_history:
             if row.comparability_status == "excluded":
                 continue
-            missing = sorted(key for key in required_financial_metrics(["dcf"]) if getattr(row, key) is None)
+            missing = sorted(key for key in historical_core if getattr(row, key) is None)
             if missing:
-                findings.append(ValidationFinding(rule_id="HISTORY_METHOD_INPUTS_MISSING", severity="blocking",
-                    message=f"{row.period_end} 历史DCF输入不完整：" + "、".join(missing)))
+                findings.append(ValidationFinding(
+                    rule_id="HISTORY_CORE_INPUTS_MISSING",
+                    severity="blocking",
+                    message=f"{row.period_end} 历史收入/利润率输入不完整：" + "、".join(missing),
+                ))
+            for key in degradable_dcf_fields:
+                if getattr(row, key) is None:
+                    degraded_years[key].append(row.period_end.year)
+        for key, years in degraded_years.items():
+            if years:
+                findings.append(ValidationFinding(
+                    rule_id="HISTORY_DRIVER_DEGRADED_" + key.upper(),
+                    severity="warning",
+                    message=(
+                        f"{key}在历史年度" + "、".join(map(str, years))
+                        + "缺失；模型将按可得历史比例或显式低置信默认值降级，不再把缺失当作零。"
+                    ),
+                ))
         if any(f.severity == "blocking" for f in findings):
             return findings
         active_history = [
@@ -409,6 +451,74 @@ class FinanceTeamModel:
                         recommended_action="联网取得基准日中国10年期国债收益率、ERP、Beta与债务成本并附来源。",
                     )
                 )
+        market_as_of = request.assumptions.market_inputs_as_of
+        market_source = request.assumptions.market_inputs_source.strip()
+        if market_as_of is None:
+            findings.append(
+                ValidationFinding(
+                    rule_id="WACC_MARKET_DATE_UNVERIFIED",
+                    severity="warning",
+                    message=(
+                        "WACC市场参数未记录基准日；数值结果将降为低置信并扩大WACC区间，"
+                        "不得把模型默认值表述为估值日事实。"
+                    ),
+                    recommended_action="记录Rf、ERP、Beta、Kd和市值快照的估值日或最近交易日。",
+                )
+            )
+        else:
+            age = (request.valuation_date - market_as_of).days
+            if age > request.assumptions.market_inputs_stale_after_days:
+                findings.append(
+                    ValidationFinding(
+                        rule_id="WACC_MARKET_DATA_STALE",
+                        severity="warning",
+                        message=(
+                            f"WACC市场参数距估值日{age}天，超过"
+                            f"{request.assumptions.market_inputs_stale_after_days}天新鲜度阈值；"
+                            "结果将降低置信等级并扩大区间。"
+                        ),
+                    )
+                )
+        if not market_source:
+            findings.append(
+                ValidationFinding(
+                    rule_id="WACC_MARKET_SOURCE_UNVERIFIED",
+                    severity="warning",
+                    message="WACC市场参数未记录可核验来源；报告将明确标记为未核验输入。",
+                )
+            )
+        if (
+            request.assumptions.stable_roic is not None
+            and request.assumptions.stable_roic
+            <= (
+                request.assumptions.terminal_growth
+                if request.assumptions.terminal_growth is not None
+                else D("0.03")
+            )
+        ):
+            findings.append(
+                ValidationFinding(
+                    rule_id="STABLE_ROIC_NOT_ABOVE_GROWTH",
+                    severity="blocking",
+                    message="用户指定的稳定期ROIC必须高于永续增长率，否则g/ROIC再投资率不成立。",
+                )
+            )
+        if (
+            request.assumptions.wacc is not None
+            and request.assumptions.wacc
+            <= (
+                request.assumptions.terminal_growth
+                if request.assumptions.terminal_growth is not None
+                else D("0.03")
+            )
+        ):
+            findings.append(
+                ValidationFinding(
+                    rule_id="WACC_NOT_ABOVE_TERMINAL_GROWTH",
+                    severity="blocking",
+                    message="WACC必须高于永续增长率，否则Gordon终值不成立。",
+                )
+            )
         required_assets = {
             "fixed_assets_net",
             "intangible_assets",
@@ -564,14 +674,51 @@ class FinanceTeamModel:
         marginal_tax_rate: Decimal,
     ) -> tuple[Decimal, dict[str, Decimal], str]:
         supplied = request.assumptions
+        market_age = (
+            D((request.valuation_date - supplied.market_inputs_as_of).days)
+            if supplied.market_inputs_as_of is not None
+            else D(-1)
+        )
+        market_verified = D(
+            int(
+                supplied.market_inputs_as_of is not None
+                and bool(supplied.market_inputs_source.strip())
+            )
+        )
+        market_stale = D(
+            int(
+                market_age >= 0
+                and market_age > D(supplied.market_inputs_stale_after_days)
+            )
+        )
         if supplied.wacc is not None:
-            return supplied.wacc, {"wacc": supplied.wacc}, "用户指定WACC"
-        rf = supplied.risk_free_rate or (
+            return supplied.wacc, {
+                "wacc": supplied.wacc,
+                "manual_wacc": D(1),
+                "market_inputs_age_days": market_age,
+                "market_inputs_verified": market_verified,
+                "market_inputs_stale": market_stale,
+                "wacc_default_count": D(0),
+            }, "用户指定WACC；市场参数日期与来源仍单独披露"
+        rf = supplied.risk_free_rate if supplied.risk_free_rate is not None else (
             D("0.0168") if request.valuation_date >= date(2026, 1, 1) else D("0.0185")
         )
-        erp = supplied.equity_risk_premium or D("0.06")
-        beta = supplied.beta or beta_default
-        kd = supplied.debt_cost or D("0.045")
+        erp = (
+            supplied.equity_risk_premium
+            if supplied.equity_risk_premium is not None
+            else D("0.06")
+        )
+        beta = supplied.beta if supplied.beta is not None else beta_default
+        kd = supplied.debt_cost if supplied.debt_cost is not None else D("0.045")
+        default_count = sum(
+            value is None
+            for value in (
+                supplied.risk_free_rate,
+                supplied.equity_risk_premium,
+                supplied.beta,
+                supplied.debt_cost,
+            )
+        )
         market_cap = (
             supplied.quarterly_average_market_cap
             or financials.statement_items.get("quarterly_average_market_cap")
@@ -579,7 +726,10 @@ class FinanceTeamModel:
             or financials.statement_items.get("market_cap")
             or financials.statement_items.get("total_equity")
         )
-        debt = financials.interest_bearing_debt
+        # Capitalized leases are debt for both the WACC weights and the
+        # enterprise-to-equity bridge.  Resolve them with the same policy to
+        # avoid discounting lease cash flows with an inconsistent capital mix.
+        debt = effective_capitalized_debt(financials)[0]
         if market_cap is None:
             equity_weight, debt_weight = D(1), D(0)
             weight_note = "缺少市值/权益数据，暂按100%股权权重"
@@ -606,6 +756,11 @@ class FinanceTeamModel:
             "equity_weight": equity_weight,
             "debt_weight": debt_weight,
             "wacc": wacc,
+            "manual_wacc": D(0),
+            "market_inputs_age_days": market_age,
+            "market_inputs_verified": market_verified,
+            "market_inputs_stale": market_stale,
+            "wacc_default_count": D(default_count),
         }, weight_note
 
     def resolve_assumptions(
@@ -615,7 +770,11 @@ class FinanceTeamModel:
             return self.reference.resolve_assumptions(request, financials)
         industry = self.registry.resolve(request.company.industry)
         history = self._history(request, financials)
-        terminal_growth = request.assumptions.terminal_growth or D("0.03")
+        terminal_growth = (
+            request.assumptions.terminal_growth
+            if request.assumptions.terminal_growth is not None
+            else D("0.03")
+        )
         decisions: list[str] = [
             "全球行业增速仅作有限期合理性校验，不直接作为永续增长率。",
             "金融行业被排除，参数库不会为金融公司返回通用FCFF参数。",
@@ -674,6 +833,38 @@ class FinanceTeamModel:
         if terminal_growth >= wacc:
             raise ValueError("永续增长率必须低于WACC。")
         decisions.append(weight_note)
+        if request.assumptions.stable_roic is not None:
+            if request.assumptions.stable_roic <= terminal_growth:
+                raise ValueError("稳定期ROIC必须高于永续增长率。")
+            stable_roic = request.assumptions.stable_roic
+            stable_roic_note = "稳定期ROIC使用用户已确认输入"
+            stable_roic_policy_fallback = False
+        else:
+            invested_capital = financials.statement_items.get("invested_capital")
+            if invested_capital is not None and invested_capital > 0:
+                current_ebit = financials.revenue * financials.ebit_margin
+                current_nopat = current_ebit - max(current_ebit, ZERO) * terminal_tax
+                observed_roic = current_nopat / invested_capital
+                stable_roic = min(D("0.30"), max(D("0.06"), observed_roic))
+                stable_roic_note = "稳定期ROIC由最新NOPAT/投入资本推导并限制在6%–30%审慎区间"
+                stable_roic_policy_fallback = stable_roic != observed_roic
+            else:
+                lifecycle_roic = {
+                    "成长期": D("0.15"),
+                    "成熟期": D("0.10"),
+                    "衰退期": D("0.08"),
+                }
+                stable_roic = lifecycle_roic.get(industry.lifecycle, D("0.10"))
+                stable_roic_note = "缺少投入资本，稳定期ROIC使用按生命周期披露的低置信政策值"
+                stable_roic_policy_fallback = True
+        stable_roic = max(stable_roic, terminal_growth + D("0.01"))
+        decisions.append(
+            stable_roic_note
+            + f"；稳定期再投资率=g/ROIC={terminal_growth / stable_roic:.2%}。"
+        )
+        decisions.append(
+            "预测EBIT为负时不预设当期可收取所得税退款；税亏结转及以后年度抵扣未单独建模。"
+        )
         capex_alpha, capex_kappa, capex_method, capex_note = self._capex_drivers(
             request, history
         )
@@ -693,7 +884,60 @@ class FinanceTeamModel:
             "operating_cash_ratio": _q(
                 request.assumptions.operating_cash_ratio or D(0)
             ),
+            "stable_roic": _q(stable_roic),
+            "stable_roic_policy_fallback": D(int(stable_roic_policy_fallback)),
+            "operating_cash_policy_fallback": D(
+                int(
+                    request.assumptions.operating_cash_ratio is None
+                    and financials.cash_and_non_operating_assets > ZERO
+                )
+            ),
         }
+        if operating_drivers["operating_cash_policy_fallback"]:
+            decisions.append(
+                "经营必需现金比例未建立；暂按0计算可分配现金，可能高估普通股价值，"
+                "结果按低置信等级披露。"
+            )
+        da_ratios = [
+            row.depreciation_amortization / row.revenue
+            for row in history[-5:]
+            if row.depreciation_amortization is not None
+        ]
+        capex_ratios = [
+            row.capital_expenditure / row.revenue
+            for row in history[-5:]
+            if row.capital_expenditure is not None
+        ]
+        da_ratio = D(str(median(da_ratios))) if da_ratios else D("0.03")
+        capex_ratio = (
+            D(str(median(capex_ratios)))
+            if capex_ratios
+            else max(da_ratio, D("0.05"))
+        )
+        operating_drivers["da_revenue_ratio"] = _q(da_ratio)
+        operating_drivers["capex_revenue_ratio"] = _q(capex_ratio)
+        operating_drivers["da_policy_fallback"] = D(
+            int(not da_ratios and self._asset_rates(history) is None)
+        )
+        operating_drivers["capex_policy_fallback"] = D(
+            int(
+                not capex_ratios
+                and capex_method == "revenue_ratio_fallback"
+            )
+        )
+        if not da_ratios:
+            decisions.append("D&A历史值不可得，采用收入3%低置信比例并进入扩大敏感性区间。")
+        if not capex_ratios:
+            decisions.append("CapEx历史值不可得，采用收入比例政策值并明确标记为降级。")
+        wacc_range_delta = (
+            D("0.02")
+            if components.get("market_inputs_verified", D(0)) == 0
+            or components.get("wacc_default_count", D(0)) > 0
+            else D("0.015")
+            if components.get("market_inputs_stale", D(0)) > 0
+            else D("0.01")
+        )
+        operating_drivers["wacc_range_delta"] = wacc_range_delta
         operating_drivers.update(
             {key: _q(value) for key, value in revenue_drivers.items()}
         )
@@ -719,6 +963,7 @@ class FinanceTeamModel:
                 "wacc": "CAPM与资本结构；" + weight_note,
                 "terminal_growth": "长期稳态参数，默认3%；与有限期全球行业增速分开",
                 "tax": f"实际税率{financials.tax_rate:.2%}向可持续税率{terminal_tax:.2%}过渡",
+                "stable_roic": stable_roic_note,
             },
             revenue_growth_scenarios={
                 key: [_q(x) for x in values] for key, values in revenue_scenarios.items()
@@ -732,9 +977,14 @@ class FinanceTeamModel:
             model_decisions=decisions,
             operating_drivers=operating_drivers,
             calculation_methods={
+                "depreciation_amortization": (
+                    "policy_3_percent_revenue"
+                    if operating_drivers["da_policy_fallback"]
+                    else "asset_rollforward_or_historical_revenue_ratio"
+                ),
                 "capex": capex_method,
                 "change_operating_nwc": nwc_method,
-                "terminal_value": "gordon_growth_primary_exit_multiple_cross_check",
+                "terminal_value": "gordon_growth_normalized_reinvestment",
                 **ebit_methods,
             },
         )
@@ -756,13 +1006,20 @@ class FinanceTeamModel:
         rates: dict[str, Decimal] = {}
         for name, (balance_key, charge_key) in pairs.items():
             values = []
-            for row in history[-5:]:
+            for previous, row in pairwise(history[-6:]):
                 if name == "right_of_use" and row.period_end.year < 2019:
                     continue
-                balance = row.statement_items.get(balance_key)
+                opening = previous.statement_items.get(balance_key)
+                closing = row.statement_items.get(balance_key)
                 charge = row.statement_items.get(charge_key)
-                if balance and charge is not None:
-                    values.append(charge / balance)
+                if (
+                    opening is not None
+                    and closing is not None
+                    and opening + closing > 0
+                    and charge is not None
+                ):
+                    average_balance = (opening + closing) / D(2)
+                    values.append(charge / average_balance)
             if len(values) < 3:
                 return None
             rates[name] = D(str(median(values)))
@@ -788,6 +1045,13 @@ class FinanceTeamModel:
         kappas: list[Decimal] = []
         recent = history[-6:]
         for previous, current in pairwise(recent):
+            if (
+                previous.revenue is None
+                or current.revenue is None
+                or current.capital_expenditure is None
+                or current.depreciation_amortization is None
+            ):
+                continue
             delta_revenue = current.revenue - previous.revenue
             materiality = abs(previous.revenue) * D("0.005")
             if abs(delta_revenue) <= materiality:
@@ -797,12 +1061,20 @@ class FinanceTeamModel:
                 / delta_revenue
             )
         if len(kappas) >= 3:
-            kappa = D(str(median(kappas)))
+            raw_median = D(str(median(kappas)))
+            deviations = [abs(value - raw_median) for value in kappas]
+            mad = D(str(median(deviations)))
+            robust = (
+                [value for value in kappas if abs(value - raw_median) <= D(3) * mad]
+                if mad > 0
+                else kappas
+            )
+            kappa = max(D("-2"), min(D("2"), D(str(median(robust)))))
             return (
                 alpha,
                 kappa,
                 "alpha_da_plus_kappa_delta_revenue",
-                f"资本开支采用方法A：α={alpha}，κ取最近{len(kappas)}个有效年度的历史中位数{kappa:.4f}；预测末期α→1、κ→0。",
+                f"资本开支采用方法A：α={alpha}，κ取最近{len(robust)}个稳健历史样本中位数{kappa:.4f}（MAD去极值并限制在[-2,2]）；预测末期α→1、κ→0。",
             )
         return (
             alpha,
@@ -894,7 +1166,14 @@ class FinanceTeamModel:
                 "latest_operating_nwc_revenue_ratio",
                 "周转科目与历史等价比例均不足，暂用最近一期经营营运资本/收入；该低样本降级必须复核。",
             )
-        if len(history) >= 2 and history[-1].revenue != history[-2].revenue:
+        latest_change_rows = [
+            row for row in history if row.change_operating_nwc is not None
+        ]
+        if (
+            len(history) >= 2
+            and history[-1].revenue != history[-2].revenue
+            and history[-1].change_operating_nwc is not None
+        ):
             factor = history[-1].change_operating_nwc / (
                 history[-1].revenue - history[-2].revenue
             )
@@ -903,11 +1182,21 @@ class FinanceTeamModel:
                 "implied_from_latest_delta",
                 "经营营运资本余额不可得，暂按最近一期ΔNWC/Δ收入降级；不得将其误称为周转天数模型。",
             )
-        ratio = latest.change_operating_nwc / latest.revenue
+        if latest_change_rows:
+            ratio = D(str(median(
+                row.change_operating_nwc / row.revenue
+                for row in latest_change_rows[-5:]
+            )))
+            return (
+                {"nwc_delta_revenue_factor": ratio},
+                "historical_delta_nwc_revenue_fallback",
+                "经营营运资本余额不可得，按可得历史ΔNWC/收入中位数低质量降级并要求人工复核。",
+            )
+        ratio = D("0.10")
         return (
             {"nwc_delta_revenue_factor": ratio},
-            "delta_revenue_ratio_fallback",
-            "营运资本资料不足，按最近一期ΔNWC/收入低质量降级并要求人工复核。",
+            "policy_delta_revenue_fallback",
+            "营运资本余额及变动均不可得，按Δ收入的10%政策值低置信降级；不得把缺失值填零。",
         )
 
     @staticmethod
@@ -1011,12 +1300,25 @@ class FinanceTeamModel:
             scenario, assumptions.ebit_margin
         )
         revenue = financials.revenue
-        current_da_ratio = financials.depreciation_amortization / financials.revenue
+        drivers = assumptions.operating_drivers
+        current_da_ratio = (
+            financials.depreciation_amortization / financials.revenue
+            if financials.depreciation_amortization is not None
+            else drivers.get("da_revenue_ratio", D("0.03"))
+        )
         history_da = [
-            row.depreciation_amortization / row.revenue for row in history[-5:]
+            row.depreciation_amortization / row.revenue
+            for row in history[-5:]
+            if row.depreciation_amortization is not None
         ]
-        terminal_da_ratio = D(str(median(history_da)))
-        current_capex_ratio = financials.capital_expenditure / financials.revenue
+        terminal_da_ratio = (
+            D(str(median(history_da))) if history_da else current_da_ratio
+        )
+        current_capex_ratio = (
+            financials.capital_expenditure / financials.revenue
+            if financials.capital_expenditure is not None
+            else drivers.get("capex_revenue_ratio", max(current_da_ratio, D("0.05")))
+        )
         rates = self._asset_rates(history)
         asset_keys = {
             "fixed": "fixed_assets_net",
@@ -1029,12 +1331,19 @@ class FinanceTeamModel:
             for name, key in asset_keys.items()
         }
         asset_total = sum(asset_balances.values(), D(0))
-        asset_shares = (
-            {key: value / asset_total for key, value in asset_balances.items()}
-            if asset_total > 0
+        cash_asset_total = sum(
+            value for name, value in asset_balances.items()
+            if name != "right_of_use"
+        )
+        cash_asset_shares = (
+            {
+                key: value / cash_asset_total
+                for key, value in asset_balances.items()
+                if key != "right_of_use"
+            }
+            if cash_asset_total > 0
             else {}
         )
-        drivers = assumptions.operating_drivers
         capex_method = assumptions.calculation_methods.get(
             "capex", "revenue_ratio_fallback"
         )
@@ -1153,19 +1462,29 @@ class FinanceTeamModel:
                 if assumptions.tax_rate_path
                 else financials.tax_rate
             )
-            nopat = ebit * (D(1) - tax_rate)
+            # Losses do not create an immediate cash tax refund by default.
+            # Tax-loss carryforwards require their own dated evidence/model.
+            nopat = ebit - max(ebit, ZERO) * tax_rate
             if rates and asset_total > 0:
-                da = sum(
-                    asset_balances[name] * rates[name] * da_rate_multiplier
+                da_components = {
+                    name: asset_balances[name] * rates[name] * da_rate_multiplier
                     for name in rates
-                )
+                }
+                da = sum(da_components.values(), D(0))
+                right_of_use_da = da_components.get("right_of_use", D(0))
                 da_method = "asset_rollforward"
             else:
                 da_ratio = current_da_ratio + (
                     terminal_da_ratio - current_da_ratio
                 ) * progress
                 da = revenue * da_ratio * da_rate_multiplier
+                right_of_use_ratio = (
+                    financials.statement_items.get("depreciation_right_of_use", D(0))
+                    / financials.revenue
+                )
+                right_of_use_da = min(da, revenue * right_of_use_ratio)
                 da_method = "revenue_ratio_fallback"
+            cash_asset_da = max(D(0), da - right_of_use_da)
 
             if capex_method == "alpha_da_plus_kappa_delta_revenue" and capex_kappa is not None:
                 remaining = request.forecast_years - index
@@ -1176,13 +1495,16 @@ class FinanceTeamModel:
                 effective_kappa = capex_kappa * (D(1) - convergence)
                 capex = max(
                     D(0),
-                    effective_alpha * da
+                    effective_alpha * cash_asset_da
                     + (revenue - previous_revenue) * effective_kappa,
                 )
                 capex_formula = "alpha_da_plus_kappa_delta_revenue_terminal_convergence"
             else:
+                terminal_cash_da_ratio = max(
+                    D(0), terminal_da_ratio - (right_of_use_da / revenue)
+                )
                 capex_ratio = current_capex_ratio + (
-                    terminal_da_ratio - current_capex_ratio
+                    terminal_cash_da_ratio - current_capex_ratio
                 ) * progress
                 capex = revenue * capex_ratio
                 effective_alpha = D(1)
@@ -1191,10 +1513,11 @@ class FinanceTeamModel:
 
             if rates and asset_total > 0:
                 for name, balance in asset_balances.items():
+                    cash_capex = capex * cash_asset_shares.get(name, D(0))
                     asset_balances[name] = max(
                         D(0),
                         balance
-                        + capex * asset_shares[name]
+                        + cash_capex
                         - balance * rates[name] * da_rate_multiplier,
                     )
 
@@ -1231,6 +1554,8 @@ class FinanceTeamModel:
                 operating_items["operating_nwc"] = _q(operating_nwc)
             operating_items["capex_alpha"] = _q(effective_alpha)
             operating_items["capex_kappa"] = _q(effective_kappa)
+            operating_items["depreciation_right_of_use"] = _q(right_of_use_da)
+            operating_items["cash_asset_depreciation"] = _q(cash_asset_da)
             rows.append(
                 ForecastYear(
                     year=financials.period_end.year + index + 1,
@@ -1277,26 +1602,49 @@ class FinanceTeamModel:
         wacc: Decimal,
         terminal_growth: Decimal,
         operating_cash: Decimal = ZERO,
-    ) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal | None]:
-        if terminal_growth >= wacc:
-            raise ValueError("永续增长率必须低于WACC。")
+        stable_roic: Decimal | None = None,
+        bridge_policy: str = "use_disclosed_book_values",
+        discount_policy: str = "year_end",
+    ) -> tuple:
+        if wacc <= ZERO or terminal_growth >= wacc:
+            raise ValueError("WACC必须为正，且永续增长率必须低于WACC。")
         pv_explicit = sum(
-            (row.fcff / ((D(1) + wacc) ** row.discount_period) for row in forecast),
+            (
+                row.fcff
+                * row.cash_flow_fraction
+                / ((D(1) + wacc) ** row.discount_period)
+                for row in forecast
+            ),
             D(0),
         )
-        terminal_value = forecast[-1].fcff * (D(1) + terminal_growth) / (
-            wacc - terminal_growth
-        )
-        pv_terminal = terminal_value / (
-            (D(1) + wacc) ** forecast[-1].discount_period
-        )
+        if stable_roic is not None:
+            terminal_cash_flow = normalized_terminal_cash_flow(
+                forecast[-1].nopat,
+                terminal_growth,
+                stable_roic,
+            )
+            terminal_nopat = terminal_cash_flow.nopat
+            terminal_reinvestment_rate = terminal_cash_flow.reinvestment_rate
+            terminal_reinvestment = terminal_cash_flow.reinvestment
+            terminal_fcff = terminal_cash_flow.fcff
+        else:
+            terminal_nopat = forecast[-1].nopat * (D(1) + terminal_growth)
+            terminal_reinvestment_rate = D(0)
+            terminal_reinvestment = D(0)
+            terminal_fcff = forecast[-1].fcff * (D(1) + terminal_growth)
+        terminal_value = terminal_fcff / (wacc - terminal_growth)
+        terminal_period = forecast[-1].discount_period
+        if discount_policy == "annual_midyear_remaining":
+            terminal_period += forecast[-1].cash_flow_fraction / D(2)
+        pv_terminal = terminal_value / ((D(1) + wacc) ** terminal_period)
         enterprise = pv_explicit + pv_terminal
-        equity = (
-            enterprise
-            - financials.interest_bearing_debt
-            + max(D(0), financials.cash_and_non_operating_assets - operating_cash)
+        bridge = resolve_equity_bridge(
+            financials,
+            operating_cash,
+            policy=bridge_policy,
         )
-        per_share = equity / financials.common_shares
+        equity = bridge.equity_value(enterprise)
+        per_share = equity / bridge.share_count
         terminal_share = pv_terminal / enterprise if enterprise else D(0)
         terminal_ebitda = (
             forecast[-1].ebit + forecast[-1].depreciation_amortization
@@ -1312,6 +1660,12 @@ class FinanceTeamModel:
             pv_explicit,
             pv_terminal,
             implied_multiple,
+            terminal_value,
+            terminal_nopat,
+            terminal_reinvestment_rate,
+            terminal_reinvestment,
+            terminal_fcff,
+            bridge,
         )
 
     def dcf(
@@ -1342,20 +1696,76 @@ class FinanceTeamModel:
                 assumptions.wacc,
                 assumptions.terminal_growth,
                 operating_cash,
+                assumptions.operating_drivers.get("stable_roic"),
+                request.assumptions.equity_bridge_policy,
+                request.discount_policy,
             )
             scenario_values[scenario] = values[2]
             if scenario == "base":
                 base_values = values
         if len(set(scenario_values.values())) == 1:
             scenario_warnings.append(
-                "悲观、中性、乐观情景使用了相同预测路径，DCF区间已退化为单点；"
-                "请提供不同情景假设或启用完整历史收入模型后再把它作为估值区间。"
+                "悲观、中性、乐观情景使用了相同经营预测路径，经营情景区间退化为单点；"
+                "最终区间仍保留WACC数据质量压力测试。请补充不同经营情景后再把经营区间"
+                "解释为情景分布。"
             )
         assert base_values is not None
-        enterprise, equity, per_share, terminal_share, pv_explicit, pv_terminal, implied = base_values
-        terminal_value = forecast[-1].fcff * (D(1) + assumptions.terminal_growth) / (
-            assumptions.wacc - assumptions.terminal_growth
+        (
+            enterprise,
+            equity,
+            per_share,
+            terminal_share,
+            pv_explicit,
+            pv_terminal,
+            implied,
+            terminal_value,
+            terminal_nopat,
+            terminal_reinvestment_rate,
+            terminal_reinvestment,
+            terminal_fcff,
+            bridge_inputs,
+        ) = base_values
+        scenario_warnings.extend(bridge_inputs.warnings)
+        range_values = list(scenario_values.values())
+        lease_value = financials.lease_liabilities
+        if lease_value is None:
+            lease_value = financials.statement_items.get("lease_liabilities")
+        debt_method = financials.calculation_methods.get("interest_bearing_debt", "")
+        if (
+            lease_value is not None
+            and lease_value > ZERO
+            and financials.interest_bearing_debt_includes_leases is None
+            and "lease_liabilities" not in debt_method
+        ):
+            range_values.append(per_share + lease_value / bridge_inputs.share_count)
+            scenario_warnings.append(
+                "有息负债是否已包含租赁负债尚未核实；区间上界额外纳入"
+                "租赁已包含时的每股差额，基准情景按单列计债。"
+            )
+        wacc_range_delta = assumptions.operating_drivers.get(
+            "wacc_range_delta", D("0.01")
         )
+        for stressed_wacc in (
+            assumptions.wacc - wacc_range_delta,
+            assumptions.wacc + wacc_range_delta,
+        ):
+            if stressed_wacc > max(ZERO, assumptions.terminal_growth):
+                range_values.append(
+                    self._dcf_values(
+                        financials,
+                        forecast,
+                        stressed_wacc,
+                        assumptions.terminal_growth,
+                        operating_cash,
+                        assumptions.operating_drivers.get("stable_roic"),
+                        request.assumptions.equity_bridge_policy,
+                        request.discount_policy,
+                    )[2]
+                )
+        if wacc_range_delta > D("0.01"):
+            scenario_warnings.append(
+                f"WACC输入未完全核验或已过期，估值区间额外纳入±{wacc_range_delta:.2%}压力测试。"
+            )
         exit_multiple = assumptions.operating_drivers.get("exit_multiple")
         exit_cross_check = None
         exit_per_share = None
@@ -1363,16 +1773,15 @@ class FinanceTeamModel:
         if exit_multiple is not None:
             terminal_ebitda = forecast[-1].ebit + forecast[-1].depreciation_amortization
             exit_terminal_value = terminal_ebitda * exit_multiple
+            exit_terminal_period = forecast[-1].discount_period
+            if request.discount_policy == "annual_midyear_remaining":
+                exit_terminal_period += forecast[-1].cash_flow_fraction / D(2)
             exit_pv_terminal = exit_terminal_value / (
-                (D(1) + assumptions.wacc) ** forecast[-1].discount_period
+                (D(1) + assumptions.wacc) ** exit_terminal_period
             )
             exit_cross_check = pv_explicit + exit_pv_terminal
-            exit_equity = (
-                exit_cross_check
-                - financials.interest_bearing_debt
-                + max(D(0), financials.cash_and_non_operating_assets - operating_cash)
-            )
-            exit_per_share = exit_equity / financials.common_shares
+            exit_equity = bridge_inputs.equity_value(exit_cross_check)
+            exit_per_share = exit_equity / bridge_inputs.share_count
             if per_share != 0:
                 terminal_method_gap = (exit_per_share - per_share) / abs(per_share)
                 if abs(terminal_method_gap) > D("0.20"):
@@ -1380,23 +1789,21 @@ class FinanceTeamModel:
                         f"Gordon法与退出倍数交叉校验的每股价值相差{abs(terminal_method_gap):.2%}，"
                         "应复核永续增长率、WACC及终值EBITDA口径。"
                     )
+        bridge_rows = bridge_inputs.entries(enterprise)
+        bridge_rows.update({
+            "cash_and_non_operating_assets": financials.cash_and_non_operating_assets,
+            "operating_cash_requirement": -operating_cash,
+            "surplus_cash": bridge_inputs.distributable_cash,
+            "interest_bearing_debt": -financials.interest_bearing_debt,
+        })
         return DcfResult(
             enterprise_value=_q(enterprise),
             equity_value=_q(equity),
             per_share_value=_q(per_share),
-            range_low=_q(min(scenario_values.values())),
-            range_high=_q(max(scenario_values.values())),
+            range_low=_q(min(range_values)),
+            range_high=_q(max(range_values)),
             terminal_value_share=_q(terminal_share),
-            bridge={
-                "operating_enterprise_value": _q(enterprise),
-                "cash_and_non_operating_assets": _q(financials.cash_and_non_operating_assets),
-                "operating_cash_requirement": _q(-operating_cash),
-                "surplus_cash": _q(
-                    max(D(0), financials.cash_and_non_operating_assets - operating_cash)
-                ),
-                "interest_bearing_debt": _q(-financials.interest_bearing_debt),
-                "common_equity_value": _q(equity),
-            },
+            bridge={key: _q(value) for key, value in bridge_rows.items()},
             scenario_warnings=scenario_warnings,
             scenario_values={key: _q(value) for key, value in scenario_values.items()},
             present_value_explicit=_q(pv_explicit),
@@ -1412,6 +1819,12 @@ class FinanceTeamModel:
             terminal_method_gap=(
                 _q(terminal_method_gap) if terminal_method_gap is not None else None
             ),
+            terminal_nopat=_q(terminal_nopat),
+            terminal_reinvestment_rate=_q(terminal_reinvestment_rate),
+            terminal_reinvestment=_q(terminal_reinvestment),
+            terminal_fcff=_q(terminal_fcff),
+            stable_roic=_q(assumptions.operating_drivers["stable_roic"]),
+            bridge_unmeasured_items=list(bridge_inputs.unmeasured_items),
         )
 
     def relative(
@@ -1473,14 +1886,24 @@ class FinanceTeamModel:
                     retained = candidate
 
             values = []
+            bridge_inputs = (
+                resolve_equity_bridge(
+                    financials,
+                    policy=request.assumptions.equity_bridge_policy,
+                )
+                if enterprise_multiple
+                else None
+            )
+            share_count = (
+                bridge_inputs.share_count
+                if bridge_inputs is not None
+                else financials.diluted_shares or financials.common_shares
+            )
             for _, multiple in retained:
                 equity_value = multiple * target_value
                 if enterprise_multiple:
-                    equity_value += (
-                        financials.cash_and_non_operating_assets
-                        - financials.interest_bearing_debt
-                    )
-                values.append(equity_value / financials.common_shares)
+                    equity_value = bridge_inputs.equity_value(equity_value)
+                values.append(equity_value / share_count)
             sample_size = len(values)
             outlier_count = original_size - sample_size
             quality = "adequate" if sample_size >= 5 else "limited"
@@ -1489,6 +1912,8 @@ class FinanceTeamModel:
                 note_parts.append("有效样本不足5家，区间稳定性有限")
             if outlier_count:
                 note_parts.append(f"按1.5×IQR规则剔除{outlier_count}个异常倍数")
+            if bridge_inputs is not None:
+                note_parts.extend(bridge_inputs.warnings)
             return MultipleResult(
                 method=method.value,
                 status="success",
@@ -1537,18 +1962,36 @@ class FinanceTeamModel:
             return self.reference.sensitivity(request, financials, assumptions)
         forecast = self._forecast_scenario(request, financials, assumptions, "base")
         cells: list[SensitivityCell] = []
-        for wacc_delta in (D("-0.01"), D(0), D("0.01")):
+        wacc_step = assumptions.operating_drivers.get("wacc_range_delta", D("0.01"))
+        operating_cash = financials.revenue * assumptions.operating_drivers.get(
+            "operating_cash_ratio", D(0)
+        )
+        for wacc_delta in (-wacc_step, D(0), wacc_step):
             wacc = assumptions.wacc + wacc_delta
             for growth_delta in (D("-0.01"), D(0), D("0.01")):
                 growth = assumptions.terminal_growth + growth_delta
-                if wacc <= 0 or growth >= wacc:
+                stable_roic = assumptions.operating_drivers.get("stable_roic")
+                if (
+                    wacc <= 0
+                    or growth >= wacc
+                    or (stable_roic is not None and growth >= stable_roic)
+                ):
                     cells.append(
                         SensitivityCell(
                             wacc=_q(wacc), terminal_growth=_q(growth), per_share_value=None, valid=False
                         )
                     )
                     continue
-                value = self._dcf_values(financials, forecast, wacc, growth)[2]
+                value = self._dcf_values(
+                    financials,
+                    forecast,
+                    wacc,
+                    growth,
+                    operating_cash,
+                    assumptions.operating_drivers.get("stable_roic"),
+                    request.assumptions.equity_bridge_policy,
+                    request.discount_policy,
+                )[2]
                 cells.append(
                     SensitivityCell(
                         wacc=_q(wacc), terminal_growth=_q(growth), per_share_value=_q(value), valid=True
@@ -1578,13 +2021,23 @@ class FinanceTeamModel:
             growth = variant.terminal_growth
             if wacc <= 0 or growth >= wacc:
                 return None
-            rows = self._forecast_scenario(request, financials, variant, "base")
-            operating_cash = financials.revenue * variant.operating_drivers.get(
-                "operating_cash_ratio", D(0)
-            )
-            return self._dcf_values(
-                financials, rows, wacc, growth, operating_cash
-            )[2]
+            try:
+                rows = self._forecast_scenario(request, financials, variant, "base")
+                operating_cash = financials.revenue * variant.operating_drivers.get(
+                    "operating_cash_ratio", D(0)
+                )
+                return self._dcf_values(
+                    financials,
+                    rows,
+                    wacc,
+                    growth,
+                    operating_cash,
+                    variant.operating_drivers.get("stable_roic"),
+                    request.assumptions.equity_bridge_policy,
+                    request.discount_policy,
+                )[2]
+            except ValueError:
+                return None
 
         baseline = per_share(assumptions)
 
@@ -1641,16 +2094,18 @@ class FinanceTeamModel:
             )
 
         studies: list[SensitivityStudy] = []
+        wacc_step = assumptions.operating_drivers.get("wacc_range_delta", D("0.01"))
         low_wacc = assumptions.model_copy(
-            update={"wacc": assumptions.wacc - D("0.01")}
+            update={"wacc": assumptions.wacc - wacc_step}
         )
         high_wacc = assumptions.model_copy(
-            update={"wacc": assumptions.wacc + D("0.01")}
+            update={"wacc": assumptions.wacc + wacc_step}
         )
         studies.append(completed(
             "S1", "WACC", f"{assumptions.wacc:.2%}",
             f"{low_wacc.wacc:.2%}", f"{high_wacc.wacc:.2%}",
-            per_share(low_wacc), per_share(high_wacc), "WACC上下扰动1个百分点。"
+            per_share(low_wacc), per_share(high_wacc),
+            f"WACC按本次数据质量上下扰动{wacc_step:.2%}。"
         ))
 
         low_g = assumptions.model_copy(update={"terminal_growth": D("0.02")})
@@ -1658,6 +2113,28 @@ class FinanceTeamModel:
         studies.append(completed(
             "S2", "永续增长率g", f"{assumptions.terminal_growth:.2%}", "2.00%", "4.00%",
             per_share(low_g), per_share(high_g), "按文档固定测试2%、3%、4%档位。"
+        ))
+
+        stable_roic = assumptions.operating_drivers["stable_roic"]
+        low_roic = max(
+            assumptions.terminal_growth + D("0.005"), stable_roic * D("0.8")
+        )
+        high_roic = min(D(1), stable_roic * D("1.2"))
+        low_roic_drivers = dict(
+            assumptions.operating_drivers, stable_roic=low_roic
+        )
+        high_roic_drivers = dict(
+            assumptions.operating_drivers, stable_roic=high_roic
+        )
+        studies.append(completed(
+            "S2-roic",
+            "稳定期ROIC",
+            f"{stable_roic:.2%}",
+            f"{low_roic:.2%}",
+            f"{high_roic:.2%}",
+            per_share(assumptions.model_copy(update={"operating_drivers": low_roic_drivers})),
+            per_share(assumptions.model_copy(update={"operating_drivers": high_roic_drivers})),
+            "验证永续增长所需再投资率g/ROIC，防止正增长与零净再投资并存。",
         ))
 
         grid_values = [cell.per_share_value for cell in self.sensitivity(
@@ -1854,27 +2331,29 @@ class FinanceTeamModel:
                 assumptions.wacc,
                 assumptions.terminal_growth,
                 exit_operating_cash,
+                assumptions.operating_drivers.get("stable_roic"),
+                request.assumptions.equity_bridge_policy,
+                request.discount_policy,
             )[4]
+            exit_bridge = resolve_equity_bridge(
+                financials,
+                exit_operating_cash,
+                policy=request.assumptions.equity_bridge_policy,
+            )
 
             def exit_price(multiple: Decimal) -> Decimal:
                 terminal_ebitda = (
                     exit_forecast[-1].ebit
                     + exit_forecast[-1].depreciation_amortization
                 )
+                exit_terminal_period = exit_forecast[-1].discount_period
+                if request.discount_policy == "annual_midyear_remaining":
+                    exit_terminal_period += exit_forecast[-1].cash_flow_fraction / D(2)
                 pv_terminal = terminal_ebitda * multiple / (
-                    (D(1) + assumptions.wacc) ** exit_forecast[-1].discount_period
+                    (D(1) + assumptions.wacc) ** exit_terminal_period
                 )
-                equity = (
-                    pv_explicit
-                    + pv_terminal
-                    - financials.interest_bearing_debt
-                    + max(
-                        D(0),
-                        financials.cash_and_non_operating_assets
-                        - exit_operating_cash,
-                    )
-                )
-                return equity / financials.common_shares
+                equity = exit_bridge.equity_value(pv_explicit + pv_terminal)
+                return equity / exit_bridge.share_count
 
             low_multiple = drivers.get(
                 "exit_multiple_low", drivers["exit_multiple"]
@@ -2169,6 +2648,7 @@ class FinanceTeamModel:
         financials: FinancialSnapshot,
         peers: list[PeerCompany],
         relative: list[MultipleResult],
+        assumptions: AssumptionSet | None = None,
     ) -> DataQualityAssessment:
         """Summarize data and model support without changing valuation numbers."""
 
@@ -2201,11 +2681,41 @@ class FinanceTeamModel:
         core_evidence = required_financial_metrics(request.methods)
         has_dcf = "dcf" in request.methods
         denominator = max(len(history) * len(core_evidence), 1)
-        evidence_count = sum(
-            len(core_evidence & set(row.evidence)) for row in history
-        )
+        evidence_count = 0
+        for row in history:
+            available_evidence = set(row.evidence)
+            for key in core_evidence:
+                if key == "common_shares":
+                    evidence_count += int(
+                        bool({"common_shares", "diluted_shares"} & available_evidence)
+                    )
+                else:
+                    evidence_count += int(key in available_evidence)
         evidence_coverage = D(evidence_count) / D(denominator)
         notes: list[str] = []
+        if has_dcf and assumptions is None:
+            assumptions = self.resolve_assumptions(request, financials)
+        degraded_fields = []
+        if has_dcf and assumptions is not None:
+            if assumptions.operating_drivers.get("da_policy_fallback", D(0)):
+                degraded_fields.append("depreciation_amortization")
+            if assumptions.operating_drivers.get("capex_policy_fallback", D(0)):
+                degraded_fields.append("capital_expenditure")
+            if (
+                assumptions.calculation_methods.get("change_operating_nwc")
+                == "policy_delta_revenue_fallback"
+            ):
+                degraded_fields.append("change_operating_nwc")
+            if assumptions.operating_drivers.get("stable_roic_policy_fallback", D(0)):
+                degraded_fields.append("stable_roic")
+            if assumptions.operating_drivers.get("operating_cash_policy_fallback", D(0)):
+                degraded_fields.append("operating_cash_requirement")
+        degraded_fields = sorted(degraded_fields)
+        if degraded_fields:
+            notes.append(
+                "估值关键输入已降级：" + "、".join(degraded_fields)
+                + "；具体代理值或政策值见假设与计算口径。"
+            )
         if has_dcf and len(history) < 10:
             notes.append(f"仅有{len(history)}个可用历史年度，长期统计量样本有限。")
         if adjusted_years:
@@ -2232,6 +2742,36 @@ class FinanceTeamModel:
         peer_provenance_missing = requested_relative and any(not p.evidence or p.as_of_date is None or p.multiple_basis == "unknown" for p in peers)
         if peer_provenance_missing:
             notes.append("部分可比公司缺少定价日、分母口径或原文证据，须人工核验，不能视为已核验同业。")
+        bridge_book_proxy = any(
+            item.rule_id == "EQUITY_BRIDGE_BOOK_VALUE_PROXY"
+            for item in validate_equity_bridge_inputs(request, financials)
+        )
+        bridge_unmeasured = False
+        bridge_lease_ambiguous = False
+        if {"dcf", "ev_ebitda"} & {str(method) for method in request.methods}:
+            bridge_unmeasured = bool(
+                resolve_equity_bridge(
+                    financials,
+                    policy=request.assumptions.equity_bridge_policy,
+                ).unmeasured_items
+            )
+            lease_value = financials.lease_liabilities
+            if lease_value is None:
+                lease_value = financials.statement_items.get("lease_liabilities")
+            bridge_lease_ambiguous = bool(
+                lease_value is not None
+                and lease_value > ZERO
+                and financials.interest_bearing_debt_includes_leases is None
+                and "lease_liabilities" not in financials.calculation_methods.get(
+                    "interest_bearing_debt", ""
+                )
+            )
+        if bridge_book_proxy:
+            notes.append("股权价值桥接使用已披露账面值代理市场价值，结果等级最高为B。")
+        if bridge_unmeasured:
+            notes.append("部分股权桥接项未建立，未将缺失值表述为确认0；结果按C级披露。")
+        if bridge_lease_ambiguous:
+            notes.append("有息债务是否包含租赁负债尚未核实，基准值和估值区间均披露该不确定性。")
         successful_quality = [
             item.sample_quality for item in relative if item.status == "success"
         ]
@@ -2246,12 +2786,44 @@ class FinanceTeamModel:
         else:
             peer_quality = "adequate"
 
+        if not has_dcf:
+            market_input_quality = "not_applicable"
+        else:
+            market_as_of = request.assumptions.market_inputs_as_of
+            market_source = request.assumptions.market_inputs_source.strip()
+            market_components_complete = (
+                request.assumptions.wacc is not None
+                or all(
+                    value is not None
+                    for value in (
+                        request.assumptions.risk_free_rate,
+                        request.assumptions.equity_risk_premium,
+                        request.assumptions.beta,
+                        request.assumptions.debt_cost,
+                    )
+                )
+            )
+            if market_as_of is None or not market_source or not market_components_complete:
+                market_input_quality = "unverified"
+                notes.append("WACC市场参数缺少完整分项、基准日或来源，估值区间已扩大。")
+            elif (
+                request.valuation_date - market_as_of
+            ).days > request.assumptions.market_inputs_stale_after_days:
+                market_input_quality = "verified_stale"
+                notes.append("WACC市场参数有来源但已超过新鲜度阈值，估值区间已扩大。")
+            else:
+                market_input_quality = "verified_current"
+
         low = (
             (has_dcf and len(history) < 6)
             or evidence_coverage < D("0.4")
             or industry_quality == "C"
             or peer_quality == "insufficient"
             or peer_provenance_missing
+            or bool(degraded_fields)
+            or (has_dcf and market_input_quality == "unverified")
+            or bridge_unmeasured
+            or bridge_lease_ambiguous
         )
         medium = (
             (has_dcf and len(history) < 10)
@@ -2260,8 +2832,11 @@ class FinanceTeamModel:
             or (has_dcf and metadata_completeness != "complete")
             or peer_quality == "limited"
             or bool(adjusted_years or excluded_years)
+            or (has_dcf and market_input_quality == "verified_stale")
+            or bridge_book_proxy
         )
         confidence = "low" if low else "medium" if medium else "high"
+        result_grade = "C" if confidence == "low" else "B" if confidence == "medium" else "A"
         return DataQualityAssessment(
             historical_years=len(raw_history),
             comparable_years=len(history),
@@ -2272,6 +2847,9 @@ class FinanceTeamModel:
             industry_metadata_completeness=metadata_completeness,
             peer_sample_quality=peer_quality,
             confidence=confidence,
+            result_grade=result_grade,
+            market_input_quality=market_input_quality,
+            degraded_fields=degraded_fields,
             notes=notes,
         )
 

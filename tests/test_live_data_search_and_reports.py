@@ -285,8 +285,8 @@ def test_peer_selection_excludes_financial_and_uses_cash_in_enterprise_value():
                     {"ts_code": "F.SH", "name": "银行F", "industry": "银行"},
                 ]
             if api_name == "daily_basic":
-                return [{"ts_code": code, "trade_date": "20260923", "pe_ttm": 20,
-                         "ps_ttm": 4, "total_mv": 1000000}
+                return [{"ts_code": code, "trade_date": "20260923", "pe_ttm": 99,
+                         "ps_ttm": 99, "total_mv": 1000000}
                         for code in ("A.SZ", "B.SZ", "C.SZ")]
             if api_name == "fina_indicator":
                 return [{"ts_code": params["ts_code"], "ann_date": "20260401",
@@ -295,6 +295,10 @@ def test_peer_selection_excludes_financial_and_uses_cash_in_enterprise_value():
             if api_name == "balancesheet":
                 return [{"ts_code": params["ts_code"], "ann_date": "20260401",
                          "end_date": "20251231", "money_cap": 100000000}]
+            if api_name == "income":
+                return [{"ts_code": params["ts_code"], "ann_date": "20260401",
+                         "end_date": "20251231", "n_income_attr_p": 500000000,
+                         "revenue": 2000000000}]
             raise AssertionError(api_name)
 
     provider = TushareDataProvider(FakeClient(), peer_limit=3)
@@ -302,11 +306,17 @@ def test_peer_selection_excludes_financial_and_uses_cash_in_enterprise_value():
         CompanyInput(ticker="TARGET.SZ", industry="软件服务"),
         {"trade_date": "20260923", "total_mv": 1000000}, date(2026, 9, 23),
     )
-    assert not warnings
+    assert any("EV/EBITDA未生成" in warning for warning in warnings)
     assert [peer.ticker for peer in peers] == ["A.SZ", "B.SZ", "C.SZ"]
-    # total_mv uses ten-thousand yuan; EV=(10bn+0.2bn-0.1bn)/1bn=10.1x.
-    assert peers[0].ev_ebitda == D("10.1")
+    # Tushare's PE/PS TTM fields are 99 here; FY values use matching 2025 income.
+    assert peers[0].pe == D("20")
+    assert peers[0].ps == D("5")
+    assert peers[0].ev_ebitda is None
     assert peers[0].market_cap == D("10000000000")
+    assert peers[0].multiple_basis == "FY"
+    assert peers[0].financial_period_end == date(2025, 12, 31)
+    assert peers[0].as_of_date == date(2026, 9, 23)
+    assert peers[0].evidence["pe"] and peers[0].evidence["ps"]
     assert peers[0].revenue_growth == D("0.1")
     assert peers[0].ebit_margin == D("0.2")
     assert peers[0].peer_tier == "core"
@@ -337,6 +347,57 @@ def test_market_cap_statistics_preserve_average_and_period_endpoints():
     assert statistics["annual_average_market_cap"] == D("2500000")
     assert statistics["market_cap_period_low"] == D("1000000")
     assert statistics["market_cap_period_high"] == D("4000000")
+
+
+def test_tushare_missing_cash_flow_drivers_remain_unknown_not_zero(monkeypatch):
+    periods = [f"{year}1231" for year in range(2022, 2026)]
+    income = {
+        period: {
+            "revenue": 1_000_000,
+            "operate_profit": 200_000,
+            "n_income_attr_p": 150_000,
+            "total_profit": 200_000,
+            "income_tax": 30_000,
+            "ann_date": f"{int(period[:4]) + 1}0331",
+        }
+        for period in periods
+    }
+    balance = {
+        period: {
+            "money_cap": 100_000,
+            "total_hldr_eqy_exc_min_int": 500_000,
+        }
+        for period in periods
+    }
+    cashflow = {period: {} for period in periods}
+    indicator = {
+        period: {"ebit": 200_000, "interestdebt": 50_000, "working_capital": 500_000}
+        for period in periods
+    }
+    provider = TushareDataProvider(object())
+    monkeypatch.setattr(
+        provider,
+        "_query_financial_rows",
+        lambda *_: (income, balance, cashflow, indicator),
+    )
+
+    rows, warnings = provider._financial_snapshots(
+        "600000.SH",
+        date(2026, 9, 23),
+        {"trade_date": "20260923", "total_share": 10_000, "total_mv": 1_000_000},
+    )
+
+    assert len(rows) == 4
+    assert all(row.depreciation_amortization is None for row in rows)
+    assert all(row.capital_expenditure is None for row in rows)
+    assert all(row.change_operating_nwc is None for row in rows)
+    assert all(row.lease_liabilities is None for row in rows)
+    assert all(row.common_shares is None for row in rows[:-1])
+    assert rows[-1].common_shares == D("100000000")
+    assert "depreciation_amortization" not in rows[-1].evidence
+    assert "capital_expenditure" not in rows[-1].evidence
+    assert any("未知" in warning for warning in warnings)
+    assert any("一般营运资金working_capital" in warning for warning in warnings)
 
 
 def test_research_ticker_handoff_creates_traceable_run(tmp_path):
@@ -436,7 +497,9 @@ def test_formal_xlsx_and_pdf_reports_are_readable(tmp_path):
     assert {"估值摘要", "关键假设", "基期推导", "预测与FCFF", "DCF复算", "敏感性分析", "来源与风险"} <= set(workbook.sheetnames)
     assert "可比公司" not in workbook.sheetnames
     assert str(workbook["预测与FCFF"]["I2"].value).startswith("=")
-    assert str(workbook["DCF复算"]["Q10"].value).startswith("=")
+    assert workbook["DCF复算"]["Q4"].value == "=$B$3/$B$9"
+    assert workbook["DCF复算"]["G15"].value == "=E15-MAX(0,E15)*F15"
+    assert str(workbook["DCF复算"]["Q14"].value).startswith("=")
     assert str(workbook["敏感性分析"]["B2"].value).startswith("=IF(")
     derivation_rows = list(workbook["基期推导"].iter_rows(values_only=True))
     assert any(row[1] == "EBITDA (ebitda)" and row[3] == "ebit + depreciation_amortization" for row in derivation_rows)

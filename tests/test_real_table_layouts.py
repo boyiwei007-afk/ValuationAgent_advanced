@@ -374,3 +374,26 @@ def test_midea_report_disclosure_share_total_uses_official_date_not_dividend_bas
                                      identity_text="美的集团股份有限公司2024年度报告")
     assert warnings
     assert "scope" not in checks
+
+
+def test_yili_explicit_dated_share_total_binds_without_inventing_a_separator():
+    text = (
+        "内蒙古伊利实业集团股份有限公司2024年年度报告\n"
+        "公司拟向全体股东每股派发现金红利1.22元（含税），截至2025年4月8日，公司总股本\n"
+        "6,365,900,705股，扣除公司回购专户股份32,859,361股，以此计算分红总额。"
+    )
+    block = {"block_id": "yili:2", "file_id": "yili", "text": text,
+             "location": {"page": 2, "published_at": "2025-04-30"}}
+    item = CandidateInput(
+        metric="总股本", raw_value="6,365,900,705", unit="股",
+        period="2025-04-08", scope="issuer", block_id="yili:2",
+        quote="截至2025年4月8日，公司总股本6,365,900,705股",
+    )
+    draft = ResearchDraft(company="伊利股份", ticker="600887.SH", valuation_date=date(2025, 6, 30))
+    warnings, checks = bind_evidence(
+        item, block, [block], draft, aliases={"common_shares"},
+        identity_text="内蒙古伊利实业集团股份有限公司2024年年度报告 600887",
+    )
+    assert not warnings, warnings
+    assert checks["period_end"] == "2025-04-08"
+    assert checks["scope"] == "issuer"

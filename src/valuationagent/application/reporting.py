@@ -18,7 +18,12 @@ BASELINE_FIELDS = (
     ("change_operating_nwc", "经营性营运资本变动"),
     ("cash_and_non_operating_assets", "现金及非经营性资产"),
     ("interest_bearing_debt", "有息负债"),
+    ("lease_liabilities", "租赁负债"),
+    ("minority_interest", "少数股东权益"),
+    ("preferred_equity", "优先股权益"),
+    ("associates_and_non_operating_investments", "联营及非经营性投资"),
     ("common_shares", "普通股股数"),
+    ("diluted_shares", "稀释后普通股股数"),
     ("net_income_parent", "归母净利润"),
     ("ebitda", "EBITDA"),
 )
@@ -109,7 +114,9 @@ class ValuationReportExporter:
             ["估值基准日", str(result.valuation_date), "所有市场与公开信息不得晚于该日"],
             ["模型版本", result.model_version, f"运行ID：{record.run_id} · 修订v{record.revision}"],
             ["数据质量置信度", result.data_quality.confidence,
-             f"可比历史 {result.data_quality.comparable_years}/{result.data_quality.historical_years} 年"],
+             f"结果等级 {result.data_quality.result_grade} · 可比历史 {result.data_quality.comparable_years}/{result.data_quality.historical_years} 年"],
+            ["市场参数质量", result.data_quality.market_input_quality,
+             "降级字段：" + ("、".join(result.data_quality.degraded_fields) or "无")],
             ["证据覆盖率", result.data_quality.evidence_coverage,
              "核心字段中带逐项证据的比例"],
             ["可比样本质量", result.data_quality.peer_sample_quality,
@@ -140,14 +147,15 @@ class ValuationReportExporter:
             ],
         ])
         header(summary)
-        summary["B6"].number_format = "0.00%"
-        summary["B8"].number_format = '¥#,##0.00'
+        summary["B7"].number_format = "0.00%"
+        summary["B9"].number_format = '¥#,##0.00'
 
         assumptions = sheet("关键假设", (26, 22, 70))
         assumption_rows = [
             ["参数", "数值", "依据/口径"],
             ["WACC", result.assumptions.wacc if result.dcf else "不适用", result.assumptions.rationale.get("wacc", "")],
             ["永续增长率", result.assumptions.terminal_growth if result.dcf else "不适用", result.assumptions.rationale.get("terminal_growth", "")],
+            ["稳定期ROIC", result.dcf.stable_roic if result.dcf and result.dcf.stable_roic is not None else "不适用", result.assumptions.rationale.get("stable_roic", "")],
             ["假设来源", result.assumptions.source, ""],
         ]
         assumption_rows += [[f"WACC组成 · {key}", value, ""] for key, value in result.assumptions.wacc_components.items()]
@@ -157,7 +165,7 @@ class ValuationReportExporter:
         assumption_rows += [["模型决定", item, ""] for item in result.assumptions.model_decisions]
         rows(assumptions, assumption_rows)
         header(assumptions)
-        for cell in (assumptions["B2"], assumptions["B3"]):
+        for cell in (assumptions["B2"], assumptions["B3"], assumptions["B4"]):
             cell.number_format = "0.00%"
             cell.font = Font(color="1F4E78")
 
@@ -243,37 +251,67 @@ class ValuationReportExporter:
                 "DCF复算",
                 (12, 16, 20, 16, 20, 14, 20, 20, 20, 20, 20, 16, 16, 20, 16, 22, 22, 28, 28),
             )
+            total_debt = -result.dcf.bridge.get(
+                "total_debt_including_incremental_leases",
+                -result.effective_financials.interest_bearing_debt,
+            )
+            bridge_shares = result.dcf.bridge.get(
+                "diluted_or_common_shares",
+                result.effective_financials.diluted_shares
+                or result.effective_financials.common_shares,
+            )
+            surplus_cash = result.dcf.bridge.get(
+                "surplus_cash",
+                result.effective_financials.cash_and_non_operating_assets,
+            )
+            other_bridge_adjustment = (
+                result.dcf.equity_value
+                - result.dcf.enterprise_value
+                - surplus_cash
+                + total_debt
+            )
+            normalized_terminal = (
+                result.assumptions.calculation_methods.get("terminal_value")
+                == "gordon_growth_normalized_reinvestment"
+                and result.dcf.stable_roic is not None
+            )
+            stable_roic = result.dcf.stable_roic if normalized_terminal else None
             rows(dcf_recalc, [
                 ["参数", "数值", "说明"],
                 ["WACC", result.assumptions.wacc, "可编辑；修改后公式输出与敏感性表联动"],
                 ["永续增长率", result.assumptions.terminal_growth, "可编辑；必须低于WACC"],
                 ["现金及非经营性资产", result.effective_financials.cash_and_non_operating_assets, "企业价值到股权价值桥接"],
-                ["有息负债", result.effective_financials.interest_bearing_debt, "企业价值到股权价值桥接"],
-                ["普通股股数", result.effective_financials.common_shares,
-                 "每股价值分母；股数披露截止日：" + str(result.effective_financials.common_shares_as_of or "未记录")],
+                ["总债务（含增量租赁负债）", total_debt, "资本化租赁政策下的完整债务扣减"],
+                ["稀释后或普通股股数", bridge_shares,
+                 "每股价值分母；优先使用稀释后股数；披露截止日：" + str(result.effective_financials.diluted_shares_as_of or result.effective_financials.common_shares_as_of or "未记录")],
                 ["基期营业收入", result.effective_financials.revenue, "最近一期已确认财务事实"],
                 ["贴现政策", record.request.discount_policy, "贴现期沿用系统本次运行结果"],
+                ["稳定期ROIC", stable_roic, (
+                    "终值再投资率 = g / 稳定期ROIC"
+                    if normalized_terminal else "参考兼容模型未使用稳定期再投资公式"
+                )],
                 ["经营必需现金", -result.dcf.bridge.get("operating_cash_requirement", Decimal(0)), "从现金中扣除，仅剩余现金参与股权价值桥接"],
+                ["其他股权桥接净调整", other_bridge_adjustment, "联营投资等为加项；少数股东权益、优先股、养老金与预计负债等为扣项"],
             ])
             header(dcf_recalc)
-            for row_index in range(2, 8):
+            for row_index in (2, 3, 4, 5, 6, 7, 9, 10, 11):
                 cell = dcf_recalc.cell(row_index, 2)
                 cell.fill = PatternFill("solid", fgColor="FFF2CC")
                 cell.font = Font(color="0000FF")
-            for row_index in (2, 3):
+            for row_index in (2, 3, 9):
                 dcf_recalc.cell(row_index, 2).number_format = "0.00%"
-            for row_index in range(4, 8):
+            for row_index in (4, 5, 6, 7, 10, 11):
                 dcf_recalc.cell(row_index, 2).number_format = '#,##0.00'
 
-            dcf_recalc.cell(10, 1, "基准情景DCF复算")
-            dcf_recalc.cell(10, 1).font = Font(bold=True, color=navy)
+            dcf_recalc.cell(13, 1, "基准情景DCF复算")
+            dcf_recalc.cell(13, 1).font = Font(bold=True, color=navy)
             dcf_headers = [
                 "年度", "收入增长率", "营业收入", "EBIT率", "EBIT", "税率", "NOPAT",
                 "折旧摊销", "资本开支", "Δ经营营运资本", "FCFF", "贴现期", "贴现因子", "FCFF现值", "现金流比例",
             ]
             dcf_recalc.append(dcf_headers)
-            header(dcf_recalc, 11)
-            dcf_data_start = 12
+            header(dcf_recalc, 14)
+            dcf_data_start = 15
             for offset, item in enumerate(result.forecast):
                 row_index = dcf_data_start + offset
                 previous_revenue = "$B$7" if offset == 0 else f"C{row_index - 1}"
@@ -289,7 +327,11 @@ class ValuationReportExporter:
                     _number(item.ebit_margin),
                     f"=C{row_index}*D{row_index}",
                     _number(tax_rate),
-                    f"=E{row_index}*(1-F{row_index})",
+                    (
+                        f"=E{row_index}-MAX(0,E{row_index})*F{row_index}"
+                        if normalized_terminal
+                        else f"=E{row_index}*(1-F{row_index})"
+                    ),
                     _number(item.depreciation_amortization),
                     _number(item.capital_expenditure),
                     _number(item.change_operating_nwc),
@@ -311,31 +353,55 @@ class ValuationReportExporter:
 
             last_row = dcf_data_start + len(result.forecast) - 1
             terminal_period = f"L{last_row}" if record.request.discount_policy == "year_end" else f"(L{last_row}+O{last_row}/2)"
-            cash_bridge = "MAX(0,$B$4-$B$9)" if "surplus_cash" in result.dcf.bridge else "$B$4"
-            summary_rows = [
-                ["公式输出", "数值"],
-                ["显性期FCFF现值", f"=SUM(N{dcf_data_start}:N{last_row})"],
-                ["终年FCFF", f"=K{last_row}"],
-                ["终值", "=Q3*(1+$B$3)/($B$2-$B$3)"],
-                ["终值现值", f"=Q4/(1+$B$2)^{terminal_period}"],
-                ["企业价值", "=Q2+Q5"],
-                ["加：可分配现金及非经营性资产", f"={cash_bridge}"],
-                ["减：有息负债", "=$B$5"],
-                ["股权价值", "=Q6+Q7-Q8"],
-                ["每股价值", "=Q9/$B$6"],
-                ["系统本次结果", _number(result.dcf.per_share_value)],
-                ["复算差异", "=Q10-Q11"],
-                ["复算检查", '=IF(ABS(Q12)<=0.01,"一致","需复核")'],
-            ]
+            cash_bridge = "MAX(0,$B$4-$B$10)"
+            if normalized_terminal:
+                summary_rows = [
+                    ["公式输出", "数值"],
+                    ["显性期FCFF现值", f"=SUM(N{dcf_data_start}:N{last_row})"],
+                    ["终值期NOPAT", f"=G{last_row}*(1+$B$3)"],
+                    ["稳定期再投资率", "=$B$3/$B$9"],
+                    ["终值期再投资", "=Q3*Q4"],
+                    ["终值期FCFF", "=Q3-Q5"],
+                    ["终值", "=Q6/($B$2-$B$3)"],
+                    ["终值现值", f"=Q7/(1+$B$2)^{terminal_period}"],
+                    ["企业价值", "=Q2+Q8"],
+                    ["加：可分配现金及非经营性资产", f"={cash_bridge}"],
+                    ["减：总债务", "=$B$5"],
+                    ["加/减：其他股权桥接净调整", "=$B$11"],
+                    ["普通股股权价值", "=Q9+Q10-Q11+Q12"],
+                    ["每股价值", "=Q13/$B$6"],
+                    ["系统本次结果", _number(result.dcf.per_share_value)],
+                    ["复算差异", "=Q14-Q15"],
+                    ["复算检查", '=IF(ABS(Q16)<=0.01,"一致","需复核")'],
+                ]
+            else:
+                summary_rows = [
+                    ["公式输出", "数值"],
+                    ["显性期FCFF现值", f"=SUM(N{dcf_data_start}:N{last_row})"],
+                    ["终年FCFF", f"=K{last_row}"],
+                    ["终值", "=Q3*(1+$B$3)/($B$2-$B$3)"],
+                    ["终值现值", f"=Q4/(1+$B$2)^{terminal_period}"],
+                    ["企业价值", "=Q2+Q5"],
+                    ["加：可分配现金及非经营性资产", f"={cash_bridge}"],
+                    ["减：总债务", "=$B$5"],
+                    ["加/减：其他股权桥接净调整", "=$B$11"],
+                    ["普通股股权价值", "=Q6+Q7-Q8+Q9"],
+                    ["每股价值", "=Q10/$B$6"],
+                    ["系统本次结果", _number(result.dcf.per_share_value)],
+                    ["复算差异", "=Q11-Q12"],
+                    ["复算检查", '=IF(ABS(Q13)<=0.01,"一致","需复核")'],
+                ]
             for row_index, values in enumerate(summary_rows, 1):
                 dcf_recalc.cell(row_index, 16, values[0])
                 dcf_recalc.cell(row_index, 17, values[1])
             header(dcf_recalc, 1)
-            for row_index in range(2, 13):
+            for row_index in range(2, len(summary_rows) + 1):
                 dcf_recalc.cell(row_index, 17).number_format = '#,##0.00'
-            dcf_recalc.freeze_panes = "A12"
+            if normalized_terminal:
+                dcf_recalc.cell(4, 17).number_format = "0.00%"
+            dcf_recalc.freeze_panes = "A15"
 
-            scenario_row = 16
+            scenario_row = 20
             for column, value in enumerate(["情景", "系统每股价值", "收入增长路径", "EBIT率路径"], 16):
                 dcf_recalc.cell(scenario_row, column, value)
             header(dcf_recalc, scenario_row)
@@ -424,15 +490,29 @@ class ValuationReportExporter:
                         for forecast_row in range(dcf_data_start, dcf_last_row + 1)
                     )
                     terminal_period_ref = f"'DCF复算'!$L${dcf_last_row}" if record.request.discount_policy == "year_end" else f"('DCF复算'!$L${dcf_last_row}+'DCF复算'!$O${dcf_last_row}/2)"
-                    cash_ref = "MAX(0,'DCF复算'!$B$4-'DCF复算'!$B$9)" if "surplus_cash" in result.dcf.bridge else "'DCF复算'!$B$4"
+                    cash_ref = "MAX(0,'DCF复算'!$B$4-'DCF复算'!$B$10)"
                     terminal_term = (
-                        f"'DCF复算'!$K${dcf_last_row}*(1+{growth_ref})/"
-                        f"({wacc_ref}-{growth_ref})/(1+{wacc_ref})^{terminal_period_ref}"
+                        (
+                            f"'DCF复算'!$G${dcf_last_row}*(1+{growth_ref})*"
+                            f"(1-{growth_ref}/'DCF复算'!$B$9)/"
+                            f"({wacc_ref}-{growth_ref})/(1+{wacc_ref})^{terminal_period_ref}"
+                        )
+                        if normalized_terminal
+                        else (
+                            f"'DCF复算'!$K${dcf_last_row}*(1+{growth_ref})/"
+                            f"({wacc_ref}-{growth_ref})/(1+{wacc_ref})^{terminal_period_ref}"
+                        )
                     )
+                    invalid_condition = f"{wacc_ref}<={growth_ref}"
+                    if normalized_terminal:
+                        invalid_condition = (
+                            f"OR({invalid_condition},"
+                            f"{growth_ref}>='DCF复算'!$B$9)"
+                        )
                     sensitivity.cell(row_index, column_index).value = (
-                        f'=IF({wacc_ref}<={growth_ref},"无效",'
+                        f'=IF({invalid_condition},"无效",'
                         f"({explicit_terms}+{terminal_term}+{cash_ref}-"
-                        f"'DCF复算'!$B$5)/'DCF复算'!$B$6)"
+                        f"'DCF复算'!$B$5+'DCF复算'!$B$11)/'DCF复算'!$B$6)"
                     )
         for row in range(2, sensitivity.max_row + 1):
             sensitivity.cell(row, 1).number_format = "0.00%"
@@ -678,7 +758,9 @@ class ValuationReportExporter:
         story += [Spacer(1, 3*mm), p(result.executive_summary), p("数据质量", h2), table([
             ["指标", "结论", "说明"],
             ["总体置信度", result.data_quality.confidence,
-             f"可比历史 {result.data_quality.comparable_years}/{result.data_quality.historical_years} 年"],
+             f"结果等级 {result.data_quality.result_grade} · 可比历史 {result.data_quality.comparable_years}/{result.data_quality.historical_years} 年"],
+            ["市场参数", result.data_quality.market_input_quality,
+             "降级字段：" + ("、".join(result.data_quality.degraded_fields) or "无")],
             ["证据覆盖率", f"{result.data_quality.evidence_coverage:.2%}",
              (f"行业参数 {result.data_quality.industry_parameter_quality} · 元数据 {result.data_quality.industry_metadata_completeness}"
               if result.dcf else "仅统计本次相对估值所需的基期财务字段")],
@@ -688,6 +770,7 @@ class ValuationReportExporter:
             ["参数", "数值", "依据"],
             ["WACC", f"{result.assumptions.wacc:.2%}" if result.dcf else "不适用", result.assumptions.rationale.get("wacc", "")],
             ["永续增长率", f"{result.assumptions.terminal_growth:.2%}" if result.dcf else "不适用", result.assumptions.rationale.get("terminal_growth", "")],
+            ["稳定期ROIC", f"{result.dcf.stable_roic:.2%}" if result.dcf and result.dcf.stable_roic is not None else "不适用", result.assumptions.rationale.get("stable_roic", "")],
             ["假设来源", result.assumptions.source, "模型与输入审计轨迹保存在系统中"],
         ], [38*mm, 34*mm, 86*mm])]
         if result.effective_financials:
@@ -727,6 +810,13 @@ class ValuationReportExporter:
                  "股权价值", f"{result.dcf.equity_value:,.0f}"],
                 ["终值占企业价值", f"{result.dcf.terminal_value_share:.2%}",
                  "基准每股价值", f"{result.dcf.per_share_value:.2f}"],
+                ["终值期FCFF", (
+                    f"{result.dcf.terminal_fcff:,.0f}"
+                    if result.dcf.terminal_fcff is not None else "-"
+                 ), "稳定期再投资率", (
+                    f"{result.dcf.terminal_reinvestment_rate:.2%}"
+                    if result.dcf.terminal_reinvestment_rate is not None else "-"
+                 )],
             ], [42*mm, 37*mm, 42*mm, 37*mm])]
             scenario_labels = {
                 "pessimistic": "悲观", "base": "基准", "optimistic": "乐观",
@@ -739,10 +829,18 @@ class ValuationReportExporter:
                 [42*mm, 37*mm],
             ))
             story.append(p(
-                "公式口径：企业价值 = 显性期FCFF现值 + 终值现值；股权价值按现金、"
-                "非经营性资产、经营所需现金和有息负债完成桥接，再除以普通股股数。",
+                "公式口径：终值期FCFF = N+1期NOPAT × (1 − g/稳定期ROIC)；企业价值 = "
+                "显性期FCFF现值 + 终值现值。股权价值按可分配现金、完整债务、租赁、"
+                "少数股东权益及其他非经营项目完成桥接，再除以稀释后或普通股股数。",
                 small,
             ))
+            if result.dcf.bridge_unmeasured_items:
+                story.append(p(
+                    "未建立桥接项："
+                    + "、".join(result.dcf.bridge_unmeasured_items)
+                    + "。这些项目未被视为已确认0，本次未做相应调整，详见风险与质量说明。",
+                    small,
+                ))
         requested_relative = any(str(method) != "dcf" for method in record.request.methods)
         if requested_relative or result.effective_peers or result.relative:
             story += [PageBreak(), p("可比公司与相对估值", h2)]

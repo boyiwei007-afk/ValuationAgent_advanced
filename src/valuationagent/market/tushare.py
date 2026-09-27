@@ -179,7 +179,7 @@ class TushareDataProvider:
         "ts_code", "ann_date", "f_ann_date", "end_date", "report_type", "comp_type",
         "money_cap", "total_hldr_eqy_exc_min_int", "total_assets", "total_liab",
         "fix_assets", "intan_assets", "lt_amor_exp", "use_right_assets", "lease_liab",
-        "accounts_receiv", "inventories", "acct_payable",
+        "minority_int", "accounts_receiv", "inventories", "acct_payable",
     ]
     CASHFLOW_FIELDS: ClassVar[list[str]] = [
         "ts_code", "ann_date", "f_ann_date", "end_date", "report_type", "comp_type",
@@ -329,32 +329,79 @@ class TushareDataProvider:
         warnings: list[str] = []
         rows = []
         previous_nwc: Decimal | None = None
+        previous_nwc_evidence: list[EvidenceRef] = []
+        previous_nwc_period: str | None = None
         latest_shares = (_decimal(daily.get("total_share")) or D(0)) * D("10000")
         latest_market_cap = (_decimal(daily.get("total_mv")) or D(0)) * D("10000")
         if latest_shares <= 0:
             raise ValueError("每日指标缺少总股本，无法形成每股估值。")
         for period in periods:
             inc, bal, cash, ind = income[period], balance[period], cashflow[period], indicator[period]
-            revenue = _decimal(inc.get("revenue") or inc.get("total_revenue"))
-            ebit = _decimal(ind.get("ebit")) or _decimal(inc.get("operate_profit"))
+            revenue_field = "revenue" if _decimal(inc.get("revenue")) is not None else "total_revenue"
+            revenue = _decimal(inc.get(revenue_field))
+            ebit_field = "ebit" if _decimal(ind.get("ebit")) is not None else "operate_profit"
+            ebit = (
+                _decimal(ind.get("ebit"))
+                if ebit_field == "ebit"
+                else _decimal(inc.get("operate_profit"))
+            )
             net_income = _decimal(inc.get("n_income_attr_p"))
             if not revenue or revenue <= 0 or ebit is None or net_income is None:
                 raise ValueError(f"{ticker} {period} 缺少收入、EBIT或归母净利润。")
             da = _decimal(ind.get("daa"))
             ebitda = _decimal(ind.get("ebitda"))
+            da_method = "tushare.fina_indicator.daa" if da is not None else ""
+            ebitda_method = "tushare.fina_indicator.ebitda" if ebitda is not None else ""
             if da is None and ebitda is not None:
-                da = max(D(0), ebitda - ebit)
+                da = ebitda - ebit
+                da_method = "fina_indicator.ebitda - ebit"
             if da is None:
-                components = [
-                    _decimal(cash.get("depr_fa_coga_dpba")),
-                    _decimal(cash.get("amort_intang_assets")),
-                    _decimal(cash.get("lt_amort_deferred_exp")),
-                    _decimal(cash.get("use_right_asset_dep")),
-                ]
-                da = sum((item for item in components if item is not None), D(0))
-            if ebitda is None:
+                component_fields = (
+                    "depr_fa_coga_dpba",
+                    "amort_intang_assets",
+                    "lt_amort_deferred_exp",
+                    "use_right_asset_dep",
+                )
+                component_values = {
+                    field_name: _decimal(cash.get(field_name))
+                    for field_name in component_fields
+                }
+                expected_component_fields = (
+                    component_fields
+                    if int(period[:4]) >= 2019
+                    else component_fields[:3]
+                )
+                if all(
+                    component_values[field_name] is not None
+                    for field_name in expected_component_fields
+                ):
+                    da = sum(
+                        (
+                            component_values[field_name]
+                            for field_name in expected_component_fields
+                        ),
+                        D(0),
+                    )
+                    da_method = "sum(disclosed_cashflow_depreciation_amortization_components)"
+                elif any(
+                    component_values[field_name] is not None
+                    for field_name in expected_component_fields
+                ):
+                    warnings.append(
+                        f"{period}折旧摊销明细仅部分可得，未将缺失分项当作0；"
+                        "D&A保留为未知并由估值模型降级。"
+                    )
+            if da is not None and da < 0:
+                warnings.append(
+                    f"{period} D&A为负数，未截断为0；已作为异常值留空并降级。"
+                )
+                da = None
+                da_method = "invalid_negative_source_value"
+            if ebitda is None and da is not None:
                 ebitda = ebit + da
-            capex = abs(_decimal(cash.get("c_pay_acq_const_fiolta")) or D(0))
+                ebitda_method = "ebit + depreciation_amortization"
+            raw_capex = _decimal(cash.get("c_pay_acq_const_fiolta"))
+            capex = abs(raw_capex) if raw_capex is not None else None
             receivable = _decimal(bal.get("accounts_receiv"))
             inventory = _decimal(bal.get("inventories"))
             payable = _decimal(bal.get("acct_payable"))
@@ -363,28 +410,162 @@ class TushareDataProvider:
                 if receivable is not None and inventory is not None and payable is not None
                 else None
             )
-            nwc = _decimal(ind.get("networking_capital") or ind.get("working_capital"))
+            # Generic working capital includes financing/cash balances and is
+            # not interchangeable with operating NWC in FCFF.  Prefer the
+            # vendor's net operating capital; otherwise use disclosed trade
+            # receivables, inventory and payables or leave the driver unknown.
+            nwc_field = "networking_capital"
+            nwc = _decimal(ind.get(nwc_field))
             if nwc is None:
                 nwc = direct_nwc
-            change_nwc = D(0) if nwc is None or previous_nwc is None else nwc - previous_nwc
+                nwc_method = (
+                    "accounts_receivable + inventory - accounts_payable"
+                    if direct_nwc is not None
+                    else ""
+                )
+                nwc_evidence = []
+                for field_name in ("accounts_receiv", "inventories", "acct_payable"):
+                    if _decimal(bal.get(field_name)) is not None:
+                        nwc_evidence.extend(
+                            self._evidence(ticker, period, "balancesheet", field_name)
+                        )
+                if nwc is None and _decimal(ind.get("working_capital")) is not None:
+                    warnings.append(
+                        f"{period}仅有一般营运资金working_capital；其口径不能直接用于"
+                        "FCFF的经营营运资本，ΔNWC保持未知。"
+                    )
+            else:
+                nwc_method = f"tushare.fina_indicator.{nwc_field}"
+                nwc_evidence = self._evidence(
+                    ticker, period, "fina_indicator", nwc_field
+                )
+            change_nwc = (
+                nwc - previous_nwc
+                if nwc is not None and previous_nwc is not None
+                else None
+            )
+            change_nwc_method = (
+                f"operating_nwc[{period}] - operating_nwc[{previous_nwc_period}]"
+                if change_nwc is not None
+                else "unavailable_without_consecutive_operating_nwc"
+            )
             if nwc is None:
-                warnings.append(f"{period}缺少经营营运资本，ΔNWC暂为0并要求复核。")
+                warnings.append(
+                    f"{period}缺少经营营运资本，ΔNWC保留为未知并由估值模型显式降级。"
+                )
+            elif previous_nwc is None:
+                warnings.append(
+                    f"{period}为首个可用营运资本期，无法计算同口径ΔNWC；已保留为未知。"
+                )
             total_profit = _decimal(inc.get("total_profit"))
             tax_expense = _decimal(inc.get("income_tax"))
             if total_profit is not None and total_profit > 0 and tax_expense is not None:
-                tax_rate = max(D(0), min(D("0.6"), tax_expense / total_profit))
+                raw_tax_rate = tax_expense / total_profit
+                tax_rate = max(D(0), min(D("0.6"), raw_tax_rate))
+                tax_method = "income_tax / total_profit (clamped_to_0_60_percent)"
+                if tax_rate != raw_tax_rate:
+                    warnings.append(
+                        f"{period}由所得税费用/利润总额得到的税率"
+                        f"{raw_tax_rate:.2%}超出0%–60%校验区间，已保留原始证据并"
+                        f"按{tax_rate:.2%}建模，需人工复核一次性税项。"
+                    )
             else:
                 tax_rate = D("0.25")
+                tax_method = "policy_default_25_percent_due_missing_tax_base"
                 warnings.append(f"{period}无法由所得税费用/利润总额计算税率，暂用25%并要求复核。")
             period_date = _record_date(period)
             announced = inc.get("f_ann_date") or inc.get("ann_date")
             evidence = {
-                "revenue": self._evidence(ticker, period, "income", "revenue", announced),
-                "ebit_margin": self._evidence(ticker, period, "fina_indicator", "ebit", announced),
+                "revenue": self._evidence(ticker, period, "income", revenue_field, announced),
+                "ebit_margin": self._evidence(
+                    ticker,
+                    period,
+                    "fina_indicator" if ebit_field == "ebit" else "income",
+                    ebit_field,
+                    announced,
+                ),
                 "net_income_parent": self._evidence(ticker, period, "income", "n_income_attr_p", announced),
-                "depreciation_amortization": self._evidence(ticker, period, "fina_indicator", "daa", announced),
-                "capital_expenditure": self._evidence(ticker, period, "cashflow", "c_pay_acq_const_fiolta", announced),
             }
+            if da is not None:
+                if _decimal(ind.get("daa")) is not None:
+                    evidence["depreciation_amortization"] = self._evidence(
+                        ticker, period, "fina_indicator", "daa", announced
+                    )
+                elif _decimal(ind.get("ebitda")) is not None:
+                    evidence["depreciation_amortization"] = [
+                        *self._evidence(ticker, period, "fina_indicator", "ebitda", announced),
+                        *evidence["ebit_margin"],
+                    ]
+                else:
+                    evidence["depreciation_amortization"] = []
+                    for field_name in (
+                        "depr_fa_coga_dpba",
+                        "amort_intang_assets",
+                        "lt_amort_deferred_exp",
+                        "use_right_asset_dep",
+                    ):
+                        if _decimal(cash.get(field_name)) is not None:
+                            evidence["depreciation_amortization"].extend(
+                                self._evidence(
+                                    ticker, period, "cashflow", field_name, announced
+                                )
+                            )
+            if capex is not None:
+                evidence["capital_expenditure"] = self._evidence(
+                    ticker, period, "cashflow", "c_pay_acq_const_fiolta", announced
+                )
+            if change_nwc is not None:
+                evidence["change_operating_nwc"] = [
+                    *previous_nwc_evidence,
+                    *nwc_evidence,
+                ]
+            cash_value = _decimal(bal.get("money_cap"))
+            debt_value = _decimal(ind.get("interestdebt"))
+            lease_value = _decimal(bal.get("lease_liab"))
+            minority_value = _decimal(bal.get("minority_int"))
+            for label, value in (
+                ("货币资金", cash_value),
+                ("有息负债", debt_value),
+                ("租赁负债", lease_value),
+            ):
+                if value is not None and value < 0:
+                    raise ValueError(
+                        f"{ticker} {period} {label}为负数，不能静默截断为0。"
+                    )
+            if cash_value is not None:
+                evidence["cash_and_non_operating_assets"] = self._evidence(
+                    ticker, period, "balancesheet", "money_cap", announced
+                )
+            if debt_value is not None:
+                evidence["interest_bearing_debt"] = self._evidence(
+                    ticker, period, "fina_indicator", "interestdebt", announced
+                )
+            if period == periods[-1]:
+                evidence["common_shares"] = self._evidence(
+                    ticker,
+                    str(daily.get("trade_date") or cutoff.strftime("%Y%m%d")),
+                    "daily_basic",
+                    "total_share",
+                )
+            if lease_value is not None:
+                evidence["lease_liabilities"] = self._evidence(
+                    ticker, period, "balancesheet", "lease_liab", announced
+                )
+            if minority_value is not None:
+                evidence["minority_interest"] = self._evidence(
+                    ticker, period, "balancesheet", "minority_int", announced
+                )
+            if total_profit is not None and total_profit > 0 and tax_expense is not None:
+                evidence["tax_rate"] = [
+                    *self._evidence(ticker, period, "income", "income_tax", announced),
+                    *self._evidence(ticker, period, "income", "total_profit", announced),
+                ]
+            if ebitda is not None:
+                evidence["ebitda"] = (
+                    self._evidence(ticker, period, "fina_indicator", "ebitda", announced)
+                    if _decimal(ind.get("ebitda")) is not None
+                    else [*evidence["ebit_margin"], *evidence.get("depreciation_amortization", [])]
+                )
             statement_items = {
                 key: value
                 for key, value in {
@@ -425,20 +606,51 @@ class TushareDataProvider:
                     revenue=revenue,
                     ebit_margin=ebit / revenue,
                     tax_rate=tax_rate,
-                    depreciation_amortization=max(D(0), da),
+                    depreciation_amortization=da,
                     capital_expenditure=capex,
                     change_operating_nwc=change_nwc,
-                    cash_and_non_operating_assets=max(D(0), _decimal(bal.get("money_cap")) or D(0)),
-                    interest_bearing_debt=max(D(0), _decimal(ind.get("interestdebt")) or D(0)),
-                    common_shares=latest_shares,
+                    cash_and_non_operating_assets=cash_value,
+                    interest_bearing_debt=debt_value,
+                    lease_liabilities=(
+                        lease_value
+                        if lease_value is not None
+                        else None
+                    ),
+                    minority_interest=minority_value,
+                    common_shares=(latest_shares if period == periods[-1] else None),
+                    common_shares_as_of=(
+                        _record_date(daily.get("trade_date"))
+                        if period == periods[-1]
+                        else None
+                    ),
                     net_income_parent=net_income,
                     ebitda=ebitda,
                     source_label=f"Tushare Pro · {ticker} · annual statements",
                     evidence=evidence,
                     statement_items=statement_items,
+                    calculation_methods={
+                        "ebit_margin": f"{ebit_field} / {revenue_field}",
+                        "tax_rate": tax_method,
+                        "depreciation_amortization": da_method or "unavailable",
+                        "capital_expenditure": (
+                            "abs(cashflow.c_pay_acq_const_fiolta)"
+                            if capex is not None
+                            else "unavailable"
+                        ),
+                        "change_operating_nwc": change_nwc_method,
+                        "operating_nwc": nwc_method or "unavailable",
+                        "ebitda": ebitda_method or "unavailable",
+                        "interest_bearing_debt": (
+                            "tushare.fina_indicator.interestdebt"
+                            if debt_value is not None
+                            else "unavailable"
+                        ),
+                    },
                 )
             )
             previous_nwc = nwc
+            previous_nwc_evidence = nwc_evidence if nwc is not None else []
+            previous_nwc_period = period if nwc is not None else None
         return rows, list(dict.fromkeys(warnings))
 
     def _company(self, ticker: str) -> CompanyInput:
@@ -470,23 +682,12 @@ class TushareDataProvider:
         annual = self._available_annual(rows, cutoff)
         return annual[max(annual)] if annual else None
 
-    def _peer_cash(self, ticker: str, cutoff: date) -> Decimal:
-        start = date(cutoff.year - 2, 1, 1).strftime("%Y%m%d")
-        rows = self.client.query(
-            "balancesheet",
-            params={"ts_code": ticker, "start_date": start, "end_date": cutoff.strftime("%Y%m%d")},
-            fields=["ts_code", "ann_date", "f_ann_date", "end_date", "money_cap"],
-        )
-        annual = self._available_annual(rows, cutoff)
-        if not annual:
-            return D(0)
-        return max(D(0), _decimal(annual[max(annual)].get("money_cap")) or D(0))
-
     def _select_peers(
         self,
         company: CompanyInput,
         target_daily: dict[str, Any],
         cutoff: date,
+        target_period: date | None = None,
     ) -> tuple[list[PeerCompany], list[str]]:
         universe = self.client.query(
             "stock_basic",
@@ -502,14 +703,24 @@ class TushareDataProvider:
         ]
         if not same:
             return [], ["同一Tushare行业下没有可用非金融候选公司。"]
+        pricing_date = _record_date(target_daily.get("trade_date"))
+        if pricing_date is None or pricing_date > cutoff:
+            return [], ["缺少估值日前可核验的统一交易日，同业倍数不可计算。"]
         market_rows = self.client.query(
             "daily_basic",
             params={"trade_date": str(target_daily["trade_date"])},
-            fields=["ts_code", "trade_date", "pe_ttm", "ps_ttm", "total_mv"],
+            fields=["ts_code", "trade_date", "total_mv"],
         )
-        market = {row["ts_code"]: row for row in market_rows}
+        market = {
+            row["ts_code"]: row for row in market_rows
+            if _record_date(row.get("trade_date")) == pricing_date
+        }
         target_mv = (_decimal(target_daily.get("total_mv")) or D(0)) * D("10000")
         target_indicator = self._peer_indicator(company.ticker, cutoff) or {}
+        target_period = target_period or _record_date(target_indicator.get("end_date"))
+        if target_period is None:
+            return [], ["目标公司FY财务期间未确定，不能拼接同业年度倍数。"]
+        period_key = target_period.strftime("%Y%m%d")
         target_growth = _decimal(target_indicator.get("or_yoy")) or D(0)
         target_margin = _decimal(target_indicator.get("ebit_of_gr")) or D(0)
         ranked = []
@@ -525,25 +736,54 @@ class TushareDataProvider:
         warnings = []
         for size_score, row, daily, market_cap in ranked[: max(self.peer_limit * 2, 12)]:
             indicator = self._peer_indicator(row["ts_code"], cutoff)
-            if not indicator:
+            if not indicator or indicator.get("end_date") != period_key:
+                continue
+            income_rows = self.client.query(
+                "income",
+                params={
+                    "ts_code": row["ts_code"],
+                    "start_date": f"{target_period.year}0101",
+                    "end_date": cutoff.strftime("%Y%m%d"),
+                },
+                fields=[
+                    "ts_code", "ann_date", "f_ann_date", "end_date",
+                    "report_type", "revenue", "total_revenue", "n_income_attr_p",
+                ],
+            )
+            income = self._available_annual(income_rows, cutoff).get(period_key)
+            if income is None:
                 continue
             growth = _decimal(indicator.get("or_yoy")) or D(0)
             margin = _decimal(indicator.get("ebit_of_gr")) or D(0)
             quality_score = size_score + abs(float(growth - target_growth)) / 20 + abs(float(margin - target_margin)) / 10
-            pe = _decimal(daily.get("pe_ttm"))
-            ps = _decimal(daily.get("ps_ttm"))
-            ebitda = _decimal(indicator.get("ebitda"))
-            debt = _decimal(indicator.get("interestdebt")) or D(0)
-            cash = self._peer_cash(row["ts_code"], cutoff)
-            ev_ebitda = (market_cap + debt - cash) / ebitda if ebitda and ebitda > 0 else None
-            if not any(value and value > 0 for value in (pe, ps, ev_ebitda)):
+            profit = _decimal(income.get("n_income_attr_p"))
+            revenue_field = "revenue" if _decimal(income.get("revenue")) is not None else "total_revenue"
+            sales = _decimal(income.get(revenue_field))
+            pe = market_cap / profit if profit is not None and profit > 0 else None
+            ps = market_cap / sales if sales is not None and sales > 0 else None
+            if pe is None and ps is None:
                 continue
+            market_evidence = self._evidence(
+                row["ts_code"], pricing_date.isoformat(), "daily_basic", "total_mv"
+            )
+            announced = income.get("f_ann_date") or income.get("ann_date")
+            peer_evidence = {}
+            if pe is not None:
+                peer_evidence["pe"] = [
+                    *market_evidence,
+                    *self._evidence(row["ts_code"], period_key, "income", "n_income_attr_p", announced),
+                ]
+            if ps is not None:
+                peer_evidence["ps"] = [
+                    *market_evidence,
+                    *self._evidence(row["ts_code"], period_key, "income", revenue_field, announced),
+                ]
             peers.append((quality_score, PeerCompany(
                 ticker=row["ts_code"],
                 name=str(row.get("name") or row["ts_code"]),
                 pe=pe if pe and pe > 0 else None,
                 ps=ps if ps and ps > 0 else None,
-                ev_ebitda=ev_ebitda if ev_ebitda and ev_ebitda > 0 else None,
+                ev_ebitda=None,
                 market_cap=market_cap,
                 revenue_growth=growth / D("100"),
                 ebit_margin=margin / D("100"),
@@ -551,8 +791,13 @@ class TushareDataProvider:
                 peer_tier="broad",
                 rationale=(
                     f"Tushare同一行业={company.industry}；规模/增长/EBIT率距离得分={quality_score:.4f}；"
-                    f"市场数据日={daily.get('trade_date')}；EV=市值+有息负债-货币资金"
+                    f"市场数据日={pricing_date}；同业FY期间={target_period}；"
+                    "PE/PS由同日市值除以已披露同年度利润/收入复算"
                 ),
+                as_of_date=pricing_date,
+                financial_period_end=target_period,
+                multiple_basis="FY",
+                evidence=peer_evidence,
             )))
         peers.sort(key=lambda item: item[0])
         selected = [
@@ -561,6 +806,11 @@ class TushareDataProvider:
         ]
         if len(selected) < 3:
             warnings.append(f"生产筛选后仅{len(selected)}家可比公司，倍数结果将标记样本不足。")
+        if selected:
+            warnings.append(
+                "自动同业EV/EBITDA未生成：同行债务、受限现金、租赁及少数股东"
+                "桥接尚未完整核验；需要已核验的同口径企业价值倍数。"
+            )
         return selected, warnings
 
     def resolve(self, request: ValuationRequest, store) -> DataBundle:
@@ -611,7 +861,9 @@ class TushareDataProvider:
         peers = list(request.peers)
         if any(method != "dcf" for method in request.methods) and not peers:
             try:
-                peers, peer_warnings = self._select_peers(company, daily, request.valuation_date)
+                peers, peer_warnings = self._select_peers(
+                    company, daily, request.valuation_date, financials[-1].period_end
+                )
                 warnings.extend(peer_warnings)
             except ValueError as exc:
                 peers = []
@@ -623,12 +875,37 @@ class TushareDataProvider:
         company = company.model_copy(update={"industry": model_industry})
         if mapping_warning:
             warnings.append(mapping_warning)
+        assumption_updates = {}
+        if (
+            request.assumptions.quarterly_average_market_cap is None
+            and market_cap_statistics.get("quarterly_average_market_cap") is not None
+        ):
+            assumption_updates["quarterly_average_market_cap"] = (
+                market_cap_statistics["quarterly_average_market_cap"]
+            )
+        effective_assumptions = request.assumptions.model_copy(
+            update=assumption_updates
+        )
+        effective_assumption_evidence = dict(request.assumption_evidence)
+        market_date = _record_date(daily.get("trade_date"))
+        if market_date is not None:
+            period = market_date.isoformat()
+            for key in (
+                "quarterly_average_market_cap",
+                "annual_average_market_cap",
+                "market_cap_period_low",
+                "market_cap_period_high",
+            ):
+                if market_cap_statistics.get(key) is not None:
+                    effective_assumption_evidence[key] = self._evidence(
+                        ticker, period, "daily_basic", key
+                    )
         return DataBundle(
             company=company,
             financials=financials[-1],
             historical_financials=financials[:-1],
             peers=peers,
-            assumptions=request.assumptions,
-            assumption_evidence=request.assumption_evidence,
+            assumptions=effective_assumptions,
+            assumption_evidence=effective_assumption_evidence,
             warnings=list(dict.fromkeys(warnings)),
         )

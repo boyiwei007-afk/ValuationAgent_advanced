@@ -367,7 +367,7 @@ def _bind_issuer_shares(item, block, draft, aliases, identity_text):
     # that relative date into a factual issuer share-count date. The preceding
     # total is distinct from the lower dividend-eligibility base.
     relative = re.fullmatch(
-        r"(?:以)?截至本(?:年度)?报告披露之日(?:本公司|公司)(?:的)?总股本(?:为)?"
+        r"(?:以)?截至本(?:年度)?报告披露之日[，,]?(?:本公司|公司)(?:的)?总股本(?:为|是|共计|[:：])?"
         r"(?P<amount>(?:\d{1,3}(?:[,，]\d{3})+|\d+))(?P<unit>股|万股|亿股)",
         quote,
     )
@@ -411,7 +411,7 @@ def _bind_issuer_shares(item, block, draft, aliases, identity_text):
         r"(?:截至|截止至?|截至至)?(?<!\d)(?P<year>(?:19|20)\d{2})年"
         r"(?:(?P<month>\d{1,2})月(?P<day>\d{1,2})日|(?:度)?末)[，,]?"
         + owner_pattern + r"(?:的)?(?:普通股股份总数|普通股股数|股份总数|总股本)"
-        r"(?:为|是|共计|[:：])(?P<amount>(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?)"
+        r"(?:为|是|共计|[:：])?(?P<amount>(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?)"
         r"(?P<unit>百万股|亿股|万股|千股|股)(?!本|息)"
     )
     matches = list(disclosure.finditer(quote))

@@ -300,11 +300,11 @@ def test_xlsx_reference_recalc_preserves_stub_fraction_and_tax(tmp_path):
     record = runner.run(request)
     book = load_workbook(BytesIO(ValuationReportExporter().xlsx(record)))
     sheet = book['DCF复算']
-    assert D(str(sheet['F12'].value)) == record.result.effective_financials.tax_rate
-    assert abs(D(str(sheet['O12'].value)) - record.result.forecast[0].cash_flow_fraction) < D('0.0000000001')
-    assert sheet['N12'].value == '=K12*O12*M12'
+    assert D(str(sheet['F15'].value)) == record.result.effective_financials.tax_rate
+    assert abs(D(str(sheet['O15'].value)) - record.result.forecast[0].cash_flow_fraction) < D('0.0000000001')
+    assert sheet['N15'].value == '=K15*O15*M15'
     assert '/2)' in sheet['Q5'].value
-    assert '*\'DCF复算\'!$O$12' in book['敏感性分析']['B2'].value
+    assert '*\'DCF复算\'!$O$15' in book['敏感性分析']['B2'].value
 
 
 def test_xlsx_formal_recalc_excludes_operating_cash_and_treats_names_as_text(tmp_path):
@@ -316,8 +316,13 @@ def test_xlsx_formal_recalc_excludes_operating_cash_and_treats_names_as_text(tmp
     book = load_workbook(BytesIO(ValuationReportExporter().xlsx(record)))
     sheet = book['DCF复算']
     assert sheet['B9'].value > 0
-    assert sheet['Q7'].value == '=MAX(0,$B$4-$B$9)'
-    assert "MAX(0,'DCF复算'!$B$4-'DCF复算'!$B$9)" in book['敏感性分析']['B2'].value
+    assert sheet['B10'].value > 0
+    assert sheet['Q4'].value == '=$B$3/$B$9'
+    assert sheet['Q10'].value == '=MAX(0,$B$4-$B$10)'
+    assert sheet['Q14'].value == '=Q13/$B$6'
+    sensitivity_formula = book['敏感性分析']['B2'].value
+    assert "MAX(0,'DCF复算'!$B$4-'DCF复算'!$B$10)" in sensitivity_formula
+    assert ">='DCF复算'!$B$9" in sensitivity_formula
     assert book['估值摘要']['B2'].data_type == 's'
 
 

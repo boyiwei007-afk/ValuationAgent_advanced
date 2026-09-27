@@ -3,6 +3,8 @@ import hashlib
 import json
 from itertools import combinations
 
+from valuationagent.application.document_retrieval import rank_document_blocks
+
 
 def scope_key(session):
     scope = session.draft.model_dump(mode="json", exclude={"objective"})
@@ -95,16 +97,31 @@ def valuation_progress(session, assembler):
                                  and assembler.model_scope_issue(preview))
         evidence_issues = [{"fact_id": f.fact_id, "metric": f.metric, "period": f.period,
                             "warnings": list(f.warnings)} for f in assembler.pending_blockers(preview) if f.warnings]
+        suggested_source_blocks = []
+        if (
+            any("股" in item["metric"] or "shares" in item["metric"] for item in evidence_issues)
+            and assembler._block_loader is not None
+        ):
+            blocks = assembler._block_loader(preview)
+            if isinstance(blocks, dict):
+                blocks = list(blocks.values())
+            for block in rank_document_blocks(list(blocks), "股份总数")[:2]:
+                suggested_source_blocks.append({
+                    "block_id": block.get("block_id"),
+                    "page": (block.get("location") or {}).get("page"),
+                    "text": str(block.get("text") or "")[:600],
+                })
         detailed_error = original_error or "估值输入尚不完整"
         if evidence_issues and original_error and "待确认候选" in original_error:
             detailed_error = "必要字段尚未通过来源校验：" + "；".join(
                 f"{item['period']} {item['metric']}（{'、'.join(item['warnings'][:2])}）" for item in evidence_issues[:5])
         return {"status": "unsupported_model_scope" if scope_unsupported else "building_model", "ready_for_review": False, "blocking_reason": original_error or "估值输入尚不完整",
                 "blocking_detail": detailed_error, "evidence_issues": evidence_issues,
+                "suggested_source_blocks": suggested_source_blocks,
                 "staged_fact_ids": staged, "confirmed_fact_count": candidate_counts["confirmed"],
                 "candidate_counts": candidate_counts,
                 "instruction": ("当前所选方法需要尚未实现的专业调整，继续补普通财务字段也不能解除；立即交付说明报告，不要持续检索或承诺补一项就能计算。用户可另行明确更换方法。"
-                                if scope_unsupported else "只补当前模型必要输入。基期完整但历史不足时，可调用propose_forecast提出有依据的十年三情景预测，最终由用户集中确认。历史缺失不可用假设、零值或搜索摘要替代。")}
+                                if scope_unsupported else "只补当前模型必要输入。有股数来源警告时先检查suggested_source_blocks中的有日期发行人总股本原文，引用准确片段和截止日重新提交；该提示不是自动确认。基期完整但历史不足时，可调用propose_forecast提出有依据的十年三情景预测，最终由用户集中确认。历史缺失不可用假设、零值或搜索摘要替代。")}
     degraded = bool(exclusions)
     return {"status": "ready_for_review", "ready_for_review": True, "blocking_reason": "",
             "staged_fact_ids": staged, "methods": request.methods,
@@ -116,7 +133,9 @@ def valuation_progress(session, assembler):
             "baseline_period": str(request.financials.period_end) if request.financials else None,
             "historical_periods": [str(f.period_end) for f in request.historical_financials],
             "financials": request.financials.model_dump(mode="json", exclude={"evidence", "statement_items"}) if request.financials else None,
-            "assumptions": request.assumptions.model_dump(mode="json", exclude_none=True),
+            "assumptions": request.assumptions.model_dump(
+                mode="json", exclude_none=True, exclude_defaults=True
+            ),
             "forecast_proposal_id": session.forecast_proposal.proposal_id if session.forecast_proposal else None,
             "forecast_rationale": session.forecast_proposal.rationale if session.forecast_proposal else "采用确定性模型的历史推导与行业参数；计算时披露假设及风险。",
             "risks": [

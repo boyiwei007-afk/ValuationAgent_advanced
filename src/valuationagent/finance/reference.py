@@ -60,11 +60,32 @@ class ReferenceFinancialModel:
         return demo_peers()
 
     def validate(
-        self, request: ValuationRequest, financials: FinancialSnapshot
+        self,
+        request: ValuationRequest,
+        financials: FinancialSnapshot,
+        *,
+        allow_dcf_driver_degradation: bool = False,
     ) -> list[ValidationFinding]:
         from valuationagent.schemas.models import required_financial_metrics
         findings: list[ValidationFinding] = []
-        missing = sorted(key for key in required_financial_metrics(request.methods) if getattr(financials, key) is None)
+        required = required_financial_metrics(request.methods)
+        if allow_dcf_driver_degradation and "dcf" in request.methods:
+            # The finance-team implementation has deterministic, disclosed
+            # fallbacks for these three cash-flow drivers.  The reference model
+            # remains strict because it does not implement those fallbacks.
+            required -= {
+                "depreciation_amortization",
+                "capital_expenditure",
+                "change_operating_nwc",
+            }
+        missing = sorted(
+            key
+            for key in required
+            if getattr(financials, key) is None
+            and not (
+                key == "common_shares" and financials.diluted_shares is not None
+            )
+        )
         if missing:
             return [ValidationFinding(rule_id="METHOD_INPUTS_MISSING", severity="blocking",
                                       message="所选估值方法缺少已确认字段：" + "、".join(missing))]
@@ -127,7 +148,11 @@ class ReferenceFinancialModel:
                     recommended_action="更换估值日或使用当时已公开的数据。",
                 )
             )
-        if "ev_ebitda" in request.methods and financials.ebitda <= 0:
+        if (
+            "ev_ebitda" in request.methods
+            and financials.ebitda is not None
+            and financials.ebitda <= 0
+        ):
             findings.append(
                 ValidationFinding(
                     rule_id="MULTIPLE_APPLICABILITY_001",
@@ -135,7 +160,11 @@ class ReferenceFinancialModel:
                     message="EBITDA 非正，EV/EBITDA 相对估值将不适用。",
                 )
             )
-        if "pe" in request.methods and financials.net_income_parent <= 0:
+        if (
+            "pe" in request.methods
+            and financials.net_income_parent is not None
+            and financials.net_income_parent <= 0
+        ):
             findings.append(
                 ValidationFinding(
                     rule_id="MULTIPLE_APPLICABILITY_002",
@@ -145,12 +174,19 @@ class ReferenceFinancialModel:
             )
         if "dcf" not in request.methods:
             return findings
+        reinvestment_inputs = (
+            financials.capital_expenditure,
+            financials.depreciation_amortization,
+            financials.change_operating_nwc,
+        )
         reinvestment = (
             financials.capital_expenditure
             - financials.depreciation_amortization
             + financials.change_operating_nwc
+            if all(value is not None for value in reinvestment_inputs)
+            else None
         )
-        if reinvestment < 0:
+        if reinvestment is not None and reinvestment < 0:
             findings.append(
                 ValidationFinding(
                     rule_id="REINVESTMENT_001",
@@ -323,7 +359,8 @@ class ReferenceFinancialModel:
             + financials.cash_and_non_operating_assets
             - financials.interest_bearing_debt
         )
-        per_share = equity_value / financials.common_shares
+        shares = financials.diluted_shares or financials.common_shares
+        per_share = equity_value / shares
         terminal_share = (
             discounted_terminal / enterprise_value if enterprise_value else D(0)
         )
@@ -405,6 +442,7 @@ class ReferenceFinancialModel:
         peers: list[PeerCompany],
     ) -> list[MultipleResult]:
         results: list[MultipleResult] = []
+        shares = financials.diluted_shares or financials.common_shares
         if ValuationMethod.PE in request.methods:
             pe_values = [peer.pe for peer in peers if peer.pe is not None]
             if financials.net_income_parent <= 0 or not pe_values:
@@ -418,7 +456,7 @@ class ReferenceFinancialModel:
                 )
             else:
                 values = [
-                    multiple * financials.net_income_parent / financials.common_shares
+                    multiple * financials.net_income_parent / shares
                     for multiple in pe_values
                 ]
                 results.append(
@@ -451,7 +489,7 @@ class ReferenceFinancialModel:
                         + financials.cash_and_non_operating_assets
                         - financials.interest_bearing_debt
                     )
-                    / financials.common_shares
+                    / shares
                     for multiple in multiples
                 ]
                 results.append(

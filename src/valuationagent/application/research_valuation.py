@@ -51,6 +51,9 @@ METRIC_ALIASES = {
         "common_shares", "总股本", "普通股股数", "普通股股份总数",
         "普通股股份总额", "股份总数",
     },
+    "diluted_shares": {
+        "diluted_shares", "稀释后股份总数", "稀释后普通股股数", "完全摊薄股数",
+    },
     "net_income_parent": {"net_income_parent", "归母净利润", "归属于母公司股东的净利润", "归属于上市公司股东的净利润"},
     "ebitda": {"ebitda", "息税折旧摊销前利润"},
     # Raw statement lines accepted as deterministic derivation inputs.  The
@@ -86,6 +89,14 @@ METRIC_ALIASES = {
     "bonds_payable": {"bonds_payable", "应付债券"},
     "lease_liabilities": {"lease_liabilities", "租赁负债"},
     "minority_interest": {"minority_interest", "noncontrolling_interest", "少数股东权益"},
+    "preferred_equity": {"preferred_equity", "优先股权益", "优先股"},
+    "associates_and_non_operating_investments": {
+        "associates_and_non_operating_investments", "联营及非经营性投资", "长期股权投资",
+    },
+    "unfunded_pension": {"unfunded_pension", "未弥补养老金缺口"},
+    "non_operating_provisions": {
+        "non_operating_provisions", "非经营性预计负债", "预计负债",
+    },
     "restricted_cash": {
         "restricted_cash", "受限货币资金", "使用受到限制的货币资金",
         "存放中央银行法定存款准备金", "法定存款准备金",
@@ -129,6 +140,7 @@ METRIC_LABELS = {
     "cash_and_non_operating_assets": "现金及非经营性资产",
     "interest_bearing_debt": "有息负债",
     "common_shares": "普通股股数",
+    "diluted_shares": "稀释后普通股股数",
     "net_income_parent": "归母净利润",
     "ebitda": "EBITDA",
 }
@@ -137,6 +149,16 @@ REQUIRED_METRICS = {
     "revenue", "tax_rate", "depreciation_amortization", "capital_expenditure",
     "change_operating_nwc", "cash_and_non_operating_assets", "interest_bearing_debt",
     "common_shares", "net_income_parent", "ebitda", "ebit_margin",
+}
+
+OPTIONAL_BRIDGE_METRICS = {
+    "diluted_shares",
+    "lease_liabilities",
+    "minority_interest",
+    "preferred_equity",
+    "associates_and_non_operating_investments",
+    "unfunded_pension",
+    "non_operating_provisions",
 }
 
 DEPRECIATION_COMPONENTS = (
@@ -187,6 +209,13 @@ ASSUMPTION_ALIASES = {
     "beta": {"beta", "贝塔", "贝塔系数"},
     "debt_cost": {"debt_cost", "债务成本"},
     "market_cap": {"market_cap", "市值", "总市值"},
+    "quarterly_average_market_cap": {
+        "quarterly_average_market_cap", "估值日前四季度平均市值", "四季度平均市值",
+    },
+    "annual_average_market_cap": {
+        "annual_average_market_cap", "年度平均市值", "年均市值",
+    },
+    "stable_roic": {"stable_roic", "稳定期roic", "永续期roic"},
 }
 
 
@@ -257,6 +286,26 @@ class ResearchValuationAssembler:
             blocks = list(blocks.values())
         return source_risk_inventory(session, blocks, period_end)
 
+    @staticmethod
+    def _verified_dated_issuer_shares(fact):
+        """Use an explicitly dated issuer total as well as a dated report total.
+
+        Both bindings have already checked issuer identity, count, unit and
+        cutoff against the source.  The old handoff recognized only the
+        relative report-disclosure wording and discarded an equally verified
+        explicit calendar date.
+        """
+        checked = fact.verification
+        return (
+            fact.scope == "issuer"
+            and checked.get("scope") == "issuer"
+            and checked.get("binding") in {
+                "issuer_common_shares", "issuer_report_disclosure_shares",
+            }
+            and (as_of := _period(fact.period)) is not None
+            and checked.get("period_end") == as_of.isoformat()
+        )
+
     def later_issuer_shares_issue(self, session):
         """Flag an annual-report share count contradicted by its later disclosure.
 
@@ -302,8 +351,7 @@ class ResearchValuationAssembler:
                             and normalize_financial_metric(fact.metric) == "common_shares"
                             and (fact.block_id.split(":", 1)[0] == file_id
                                  or bool(source_hash and source_hash == fact.source_sha256))
-                            and fact.verification.get("binding") == "issuer_report_disclosure_shares"
-                            and fact.verification.get("scope") == "issuer"
+                            and self._verified_dated_issuer_shares(fact)
                             and (as_of := _period(fact.period)) and period < as_of
                             and (not session.draft.valuation_date or as_of <= session.draft.valuation_date)
                             and fact.normalized_value is not None
@@ -344,7 +392,8 @@ class ResearchValuationAssembler:
         if not rows:
             return ""
         findings = equity_bridge_review_findings(self._selected_methods(session), rows[max(rows)])
-        return findings[0].message if findings else ""
+        blocking = next((item for item in findings if item.severity == "blocking"), None)
+        return blocking.message if blocking else ""
 
     @staticmethod
     def _selected_methods(session):
@@ -371,6 +420,15 @@ class ResearchValuationAssembler:
         """
         selected = ResearchValuationAssembler._selected_methods(session)
         required = set(required_financial_metrics(selected))
+        if "dcf" in selected:
+            # These drivers can be deterministically degraded by the formal
+            # finance model.  Unresolved candidates remain visible evidence,
+            # but they must not keep the agent in a research/confirmation loop.
+            required -= {
+                "depreciation_amortization",
+                "capital_expenditure",
+                "change_operating_nwc",
+            }
         if {"dcf", "ev_ebitda"} & set(selected):
             required.update(EQUITY_BRIDGE_REVIEW_LABELS)
         dependencies = {
@@ -763,7 +821,16 @@ class ResearchValuationAssembler:
         if share_issue:
             raise ValueError(share_issue)
         selected_methods = self._selected_methods(session)
-        required = required_financial_metrics(selected_methods)
+        required_latest = required_financial_metrics(selected_methods)
+        if "dcf" in selected_methods:
+            required_latest -= {
+                "depreciation_amortization",
+                "capital_expenditure",
+                "change_operating_nwc",
+            }
+            required_history = {"revenue", "ebit_margin"}
+        else:
+            required_history = set(required_latest)
         rows: dict[date, dict[str, tuple[Decimal, list[object]]]] = defaultdict(dict)
         methods: dict[date, dict[str, str]] = defaultdict(dict)
         share_dates: dict[date, date] = {}
@@ -823,8 +890,7 @@ class ResearchValuationAssembler:
             latest_shares = [entry for entry in dated_issuer_shares
                              if latest_statement < entry[0]
                              and (not session.draft.valuation_date or entry[0] <= session.draft.valuation_date)
-                             and entry[2].verification.get("binding") == "issuer_report_disclosure_shares"
-                             and entry[2].verification.get("scope") == "issuer"]
+                             and self._verified_dated_issuer_shares(entry[2])]
             if latest_shares:
                 as_of = max(entry[0] for entry in latest_shares)
                 matches = [entry for entry in latest_shares if entry[0] == as_of]
@@ -838,11 +904,12 @@ class ResearchValuationAssembler:
             bridge_findings = equity_bridge_review_findings(
                 selected_methods, {key: value[0] for key, value in values.items()},
             )
-            if bridge_findings:
-                raise ValueError(f"{period.isoformat()}：" + bridge_findings[0].message)
-            require_da = "dcf" in selected_methods or (
-                "ev_ebitda" in selected_methods and "ebitda" not in values
-            )
+            blocking_bridge = [
+                item for item in bridge_findings if item.severity == "blocking"
+            ]
+            if blocking_bridge:
+                raise ValueError(f"{period.isoformat()}：" + blocking_bridge[0].message)
+            require_da = "ev_ebitda" in selected_methods and "ebitda" not in values
             self._derive_period(values, methods[period], require_da=require_da)
             self._reconcile_period(period, values, methods[period], require_da=require_da)
 
@@ -892,8 +959,14 @@ class ResearchValuationAssembler:
 
         snapshots = []
         incomplete = []
+        latest_statement = max(statement_periods) if statement_periods else None
         for period, values in sorted(rows.items()):
-            missing = sorted(required - set(values))
+            period_required = (
+                required_latest if period == latest_statement else required_history
+            )
+            if "diluted_shares" in values:
+                period_required = set(period_required) - {"common_shares"}
+            missing = sorted(period_required - set(values))
             if missing:
                 incomplete.append((period, missing))
                 continue
@@ -921,8 +994,17 @@ class ResearchValuationAssembler:
                 FinancialSnapshot(
                     period_end=period,
                     common_shares_as_of=share_dates.get(period, period if "common_shares" in values else None),
+                    diluted_shares_as_of=period if "diluted_shares" in values else None,
+                    interest_bearing_debt_includes_leases=(
+                        True
+                        if "lease_liabilities" in methods[period].get(
+                            "interest_bearing_debt", ""
+                        )
+                        else None
+                    ),
                     **{metric: (abs(values[metric][0]) if metric == "capital_expenditure" else values[metric][0])
-                       for metric in REQUIRED_METRICS if metric in values},
+                       for metric in (REQUIRED_METRICS | OPTIONAL_BRIDGE_METRICS)
+                       if metric in values},
                     source_label=(
                         "研究会话已确认原始科目及确定性推导"
                         if has_derivation else "研究会话已确认字段"
@@ -1043,13 +1125,43 @@ class ResearchValuationAssembler:
 
     def _assumptions(self, session) -> tuple[AssumptionInputs, dict[str, list[EvidenceRef]]]:
         values, evidence = {}, {}
+        wacc_market_dates = []
+        wacc_market_sources = []
+        confirmed_wacc_metrics = set()
+        wacc_market_metrics = {
+            "wacc", "risk_free_rate", "equity_risk_premium", "beta", "debt_cost",
+        }
         for fact in session.facts:
             if fact.status != "confirmed" or fact.role != "assumption":
                 continue
             metric = _normalized_metric(fact.metric, ASSUMPTION_ALIASES)
             if metric and fact.normalized_value is not None:
                 values[metric] = D(fact.normalized_value)
-                evidence[metric] = [self._evidence(session, fact)]
+                ref = self._evidence(session, fact)
+                evidence[metric] = [ref]
+                if metric in wacc_market_metrics:
+                    confirmed_wacc_metrics.add(metric)
+                    try:
+                        wacc_market_dates.append(date.fromisoformat(fact.period))
+                    except (TypeError, ValueError):
+                        pass
+                    wacc_market_sources.append(
+                        ref.source_url or ref.source or ref.evidence_id
+                    )
+        wacc_bundle_confirmed = (
+            "wacc" in confirmed_wacc_metrics
+            or {
+                "risk_free_rate", "equity_risk_premium", "beta", "debt_cost",
+            } <= confirmed_wacc_metrics
+        )
+        if wacc_bundle_confirmed and wacc_market_dates:
+            # Freshness is measured from the oldest component in the WACC
+            # snapshot, so a current share price cannot hide a stale ERP/Beta.
+            values["market_inputs_as_of"] = min(wacc_market_dates)
+        if wacc_bundle_confirmed and wacc_market_sources:
+            values["market_inputs_source"] = "；".join(
+                dict.fromkeys(wacc_market_sources)
+            )[:500]
         proposal = session.forecast_proposal
         if proposal is not None:
             from valuationagent.application.valuation_plan import scope_key
@@ -1057,7 +1169,9 @@ class ResearchValuationAssembler:
                 raise ValueError("估值范围已改变，原预测方案已失效；请重新提出并确认预测假设")
             if proposal.status != "confirmed":
                 raise ValueError("预测方案尚未确认，请集中复核估值方案后再计算")
-            for metric, value in proposal.inputs.model_dump(exclude_none=True).items():
+            for metric, value in proposal.inputs.model_dump(
+                exclude_none=True, exclude_defaults=True
+            ).items():
                 if metric in values and values[metric] != value:
                     raise ValueError(f"预测方案与已确认假设 {metric} 冲突；请更正旧假设，不能静默覆盖")
                 values[metric] = value
@@ -1139,7 +1253,11 @@ class ResearchValuationAssembler:
             valuation_date=session.draft.valuation_date,
             language=session.language,
             data_source="ticker" if use_ticker else "structured",
-            assumption_source="manual" if assumptions.model_dump(exclude_none=True) else "automatic",
+            assumption_source=(
+                "manual"
+                if assumptions.model_dump(exclude_none=True, exclude_defaults=True)
+                else "automatic"
+            ),
             mode="snapshot",
             forecast_years=10,
             methods=methods,

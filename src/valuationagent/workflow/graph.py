@@ -629,8 +629,9 @@ def build_workflow(services: WorkflowServices):
                 notes=["兼容模型未提供分项数据质量评分。"],
             )
         )
-        summary += _(" 数据质量置信度：{confidence}。").format(
-            confidence=quality.confidence
+        summary += _(" 数据质量置信度：{confidence}；结果等级：{grade}。").format(
+            confidence=quality.confidence,
+            grade=quality.result_grade,
         )
         effective = {
             "request": req,

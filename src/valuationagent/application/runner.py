@@ -314,7 +314,9 @@ class ValuationRunner:
         llm = self._run_clients.get(run_id)
 
         def change(args):
-            if not args.assumptions.model_dump(exclude_none=True):
+            if not args.assumptions.model_dump(
+                exclude_none=True, exclude_defaults=True
+            ):
                 raise ValueError("请指定要修改的假设。")
             child = self.revise(
                 run_id,
@@ -322,7 +324,7 @@ class ValuationRunner:
                     reason=args.reason,
                     changes={
                         "assumptions": args.assumptions.model_dump(
-                            exclude_none=True, mode="json"
+                            exclude_none=True, exclude_defaults=True, mode="json"
                         )
                     },
                 ),

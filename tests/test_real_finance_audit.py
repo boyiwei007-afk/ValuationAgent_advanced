@@ -14,10 +14,13 @@ from valuationagent.application.research_valuation import (
     ResearchValuationAssembler,
     normalize_financial_metric,
 )
+from valuationagent.application.valuation_plan import valuation_progress
 from valuationagent.schemas.research import FactCandidate
 from valuationagent.schemas.research import ResearchDraft, ResearchSession
 from valuationagent.finance.integrity import (
     EQUITY_BRIDGE_REVIEW_LABELS,
+    SUPPORTED_BOOK_PROXY_KEYS,
+    UNSUPPORTED_COMPLEX_BRIDGE_KEYS,
     equity_bridge_review_findings,
     validate_equity_bridge_inputs,
     verify_calculations,
@@ -178,9 +181,9 @@ def structured_request(method, metric, amount="10"):
     )
 
 
-@pytest.mark.parametrize("metric", list(EQUITY_BRIDGE_REVIEW_LABELS))
+@pytest.mark.parametrize("metric", sorted(UNSUPPORTED_COMPLEX_BRIDGE_KEYS))
 @pytest.mark.parametrize("method", ["dcf", "ev_ebitda"])
-def test_explicit_complex_bridge_inputs_block_only_enterprise_value_methods(metric, method):
+def test_unsupported_complex_bridge_inputs_block_enterprise_value_methods(metric, method):
     request = structured_request(method, metric)
     findings = FinanceTeamModel().validate(request, request.financials)
     gate = next(f for f in findings if f.rule_id == "EQUITY_BRIDGE_COMPLEX_SCOPE")
@@ -190,6 +193,24 @@ def test_explicit_complex_bridge_inputs_block_only_enterprise_value_methods(metr
     assert request.financials.statement_items[metric] == D("10")
     with pytest.raises(ValueError, match="桥接需专项复核"):
         verify_calculations(request, request.financials, None, [], None, [])
+
+
+@pytest.mark.parametrize("metric", sorted(SUPPORTED_BOOK_PROXY_KEYS))
+@pytest.mark.parametrize("method", ["dcf", "ev_ebitda"])
+def test_supported_bridge_book_values_warn_without_blocking(metric, method):
+    request = structured_request(method, metric)
+    findings = FinanceTeamModel().validate(request, request.financials)
+    proxy = next(
+        item for item in findings if item.rule_id == "EQUITY_BRIDGE_BOOK_VALUE_PROXY"
+    )
+    assert proxy.severity == "warning"
+    assert EQUITY_BRIDGE_REVIEW_LABELS[metric] in proxy.message
+    assert not any(
+        item.rule_id == "EQUITY_BRIDGE_COMPLEX_SCOPE" for item in findings
+    )
+    assert verify_calculations(
+        request, request.financials, None, [], None, []
+    ) == []
 
 
 @pytest.mark.parametrize("method", ["pe", "ps"])
@@ -240,12 +261,38 @@ def test_research_bridge_review_retains_raw_evidence_and_allows_pe_subset():
                      fact("common_shares", "100")]
     session.facts[-1].unit = "股"
     assembler = ResearchValuationAssembler()
-    assert "少数股东权益=10" in assembler.structured_readiness_error(session)
+    assert assembler.model_scope_issue(session) == ""
+    readiness = assembler.structured_readiness_error(session)
+    assert "桥接需专项复核" not in readiness
+    assert "仍缺" in readiness
     assert session.facts[0].metric == "少数股东权益"
     session.draft.methods = ["pe"]
     snapshot = assembler._structured_financials(session)[0]
     assert snapshot.net_income_parent == D("140")
+    assert snapshot.minority_interest == D("10")
     assert snapshot.statement_items["minority_interest"] == D("10")
+
+
+def test_share_warning_points_to_dated_issuer_total_in_loaded_report():
+    session = ResearchSession(session_id="issuer_hints", draft=ResearchDraft(
+        company="伊利股份", ticker="600887.SH", valuation_date=date(2025, 6, 30),
+        methods=["dcf"],
+    ), data_source_preference="web")
+    share = fact("股份总数", "6365900705")
+    share.scope = "issuer"
+    share.unit = "股"
+    share.status = "proposed"
+    share.warnings = ["缺少明确的股数截止日"]
+    session.facts = [share]
+    blocks = [
+        {"block_id": "report:71", "text": "股份总数 6,366,098,705 -198,000 6,365,900,705",
+         "location": {"page": 71}},
+        {"block_id": "report:2", "text": "截至2025年4月8日，公司总股本6,365,900,705股",
+         "location": {"page": 2}},
+    ]
+    progress = valuation_progress(session, ResearchValuationAssembler(block_loader=lambda _: blocks))
+    assert progress["status"] == "building_model"
+    assert progress["suggested_source_blocks"][0]["block_id"] == "report:2"
 
 
 def test_only_share_count_accepts_issuer_scope_alongside_consolidated_income():
@@ -345,6 +392,29 @@ def test_verified_report_disclosure_shares_replace_latest_per_share_denominator_
     newer.block_id = "official_copy:3"
     assert not assembler.later_issuer_shares_issue(session)
     assert assembler._structured_financials(session)[0].common_shares == D("7660355772")
+
+
+def test_explicitly_dated_issuer_total_is_accepted_for_latest_per_share_denominator():
+    session = ResearchSession(session_id="test_explicit_share_date", draft=ResearchDraft(
+        company="伊利股份", ticker="600887.SH", valuation_date=date(2025, 6, 30),
+        methods=["pe"],
+    ))
+    shares = fact("总股本", "6365900705")
+    shares.fact_id = "yili:dated-total"
+    shares.scope, shares.unit, shares.period = "issuer", "股", "2025-04-08"
+    shares.verification = {
+        "binding": "issuer_common_shares", "scope": "issuer",
+        "period_end": "2025-04-08", "unit": "股",
+    }
+    session.facts = [fact("归母净利润", "140"), shares]
+    snapshot = ResearchValuationAssembler()._structured_financials(session)[0]
+    assert snapshot.period_end == date(2024, 12, 31)
+    assert snapshot.common_shares == D("6365900705")
+    assert snapshot.common_shares_as_of == date(2025, 4, 8)
+    assert snapshot.calculation_methods["common_shares"] == "issuer_shares_as_of[2025-04-08]"
+
+    shares.verification.pop("period_end")
+    assert "普通股股数" in ResearchValuationAssembler().structured_readiness_error(session)
 
 
 @pytest.mark.parametrize("share_date", [date(2024, 1, 1), date(2025, 7, 1)])

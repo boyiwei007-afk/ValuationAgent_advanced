@@ -4,7 +4,7 @@
 
 Agent 以 LLM 负责意图理解、规划、工具选择和结果解释，以确定性程序负责数据校验与金融计算；长期上下文、异常恢复、来源引用和工具轨迹均可检查。完整机制见[Agent 工作机制与完整流程](docs/ValuationAgent_Agent工作机制与流程.md)。
 
-2026-09-26 v8 加固版：附件优先并自动公开检索补缺、文件失败隔离、跨轮搜索预算、零资料说明报告、独立计算复核与结果优先界面。验收事实与上线边界见[本轮验收说明](docs/生产化加固与验收_2026-09-26.md)。本轮没有改动 Tushare 模块，仍使用 `economic_agent`。这不是“任意公司零资料都能给出价格”的承诺。
+2026-09-27 v11 真实年报加固：已用伊利、美的、宁德时代官方2024年报检查年度/合并口径/单位绑定；美的股份变动表的期末股数现可做完整勾稽，并能识别同份年报稍后披露的不同总股数。股数截止日随估值输入保留，并须处于财务基期至估值日之间。真实端到端结果与生产放行边界见[真实公司验收](docs/真实公司数据验收_2026-09-27.md)，此前结果见[v8验收](docs/生产化加固与验收_2026-09-26.md)。本轮没有改动 Tushare 模块，仍使用 `economic_agent`。说明报告不等于数值估值成功，当前不能宣称无人值守生产放行。
 
 ## 启动
 
@@ -292,7 +292,7 @@ POST   /api/research-sessions/{id}/model-session
 POST   /api/research-sessions/{id}/valuation
 GET    /api/research-sessions/{id}/events
 GET    /api/research-sessions/{id}/sources/{file_id}
-GET    /api/research-sessions/{id}/export?format=json|html
+GET    /api/research-sessions/{id}/export?format=json|html|pdf
 POST   /api/runs
 GET    /api/runs
 GET    /api/capabilities
@@ -316,7 +316,7 @@ reviews 保存更正为新版本，返回其 run_id；resume 启动该版本。r
 
 新版研究 `turns` 接收文字、文件 ID，或 `question_id + option_id`，立即返回 202；`request_id` 用于幂等重试，同 ID 不重复执行，不同内容复用 ID 返回409。同步 `messages` 保留兼容。确认只作用于当前问题，文字修改不会自动确认。网页读取 `GET /api/research-sessions/{id}?compact=true&after=<序号>`，增量事件不附带大 payload，详细输入输出按需获取；旧消息分页。研究会话使用逐次修订与事件记录，不套用估值任务的重算版本机制。
 
-CLI/API/Web 的 JSON 导出共用 `valuation-review-v1`：包含有效输入、计算结果、工具事件、原文块及文件哈希、金融代码与参数哈希。`valuationagent replay <JSON文件>` 检查完整性后，在不调用模型/搜索的情况下重新计算预测、DCF、相对估值和敏感性。它复现锁定输入的计算，不声称重放随机 LLM 输出或保证实时网络结果相同。原始文件仍保存在本地数据目录；需要现场逐文件核验时一并提交有权使用的原文件。
+CLI/API/Web 中成功完成正式估值的 JSON 复算包共用 `valuation-review-v1`：包含有效输入、计算结果、工具事件、原文块及文件哈希、金融代码与参数哈希。研究说明报告的 JSON 不是这个数值复算包，不能将尚未计算的任务拿去重放估值。`valuationagent replay <JSON文件>` 检查正式复算包完整性后，在不调用模型/搜索的情况下重新计算预测、DCF、相对估值和敏感性。它复现锁定输入的计算，不声称重放随机 LLM 输出或保证实时网络结果相同。原始文件仍保存在本地数据目录；需要现场逐文件核验时一并提交有权使用的原文件。
 
 `POST /api/runs/{id}/model-session` 接收 `{"model_session_id":"…"}`，为已有任务附加临时模型会话。不会执行或修改估值；执行中的任务返回 409，未知会话返回 404。
 
@@ -355,7 +355,7 @@ npm.cmd --prefix web run build
 
 本轮可复现验收：`python scripts/production_acceptance.py` 不联网验证零资料报告和确定性算术。`python scripts/live_upload_check.py --live` 隐藏输入模型密钥，验证合成附件→一次集中确认→估值→报告→离线复算；只对脚本自身生成的合成资料自动确认。`python scripts/live_no_upload_check.py --live` 验证真实公司零上传公开取证，最多240秒，不自动确认真实财务事实。后两者会产生模型/搜索服务费用，结果和日志写入各自 `var/` 测试目录。
 
-源码交付：先构建前端，再运行 `python scripts/package_release.py`。脚本打包白名单源码、测试、说明、依赖锁与实际前端构建，不包含密钥、数据库或个人研究目录；逐文件 SHA-256 写入 `RELEASE_MANIFEST.json`。使用 `python scripts/package_release.py --verify <ZIP路径>` 验证完整性。`--include-acceptance` 仅用于附带本机本轮指定的合成验收报告和公开来源探测记录。
+源码交付：先构建前端，再运行 `python scripts/package_release.py`。脚本打包白名单源码、测试、说明、依赖锁与实际前端构建，排除个人研究目录以及已知的密钥/数据库文件类型，并检查常见凭证模式；这不代替正式发布前的敏感信息审查。逐文件 SHA-256 写入 `RELEASE_MANIFEST.json`，使用 `python scripts/package_release.py --verify <ZIP路径>` 验证完整性。`--include-real-acceptance` 附带本轮 v9 真实公司验收摘要及官方来源哈希，不分发年报全文、会话数据库或密钥；`--include-current-acceptance` 为此前 v8 的指定验收材料，`--include-acceptance` 为更早的合成验收与来源探测记录。材料必须已在本机生成；已存在的发布包不可覆盖。
 
 ## 现场环境与数据控制
 

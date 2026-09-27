@@ -11,6 +11,7 @@ from valuationagent.finance.integrity import (
     EQUITY_BRIDGE_REVIEW_LABELS,
     equity_bridge_review_findings,
 )
+from valuationagent.application.source_risks import source_risk_inventory
 
 from valuationagent.schemas.models import (
     AssumptionInputs,
@@ -246,6 +247,104 @@ def _period(value: str) -> date | None:
 
 class ResearchValuationAssembler:
     """Strict handoff: only confirmed, scoped and normalized facts are accepted."""
+
+    def __init__(self, *, block_loader=None):
+        self._block_loader = block_loader
+
+    def source_risks(self, session, period_end):
+        blocks = self._block_loader(session) if self._block_loader else []
+        if isinstance(blocks, dict):
+            blocks = list(blocks.values())
+        return source_risk_inventory(session, blocks, period_end)
+
+    def later_issuer_shares_issue(self, session):
+        """Flag an annual-report share count contradicted by its later disclosure.
+
+        The dividend-eligibility base is ignored: only the issuer's explicitly
+        named total *before* buyback deductions is compared. A later figure is
+        a research lead, not a verified substitute or an automatic adjustment.
+        """
+        if not self._block_loader:
+            return ""
+        annual = []
+        for fact in session.facts:
+            period = _period(fact.period)
+            if (fact.status == "confirmed" and not fact.warnings and fact.role == "historical"
+                    and fact.scope == "issuer" and normalize_financial_metric(fact.metric) == "common_shares"
+                    and period and (period.month, period.day) == (12, 31)
+                    and fact.normalized_value is not None):
+                annual.append((fact.block_id.split(":", 1)[0], period,
+                               D(fact.normalized_value), fact.source_sha256))
+        if not annual:
+            return ""
+        blocks = self._block_loader(session)
+        if isinstance(blocks, dict):
+            blocks = blocks.values()
+        source_text = {}
+        for block in blocks:
+            file_id = str(block.get("file_id") or block.get("block_id", "").split(":", 1)[0])
+            if any(source_id == file_id for source_id, _, _, _ in annual):
+                source_text.setdefault(file_id, []).append(block.get("text", ""))
+        for file_id, period, counted, source_hash in annual:
+            if session.draft.valuation_date and session.draft.valuation_date <= period:
+                continue
+            for text in source_text.get(file_id, []):
+                compacted = re.sub(r"\s+", "", text)
+                for match in re.finditer(
+                    r"截至本(?:年度)?报告披露之日(?:本公司|公司)(?:的)?总股本(?:为)?"
+                    r"(\d{1,3}(?:[,，]\d{3})+|\d+)股", compacted,
+                ):
+                    later = D(match[1].replace(",", "").replace("，", ""))
+                    if later != counted:
+                        corroborated = any(
+                            fact.status == "confirmed" and not fact.warnings
+                            and fact.role == "historical" and fact.scope == "issuer"
+                            and normalize_financial_metric(fact.metric) == "common_shares"
+                            and (fact.block_id.split(":", 1)[0] == file_id
+                                 or bool(source_hash and source_hash == fact.source_sha256))
+                            and fact.verification.get("binding") == "issuer_report_disclosure_shares"
+                            and fact.verification.get("scope") == "issuer"
+                            and (as_of := _period(fact.period)) and period < as_of
+                            and (not session.draft.valuation_date or as_of <= session.draft.valuation_date)
+                            and fact.normalized_value is not None
+                            and D(fact.normalized_value) == later
+                            for fact in session.facts
+                        )
+                        if corroborated:
+                            continue
+                        return (f"{period.isoformat()}年末普通股股数{counted}股与同份年报披露日的"
+                                f"公司总股本{later}股不同。不能将年末数直接用作较晚估值日的"
+                                "每股价值分母；请取得并核验估值日之前最新股数与期间变动。"
+                                "分红基数不能替代总股数。")
+        return ""
+
+    def model_scope_issue(self, session):
+        """Known unsupported economics should surface before unrelated gaps.
+
+        This uses only confirmed clean historical amounts for the latest
+        observed annual period. It never interprets missing risk fields as zero.
+        """
+        rows = {}
+        for fact in session.facts:
+            period = _period(fact.period)
+            if (fact.status != "confirmed" or fact.warnings or fact.role != "historical"
+                    or fact.scope != "consolidated" or fact.normalized_value is None
+                    or not period or period.month != 12 or period.day != 31
+                    or session.draft.valuation_date and period > session.draft.valuation_date
+                    or fact.published_at and session.draft.valuation_date and fact.published_at > session.draft.valuation_date):
+                continue
+            metrics = rows.setdefault(period, {})
+            metric = normalize_financial_metric(fact.metric)
+            if metric in EQUITY_BRIDGE_REVIEW_LABELS:
+                # Preserve a disclosed non-zero even when another conflicting
+                # candidate says zero; ambiguity must not bypass scope review.
+                value = D(fact.normalized_value)
+                if metric not in metrics or value != 0:
+                    metrics[metric] = value
+        if not rows:
+            return ""
+        findings = equity_bridge_review_findings(self._selected_methods(session), rows[max(rows)])
+        return findings[0].message if findings else ""
 
     @staticmethod
     def _selected_methods(session):
@@ -660,11 +759,16 @@ class ResearchValuationAssembler:
             )
 
     def _structured_financials(self, session) -> list[FinancialSnapshot]:
+        share_issue = self.later_issuer_shares_issue(session)
+        if share_issue:
+            raise ValueError(share_issue)
         selected_methods = self._selected_methods(session)
         required = required_financial_metrics(selected_methods)
         rows: dict[date, dict[str, tuple[Decimal, list[object]]]] = defaultdict(dict)
         methods: dict[date, dict[str, str]] = defaultdict(dict)
+        share_dates: dict[date, date] = {}
         conflicts = []
+        dated_issuer_shares = []
         for fact in session.facts:
             if fact.status != "confirmed" or fact.role != "historical":
                 continue
@@ -685,6 +789,12 @@ class ResearchValuationAssembler:
             ):
                 continue
             value = D(fact.normalized_value)
+            if fact.scope == "issuer" and metric == "common_shares":
+                dated_issuer_shares.append((period, value, fact))
+                if (period.month, period.day) != (12, 31):
+                    # A disclosure-date total is the current per-share
+                    # denominator, not a new annual financial statement.
+                    continue
             existing = rows[period].get(metric)
             if existing and existing[0] != value:
                 conflicts.append(
@@ -704,6 +814,25 @@ class ResearchValuationAssembler:
                 + "；".join(conflicts[:5])
                 + "。请拒绝错误字段或提交带 replaces 的更正后再估值。"
             )
+
+        statement_periods = [period for period, values in rows.items()
+                             if (period.month, period.day) == (12, 31)
+                             and any(metric != "common_shares" for metric in values)]
+        if statement_periods:
+            latest_statement = max(statement_periods)
+            latest_shares = [entry for entry in dated_issuer_shares
+                             if latest_statement < entry[0]
+                             and (not session.draft.valuation_date or entry[0] <= session.draft.valuation_date)
+                             and entry[2].verification.get("binding") == "issuer_report_disclosure_shares"
+                             and entry[2].verification.get("scope") == "issuer"]
+            if latest_shares:
+                as_of = max(entry[0] for entry in latest_shares)
+                matches = [entry for entry in latest_shares if entry[0] == as_of]
+                if len({entry[1] for entry in matches}) != 1:
+                    raise ValueError("最新发行人股数存在同日冲突，不能静默选择每股价值分母。")
+                rows[latest_statement]["common_shares"] = (matches[0][1], [entry[2] for entry in matches])
+                methods[latest_statement]["common_shares"] = f"issuer_shares_as_of[{as_of.isoformat()}]"
+                share_dates[latest_statement] = as_of
 
         for period, values in rows.items():
             bridge_findings = equity_bridge_review_findings(
@@ -791,6 +920,7 @@ class ResearchValuationAssembler:
             snapshots.append(
                 FinancialSnapshot(
                     period_end=period,
+                    common_shares_as_of=share_dates.get(period, period if "common_shares" in values else None),
                     **{metric: (abs(values[metric][0]) if metric == "capital_expenditure" else values[metric][0])
                        for metric in REQUIRED_METRICS if metric in values},
                     source_label=(
@@ -953,6 +1083,8 @@ class ResearchValuationAssembler:
         use_ticker = bool(
             session.data_source_preference == "online" and session.draft.ticker
         )
+        if not use_ticker and (scope_issue := self.model_scope_issue(session)):
+            raise ValueError(scope_issue)
         if not use_ticker and self.pending_blockers(session):
             raise ValueError("仍有待确认候选字段，请先确认、拒绝或更正。")
         # An explicit online+ticker choice uses the point-in-time structured
@@ -966,6 +1098,13 @@ class ResearchValuationAssembler:
             if session.data_source_preference == "web":
                 raise ValueError("已选择联网检索，但经来源核验和用户确认的字段尚未形成完整年度财务快照。")
             raise ValueError("没有可提交的完整财务快照；请补齐确认字段，或使用A股代码联网取数。")
+        if not use_ticker and {"dcf", "ev_ebitda"} & set(methods):
+            inventory = self.source_risks(session, snapshots[-1].period_end)
+            if inventory["unresolved"]:
+                detail = "；".join(f"{r['label']}（{r['block_id']}，第{r['page'] or '?'}页）"
+                                  for r in inventory["unresolved"][:5])
+                raise ValueError("已加载原文存在尚未提取核验的估值桥接风险科目：" + detail
+                                 + "。须绑定当前基期、合并口径并复核，不能把漏提取当零。此检查仅覆盖已加载原文，不代表全文件排查。")
         history_error = self._history_readiness_error(snapshots, assumptions)
         if not use_ticker and "dcf" in methods and history_error:
             raise ValueError(history_error)

@@ -80,6 +80,11 @@ class OpenAICompatibleClient:
                 body = response.json()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
+            if status == 402:
+                raise LlmError(
+                    "LLM_HTTP_402: 模型账户额度不足或计费不可用；当前进度已保留。"
+                    "请在供应商后台检查余额/计费，处理后重新连接，或改用获准的模型。不要直接反复重试。"
+                ) from None
             category = (
                 "认证失败"
                 if status in (401, 403)

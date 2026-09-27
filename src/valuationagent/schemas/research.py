@@ -165,7 +165,7 @@ class ResearchSession(ApiModel):
     last_issue: ResearchIssue | None = None
     summary: str = ""
     agent_protocol_version: str = "research-agent-v2"
-    prompt_version: str = "research-2026-09-26.18"
+    prompt_version: str = "research-2026-09-27.20"
     model_provider: str = ""
     model_name: str = ""
     valuation_run_id: str | None = None

@@ -113,6 +113,10 @@ class FinancialSnapshot(ApiModel):
     cash_and_non_operating_assets: JsonDecimal | None = Field(default=None, ge=0)
     interest_bearing_debt: JsonDecimal | None = Field(default=None, ge=0)
     common_shares: JsonDecimal = Field(gt=0)
+    # Per-share denominator can be disclosed after the fiscal baseline.
+    # This date is explicit so a later issuer total is not disguised as the
+    # year-end balance-sheet share count.
+    common_shares_as_of: date | None = None
     net_income_parent: JsonDecimal | None = None
     ebitda: JsonDecimal | None = None
     source_label: str = "user_structured_input"
@@ -305,6 +309,11 @@ class ValuationRequest(ApiModel):
 
     @model_validator(mode="after")
     def source_inputs_are_present(self) -> "ValuationRequest":
+        for snapshot in [*self.historical_financials, *([self.financials] if self.financials else [])]:
+            if snapshot.common_shares_as_of and not (
+                snapshot.period_end <= snapshot.common_shares_as_of <= self.valuation_date
+            ):
+                raise ValueError("issuer share-count date must fall between the financial period end and valuation date")
         if not self.requested_methods:
             self.requested_methods = list(self.methods)
         if not set(self.methods) <= set(self.requested_methods):

@@ -47,6 +47,10 @@ These services are called over HTTPS and are not redistributed. Their commercial
 
 Credentials are supplied at runtime, kept in process memory, and are not included in source, logs, exported reports, or this notice.
 
+## Real-disclosure acceptance fixtures (2026-09-27)
+
+Official issuer 2024 annual reports were downloaded from CNINFO for local software validation: Yili (600887), Midea (000333), CATL (300750), with the earlier Kweichow Moutai (600519) audit retained as regression evidence. These are third-party disclosures, not project-authored data and not licensed as this project's source code. Annual-report PDFs are not redistributed in release archives. Only source URLs, publication dates, hashes, acceptance summaries and minimal numerical golden rows are included; downloading and reuse remain subject to issuer/CNINFO terms. Exact sources and hashes are recorded in `docs/真实公司数据验收_2026-09-27.md` and the opt-in acceptance script's source manifests.
+
 ## Referenced projects and protocols
 
 - TradingAgents: CLI workflow/layout inspiration only; no upstream source is vendored. Source: https://github.com/TauricResearch/TradingAgents

@@ -8,8 +8,17 @@ import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
-EVIDENCE_VERSION = "table-binding-v4"
+EVIDENCE_VERSION = "table-binding-v7"
 SCOPE_PATTERN = r"(合并|母公司)(?:财务)?(?:报表(?:项目)?(?:附注|注释)?|资产负债表|利润表|现金流量表|口径)"
+STATEMENT_TITLE = (r"(?m)^\s*(?:[一二三四五六七八九十\d]+\s*[、.．]\s*)?"
+                   r"(?:(?:19|20)\d{2}\s*年度?\s*)?(?:合并及公司|合并|母公司)"
+                   r"(?:资产负债表|利润表|现金流量表)(?:[（(]续[）)])?\s*$")
+# The same token must locate years and remove them when checking a bare
+# header. PDF layout commonly separates the year from 年度/年12月31日.
+# Dates other than December 31 remain unconsumed and cannot masquerade as
+# annual headers (e.g. a June 30 half-year table).
+ANNUAL_HEADER_TOKEN = (r"(?<!\d)(?i:FY)?\s*((?:19|20)\d{2})"
+                       r"(?:\s*年(?:\s*12\s*月\s*31\s*日|\s*度|\s*末)?|[-/]12[-/]31)?")
 
 
 def compact(text):
@@ -109,7 +118,8 @@ def _name_in_row(name, line):
     for match in re.finditer(re.escape(name), line):
         before, after = line[:match.start()], line[match.end():]
         left = not before or not (before[-1].isalnum() or before[-1] == "_") or bool(re.search(r"\d{4}年$", before))
-        right = not after or not (after[0].isalpha() or after[0] == "_")
+        right = (not after or not (after[0].isalpha() or after[0] == "_")
+                 or bool(re.match(r"^[一二三四五六七八九十百]+[（(]\d+[）)]", after)))
         if left and right:
             return True
     return False
@@ -201,26 +211,75 @@ def _table_columns(prefix, metric_line):
             except ValueError:
                 pass
         line = re.sub(r"\b[A-Z]{1,3}\d+\s*:\s*", "", line)
-        years = list(re.finditer(r"(?<!\d)((?:19|20)\d{2})\s*(?:年|[-/]12[-/]31)?", line))
+        years = list(re.finditer(ANNUAL_HEADER_TOKEN, line))
         labelled = bool(re.search(r"^\s*(?:项目|科目|附注|(?i:items?|metric|notes?))(?=\s|[|:：（(]|$)", line))
         # A preceding amount row such as '营业成本 2025 2024' is not a year
         # header. Bare-year headings and explicitly labelled headers are.
-        remainder = re.sub(r"(?i:FY)?\s*(?:19|20)\d{2}(?:年度?|[-/]12[-/]31)?", "", line)
+        remainder = re.sub(ANNUAL_HEADER_TOKEN, "", line)
         remainder = re.sub(r"本(?:年|期)比上(?:年|期)(?:同期)?(?:增减|增长)?|同比(?:增减|增长)(?:率|变化)?", "", remainder)
         bare_years = not re.sub(r"[\s|,，()（）%％/.-]", "", remainder)
+        nonannual_period = bool(re.search(r"\d\s*月|半年|季度|[-/]\d{1,2}[-/]\d{1,2}", remainder))
         explicit_single = len(years) == 1 and labelled
-        if (len(years) >= 2 or explicit_single) and (labelled or bare_years) and len({m[1] for m in years}) == len(years):
+        if (len(years) >= 2 or explicit_single) and (labelled or bare_years) and not nonannual_period and len({m[1] for m in years}) == len(years):
             markers = [(m.start(), int(m[1])) for m in years]
             comparisons = list(re.finditer(r"本(?:年|期)比上(?:年|期)(?:同期)?(?:增减|增长)?|同比(?:增减|增长)(?:率|变化)?", line))
             markers.extend((m.start(), None) for m in comparisons)
             columns = [value for _, value in sorted(markers)]
             header = line
-        elif len(relative := re.findall(r"(本期|上期|本年|上年|本年度|上年度)(?:金额|发生额|数)", line)) == 2 and relative[0][0] != relative[1][0]:
+        elif (relative := re.findall(r"(本期|上期|本年|上年|本年度|上年度)(?:金额|发生额|数)", line)) and (
+            len(relative) == 1 or len(relative) == 2 and relative[0][0] != relative[1][0]
+        ) and re.fullmatch(r"\s*(?:项目|科目|补充资料)?\s*(?:(?:本期|上期|本年|上年|本年度|上年度)(?:金额|发生额|数)\s*){1,2}", line):
             reports = re.findall(r"((?:19|20)\d{2})\s*年\s*(?:年度报告|度报告)", prefix)
             if len(set(reports)) == 1:
                 year = int(reports[0])
                 header, columns = line, [year if label.startswith("本") else year - 1 for label in relative]
+        elif re.fullmatch(r"\s*(?:项目|科目)?\s*期末余额\s+期初余额\s*", line):
+            # Only an explicit annual balance-sheet date can define these
+            # relative columns. Never derive dates from the proposed fact.
+            dates = re.findall(r"(?m)^\s*((?:19|20)\d{2})\s*年\s*12\s*月\s*31\s*日\s*$", prefix[:prefix.index(line)])
+            if dates:
+                year = int(dates[-1])
+                header, columns = line, [year, year - 1]
     return header, columns
+
+
+def _joint_statement_columns(prefix):
+    """Read explicit year × perimeter headings in a joint group/company table.
+
+    A joint title is not itself a consolidated-scope assertion. Every year
+    column must have a separate aligned-order scope label; duplicate pairs,
+    missing labels, and other table shapes remain unverified.
+    """
+    titles = list(re.finditer(STATEMENT_TITLE, prefix))
+    if not titles or "合并及公司" not in titles[-1][0]:
+        return None
+    lines = prefix[titles[-1].end():].splitlines()
+    for index, line in enumerate(lines):
+        years = re.findall(r"(?<!\d)((?:19|20)\d{2})\s*年度?", line)
+        residual = re.sub(r"(?:19|20)\d{2}\s*年度?", "", line)
+        residual = re.sub(r"项目|科目|资产|负债和股东权益|附注|\s+", "", residual)
+        if len(years) != 4 or residual:
+            continue
+        for scope_line in lines[index + 1:index + 4]:
+            scopes = re.findall(r"合并|母公司|公司", scope_line)
+            residual_scope = re.sub(r"合并|母公司|公司|项目|科目|附注|\s+", "", scope_line)
+            if len(scopes) != 4 or residual_scope:
+                continue
+            columns = [(int(year), "consolidated" if scope == "合并" else "parent")
+                       for year, scope in zip(years, scopes)]
+            if len(set(columns)) == 4 and {scope for _, scope in columns} == {"consolidated", "parent"}:
+                return line + "\n" + scope_line, columns
+    return None
+
+
+def _joint_statement_values(row_text):
+    # Explicit Chinese note references are metadata, not amounts. In contrast,
+    # standalone parentheses around a number retain the accounting minus sign.
+    row_text = re.sub(r"[一二三四五六七八九十百]+[（(]\d+[）)](?:[（(][a-z][）)])?[,，]?", "", row_text)
+    cells = re.findall(r"(?<![\w.])(?:\([+\-−]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?\)|[+\-−]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?|(?<!\S)[-—–](?!\S))", row_text)
+    if len(cells) != 4:
+        return None
+    return [None if cell in {"-", "—", "–"} else numeric_tokens(cell)[0] for cell in cells]
 
 
 def _aligned_note_values(block_prefix, metric_line, column_count):
@@ -303,6 +362,49 @@ def _bind_issuer_shares(item, block, draft, aliases, identity_text):
     if re.search(r"分红|派息|利润分配|流通股|无限售|子公司|参股公司|其他发行人|优先股|存托凭证", quote):
         return [*warnings, "发行人股数须直接披露总股份数，不能由分红基数、流通股或其他主体/证券类别推算"], checks
 
+    # A filing may say "as of this report's disclosure" rather than print a
+    # calendar day in the sentence. Only an official, dated source can turn
+    # that relative date into a factual issuer share-count date. The preceding
+    # total is distinct from the lower dividend-eligibility base.
+    relative = re.fullmatch(
+        r"(?:以)?截至本(?:年度)?报告披露之日(?:本公司|公司)(?:的)?总股本(?:为)?"
+        r"(?P<amount>(?:\d{1,3}(?:[,，]\d{3})+|\d+))(?P<unit>股|万股|亿股)",
+        quote,
+    )
+    if relative:
+        published = (block.get("location") or {}).get("published_at")
+        try:
+            disclosure_date = date.fromisoformat(str(published)[:10])
+        except (TypeError, ValueError):
+            return [*warnings, "报告披露日股数缺少可核验的来源发布日期；请取得正式公告日期"], checks
+        try:
+            period = date.fromisoformat(str(item.period))
+        except ValueError:
+            period = None
+        if period != disclosure_date:
+            warnings.append("期间冲突：候选股数截止日须与正式报告披露日一致")
+        if draft.valuation_date and disclosure_date > draft.valuation_date:
+            warnings.append("披露时点晚于估值日，不能使用未来股数")
+        if numeric_tokens(item.raw_value) != numeric_tokens(relative["amount"]):
+            warnings.append("科目数值冲突：候选股数未与报告披露日总股数一致")
+        if item.unit != relative["unit"]:
+            warnings.append("单位冲突：报告披露日总股数须保留原文股数单位")
+        checks.update(binding="issuer_report_disclosure_shares", source_row=item.quote,
+                      period_end=disclosure_date.isoformat(), period=str(disclosure_date.year),
+                      unit=relative["unit"])
+        if not warnings:
+            checks["scope"] = "issuer"
+        return list(dict.fromkeys(warnings)), checks
+
+    # Annual share-change tables disclose the issuer's closing shares without
+    # repeating its name or fiscal date on every row. Bind the right-hand
+    # 'after change / quantity' column only when the annual-report identity,
+    # table unit, complete header and arithmetic all agree in the same file.
+    change_rows = [line for line in block.get("text", "").splitlines()
+                   if re.match(r"^\s*(?:[一二三四五六七八九十]+[、.．]\s*)?股份总数\s+", line)]
+    if change_rows and any(compact(line) in quote for line in change_rows):
+        return _bind_issuer_share_change(item, block, draft, identity_text, checks, warnings, change_rows)
+
     owners = ["本公司", "公司", *([company] if company else []), *([short_company] if len(short_company) >= 2 else [])]
     owner_pattern = "(?:" + "|".join(re.escape(owner) for owner in sorted(set(owners), key=len, reverse=True)) + ")"
     disclosure = re.compile(
@@ -347,6 +449,70 @@ def _bind_issuer_shares(item, block, draft, aliases, identity_text):
                 warnings.append("披露时点晚于估值日，不能用于该时点的历史估值")
         except ValueError:
             warnings.append("来源披露日期无法识别")
+    if not warnings:
+        checks["scope"] = "issuer"
+    return list(dict.fromkeys(warnings)), checks
+
+
+def _bind_issuer_share_change(item, block, draft, identity_text, checks, warnings, rows):
+    """Bind the closing quantity of a complete issuer share-change table."""
+    text = block.get("text", "")
+    row = rows[0] if len(rows) == 1 else ""
+    if len(rows) != 1 or compact(row) not in compact(item.quote):
+        return [*warnings, "股份变动表总数行不唯一，需引用单一完整原文行"], checks
+    prefix = text[:text.index(row)]
+    heading = prefix.rfind("股份变动情况")
+    local_header = prefix[heading:] if heading >= 0 else ""
+    if not ("本次变动前" in local_header
+            and "本次变动后" in local_header and local_header.count("数量") >= 2
+            and "小计" in local_header and re.search(r"单位\s*[:：]\s*股(?!本)", local_header)):
+        return [*warnings, "股份变动表缺少完整的变动前/变动后数量列与股数单位"], checks
+    report_years = re.findall(r"(?<!\d)((?:19|20)\d{2})\s*年?\s*度报告", identity_text)
+    if len(set(report_years)) != 1:
+        return [*warnings, "股份变动表未绑定单一年度的发行人正式年报"], checks
+    year = int(report_years[0])
+    source_date = date(year, 12, 31)
+    period = re.sub(r"\s+", "", item.period)
+    exact_date = re.fullmatch(r"((?:19|20)\d{2})(?:年|-|/)(\d{1,2})(?:月|-|/)(\d{1,2})日?", period)
+    annual = re.fullmatch(r"((?:19|20)\d{2})(?:年度?|年度?末)?", period)
+    try:
+        target_date = (date(*map(int, exact_date.groups())) if exact_date
+                       else date(int(annual[1]), 12, 31) if annual else None)
+    except ValueError:
+        target_date = None
+    if target_date != source_date:
+        warnings.append("期间冲突：股份变动表期末数只对应所列年度的12月31日")
+    else:
+        checks.update(period=str(year), period_end=source_date.isoformat(), year_column=year)
+    if draft.valuation_date and source_date > draft.valuation_date:
+        warnings.append("股数截止日晚于估值日，不能用于该时点的历史估值")
+    parts = re.sub(r"^\s*(?:[一二三四五六七八九十]+[、.．]\s*)?股份总数\s+", "", row).split()
+    if len(parts) != 7 or not all(re.fullmatch(r"[+\-−]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?", p) for p in parts):
+        return [*warnings, "股份变动表总数行列数不完整，不能猜测空白列"], checks
+    values = [numeric_tokens(part)[0] for part in parts]
+    before, before_pct, issued, other, change, after, after_pct = values
+    if (before_pct != 100 or after_pct != 100 or before <= 0 or after <= 0
+            or issued + other != change or before + change != after
+            or any(value != value.to_integral_value() for value in (before, issued, other, change, after))):
+        warnings.append("股份变动表期初、增减小计、期末股数或总数比例不勾稽")
+    proposed = numeric_tokens(item.raw_value)
+    if len(proposed) != 1 or proposed[0] != after:
+        warnings.append("科目数值冲突：候选股数不是变动后数量列的股份总数")
+    if item.unit != "股":
+        warnings.append("单位冲突：股份变动表明确以股计量，不能使用股本金额")
+    else:
+        checks["unit"] = "股"
+    published = (block.get("location") or {}).get("published_at")
+    if published and draft.valuation_date:
+        try:
+            if date.fromisoformat(str(published)[:10]) > draft.valuation_date:
+                warnings.append("披露时点晚于估值日，不能用于该时点的历史估值")
+        except ValueError:
+            warnings.append("来源披露日期无法识别")
+    checks.update(binding="issuer_share_change_table", source_row=row,
+                  column_alignment="explicit_before_change_after_quantity",
+                  reconciliation={"before": str(before), "issued": str(issued),
+                                  "other": str(other), "change": str(change), "after": str(after)})
     if not warnings:
         checks["scope"] = "issuer"
     return list(dict.fromkeys(warnings)), checks
@@ -410,16 +576,16 @@ def bind_evidence(item, block, context, draft, aliases=(), identity_text=""):
     prefix = re.sub(r"\b[A-Z]{1,3}\d+\s*:", "", prefix)
     scope_prefix = prefix
     # A new statement cannot inherit the previous statement's units/years.
-    titles = list(re.finditer(r"(?m)^\s*(?:合并|母公司)(?:资产负债表|利润表|现金流量表)\s*$", prefix))
+    titles = list(re.finditer(STATEMENT_TITLE, prefix))
     if titles:
         prefix = prefix[titles[-1].start():]
     checks["context_block_ids"] = list(dict.fromkeys(b["block_id"] for b in context))
     checks["source_row"] = metric_line
 
     unit_pattern = r"(百万元|亿元|万元|千元|元|百万股|亿股|万股|千股|股|%)"
-    units = re.findall(r"单位\s*[:：]?\s*(?:人民币\s*)?" + unit_pattern, prefix)
+    units = re.findall(r"单位\s*[:：为]?\s*(?:人民币\s*)?" + unit_pattern, prefix)
     inline = re.findall(r"[\d.)）]\s*" + unit_pattern, metric_line)
-    label_units = re.findall(r"[（(]\s*" + unit_pattern + r"\s*[）)]", metric_line)
+    label_units = re.findall(r"[（(]\s*(?:人民币\s*)?" + unit_pattern + r"(?:\s*/\s*股)?\s*[）)]", metric_line)
     # Percentage comparison columns do not redefine monetary row units.
     if item.unit not in {"%", "ratio"}:
         inline = [unit for unit in inline if unit != "%"]
@@ -434,8 +600,12 @@ def bind_evidence(item, block, context, draft, aliases=(), identity_text=""):
     else:
         checks["unit"] = source_unit
 
+    joint_columns = _joint_statement_columns(prefix)
     scopes = re.findall(SCOPE_PATTERN, scope_prefix)
     source_scope = {"合并": "consolidated", "母公司": "parent"}.get(scopes[-1] if scopes else "")
+    if titles and "合并及公司" in titles[-1][0]:
+        # Do not inherit another page's single-scope title for a mixed table.
+        source_scope = item.scope if joint_columns and item.scope in {"consolidated", "parent"} else None
     if source_scope and source_scope != item.scope:
         warnings.append("报表口径冲突：原文为" + ("母公司" if source_scope == "parent" else "合并") + "报表")
     elif not source_scope:
@@ -473,7 +643,25 @@ def bind_evidence(item, block, context, draft, aliases=(), identity_text=""):
     # Layout/pipe tables: bind the amount's column to the year header. A
     # repeated amount is safe only when it also appears in the requested year.
     header_years = [year for year in columns if year is not None]
-    if header_years and metric_line and len(inline_years) < 2:
+    if joint_columns and metric_line and len(inline_years) < 2:
+        joint_header, joint = joint_columns
+        row_text = metric_line
+        matched = next((name for name in names if name.casefold() in row_text.casefold()), None)
+        if matched:
+            row_text = row_text[row_text.casefold().index(matched.casefold()) + len(matched):]
+        values = _joint_statement_values(row_text)
+        amount = numeric_tokens(item.raw_value)
+        if values is not None and len(amount) == 1 and any(
+            pair == (target_year, item.scope) and value == amount[0]
+            for pair, value in zip(joint, values)
+        ):
+            checks.update(year_column=target_year, period=str(target_year), column_header=joint_header,
+                          column_scope=item.scope, column_alignment="explicit_year_scope_pairs")
+        else:
+            warnings.append("年度/报表口径列冲突：合并及公司表须将数值同时绑定到明确年份及对应口径列，空白不得补零")
+            checks.pop("period", None)
+            checks.pop("scope", None)
+    elif header_years and metric_line and len(inline_years) < 2:
         row_text = re.sub(r"\b[A-Z]{1,3}\d+\s*:", "", metric_line)
         matched = next((name for name in names if name.casefold() in row_text.casefold()), None)
         if matched:

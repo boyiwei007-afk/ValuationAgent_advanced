@@ -21,11 +21,18 @@ EQUITY_BRIDGE_REVIEW_LABELS = {
 def equity_bridge_review_findings(methods, statement_items):
     if not {"dcf", "ev_ebitda"} & set(methods):
         return []
-    present = [
-        f"{label}={statement_items[key]}"
-        for key, label in EQUITY_BRIDGE_REVIEW_LABELS.items()
-        if statement_items.get(key) is not None and statement_items[key] > 0
-    ]
+    # An accounting deficit in non-controlling equity is not evidence that its
+    # market value is zero.  Nor may a negative restricted-cash/deposit balance
+    # silently bypass review.  This gate checks disclosed values only: absence
+    # of a key is not proof that a source document contains no such exposure.
+    present = []
+    for key, label in EQUITY_BRIDGE_REVIEW_LABELS.items():
+        value = statement_items.get(key)
+        if value is None:
+            continue
+        amount = D(str(value))
+        if not amount.is_finite() or amount != 0:
+            present.append(f"{label}={value}")
     if not present:
         return []
     return [ValidationFinding(

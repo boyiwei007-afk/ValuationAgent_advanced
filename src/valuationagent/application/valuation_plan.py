@@ -91,17 +91,20 @@ def valuation_progress(session, assembler):
                 break
 
     if request is None:
+        scope_unsupported = bool(requested_methods and set(requested_methods) <= {"dcf", "ev_ebitda"}
+                                 and assembler.model_scope_issue(preview))
         evidence_issues = [{"fact_id": f.fact_id, "metric": f.metric, "period": f.period,
                             "warnings": list(f.warnings)} for f in assembler.pending_blockers(preview) if f.warnings]
         detailed_error = original_error or "估值输入尚不完整"
         if evidence_issues and original_error and "待确认候选" in original_error:
             detailed_error = "必要字段尚未通过来源校验：" + "；".join(
                 f"{item['period']} {item['metric']}（{'、'.join(item['warnings'][:2])}）" for item in evidence_issues[:5])
-        return {"status": "building_model", "ready_for_review": False, "blocking_reason": original_error or "估值输入尚不完整",
+        return {"status": "unsupported_model_scope" if scope_unsupported else "building_model", "ready_for_review": False, "blocking_reason": original_error or "估值输入尚不完整",
                 "blocking_detail": detailed_error, "evidence_issues": evidence_issues,
                 "staged_fact_ids": staged, "confirmed_fact_count": candidate_counts["confirmed"],
                 "candidate_counts": candidate_counts,
-                "instruction": "只补当前模型必要输入。基期完整但历史不足时，可调用propose_forecast提出有依据的十年三情景预测，最终由用户集中确认。历史缺失不可用假设、零值或搜索摘要替代。"}
+                "instruction": ("当前所选方法需要尚未实现的专业调整，继续补普通财务字段也不能解除；立即交付说明报告，不要持续检索或承诺补一项就能计算。用户可另行明确更换方法。"
+                                if scope_unsupported else "只补当前模型必要输入。基期完整但历史不足时，可调用propose_forecast提出有依据的十年三情景预测，最终由用户集中确认。历史缺失不可用假设、零值或搜索摘要替代。")}
     degraded = bool(exclusions)
     return {"status": "ready_for_review", "ready_for_review": True, "blocking_reason": "",
             "staged_fact_ids": staged, "methods": request.methods,

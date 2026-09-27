@@ -24,6 +24,7 @@ from valuationagent.application.research_valuation import (
     _period as financial_period,
 )
 from valuationagent.application.valuation_plan import scope_key, valuation_progress
+from valuationagent.application.document_retrieval import rank_document_blocks
 from valuationagent.core.data import LocalDataProvider
 from valuationagent.core.documents import parse_document
 from valuationagent.core.evidence import bind_evidence, evidence_context, numeric_tokens
@@ -104,7 +105,7 @@ class CandidateInput(ApiModel):
     )
     scope: Literal["consolidated", "parent", "issuer", "unknown"] = Field(
         default="unknown",
-        description="consolidated（合并）、parent（母公司）、issuer（仅发行人普通股股份总数，需明确主体/截止日/股数单位原文）、unknown（无法判断）。其他财务科目不得使用issuer。",
+        description="consolidated（合并）、parent（母公司）、issuer（仅发行人总股数，须有明确主体/截止日/股数单位的正文，或完整年报股份变动表总数行与表头）、unknown（无法判断）。其他财务科目不得使用issuer。",
     )
     role: Literal["historical", "assumption", "policy", "comparable"] = "historical"
     peer_ticker: str = Field(default="", max_length=24, description="可比公司代码，仅role=comparable时填写")
@@ -309,7 +310,7 @@ def _explicit_fact_acceptance(text, *, valuation_review=False):
     ))
 
 
-def _valuation_finish_violation(answer, question="", options=()):
+def _valuation_finish_violation(answer, question="", options=(), *, public_research_authorized=False):
     """Reject model-authored UI that impersonates controller readiness.
 
     The language model may explain evidence and ask for a genuinely missing
@@ -321,6 +322,20 @@ def _valuation_finish_violation(answer, question="", options=()):
         r"\s+", "", "\n".join([str(question or ""), *(str(item) for item in options)])
     ).casefold()
     combined = narrative + "\n" + decision
+    if decision and re.search(r"[\d,，]+(?:\.\d+)?(?:亿元|百万元|万元|千元|元|亿股|万股|千股|股|倍|%|％)", decision):
+        return "普通澄清卡不能建议或选择具体财务数字；历史数值必须绑定原文，预测数字必须进入预测方案，最终统一确认。不能用选项点击绕过当前未通过的来源校验"
+    if decision and re.search(
+        r"(?:解析|绑定|校验).{0,12}(?:未通过|失败|不通过).{0,40}(?:裁定|核定|确认.{0,6}数值)|"
+        r"我按你确认的数值提交|裁定并提交|"
+        r"(?:营运资本变动|历史收入|历史债务).{0,110}(?:近似处理|假设替代|估计替代)", decision
+    ):
+        return "历史数值未通过来源校验时，不能让用户裁定模型建议的数字或用近似值绕过；请补正式证据，无法取得则交付说明报告"
+    if public_research_authorized and decision and re.search(
+        r"(?:允许|授权|同意|是否|要不要|请选择|继续).{0,50}"
+        r"(?:联网|公开检索|巨潮|官方披露|搜索|检索|下载|补读|联网核验)|"
+        r"(?:联网|公开检索|官方披露).{0,35}(?:许可|授权|允许|同意)", decision
+    ):
+        return "公开资料取证已获授权，不能再让用户批准联网核验、下载或继续补搜；应执行剩余取证，失败则交付说明报告"
     invalid_candidate_approval = (
         r"confirmed_fact_count",
         r"字段级确认",
@@ -395,7 +410,7 @@ class ResearchService:
         self.official_search_provider = official_search_provider or CninfoAnnouncementProvider()
         self.tool_providers = tuple(tool_providers)
         self.remote_transport = remote_transport
-        self.valuation_assembler = ResearchValuationAssembler()
+        self.valuation_assembler = ResearchValuationAssembler(block_loader=self._blocks)
         self._execution = threading.local()
 
     def execution_state(self, session_id):
@@ -1085,7 +1100,7 @@ class ResearchService:
             message = "文件读取失败，请检查格式、权限或文件是否完整。"
         else:
             message = "处理过程中出现未预期问题，已停止当前步骤。"
-        retryable = code not in {"LLM_HTTP_401", "LLM_HTTP_403", "MODEL_SESSION_REVOKED", "MODEL_CONNECTION_REQUIRED"}
+        retryable = code not in {"LLM_HTTP_401", "LLM_HTTP_402", "LLM_HTTP_403", "MODEL_SESSION_REVOKED", "MODEL_CONNECTION_REQUIRED"}
         recovery_context = dict(context or {})
         if session.question and session.question.kind == "facts":
             recovery_context["pending_fact_review"] = session.question.model_dump(mode="json")
@@ -1100,7 +1115,7 @@ class ResearchService:
             context=self._redact_value(recovery_context),
         )
         session.last_issue = issue
-        if code in {"LLM_HTTP_401", "LLM_HTTP_403", "MODEL_SESSION_REVOKED", "MODEL_CONNECTION_REQUIRED"}:
+        if code in {"LLM_HTTP_401", "LLM_HTTP_402", "LLM_HTTP_403", "MODEL_SESSION_REVOKED", "MODEL_CONNECTION_REQUIRED"}:
             choices = [
                 ("reconnect", _text(session, "重新配置模型后继续", "Reconnect a model and continue")),
                 ("offline", _text(session, "切换为离线资料整理", "Switch to local preparation")),
@@ -2112,8 +2127,18 @@ class ResearchService:
                 meta = self.store.get_file(args.file_id)
                 if not meta["storage_path"].lower().endswith(".pdf"):
                     raise ValueError("start_page只支持PDF资料")
-                parsed, warnings = parse_document(meta, check_cancel=self._check_execution,
-                    pdf_start_page=args.start_page, pdf_page_limit=25, block_offset=len(blocks))
+                document = next(d for d in session.documents if d.file_id == args.file_id)
+                loaded_pages = {b["location"].get("page") for b in blocks}
+                requested_pages = set(range(args.start_page, args.start_page + 25))
+                fully_read = document.parse_status == "parsed" and not document.warnings
+                if fully_read or requested_pages <= loaded_pages:
+                    # A page-window query of an already parsed filing is a
+                    # cache lookup. Re-extraction both wastes time and can add
+                    # a misleading "only pages X-Y read" coverage warning.
+                    parsed, warnings = [], []
+                else:
+                    parsed, warnings = parse_document(meta, check_cancel=self._check_execution,
+                        pdf_start_page=args.start_page, pdf_page_limit=25, block_offset=len(blocks))
                 # No duplicate blocks when a model retries the same page range.
                 known = {(b["text"], canonical(b["location"])) for b in blocks}
                 original_location = next((b["location"] for b in blocks if b["location"].get("source_url")), {})
@@ -2123,7 +2148,6 @@ class ResearchService:
                         block["block_id"] = f"{args.file_id}:{len(blocks) + 1}"
                         blocks.append(block)
                 self.store.save_research_blocks(session.session_id, args.file_id, blocks)
-                document = next(d for d in session.documents if d.file_id == args.file_id)
                 document.block_count = len(blocks)
                 document.warnings = list(dict.fromkeys([*document.warnings, *warnings]))
                 blocks = [b for b in blocks if args.start_page <= b["location"].get("page", 0) < args.start_page + 25]
@@ -2152,16 +2176,7 @@ class ResearchService:
                 }
             all_blocks = blocks
             if args.query:
-                terms = [term for term in re.split(r"[\s,，;；|、]+", args.query.lower()) if term]
-                def score(block):
-                    text = block["text"].lower()
-                    matches = sum(term in re.sub(r"\s+", "", text) for term in terms)
-                    # Cover the requested concepts first, then prefer numeric
-                    # statement rows over an early table-of-contents mention.
-                    numeric_rows = sum(any(term in re.sub(r"\s+", "", line) for term in terms)
-                                       and bool(re.search(r"\d[\d,，]*\.\d{2}", line)) for line in text.splitlines())
-                    return matches, numeric_rows, int("单位" in text)
-                blocks = sorted((b for b in blocks if score(b)[0]), key=score, reverse=True)
+                blocks = rank_document_blocks(blocks, args.query)
             page = blocks[args.offset:args.offset + args.limit]
             end = args.offset + len(page)
             result = {
@@ -2247,12 +2262,11 @@ class ResearchService:
                         raise ValueError("EVIDENCE_NOT_ATTEMPTED: 尚未读取或检索资料；请先实际取证，不能直接宣称数据不可得。")
                     return close_outcome(progress)
                 violation = _valuation_finish_violation(
-                    args.answer, args.question, args.options
+                    args.answer, args.question, args.options,
+                    public_research_authorized=session.data_source_preference == "web",
                 )
                 if not violation and re.search(r"唯一.{0,8}(?:阻塞|缺项)|只(?:差|剩).{0,12}(?:一项|这项)", args.question):
                     violation = "确定性组装尚未通过，不能把模型推测的缺项称为唯一阻塞，也不能让用户确认代替证据核验"
-                if not violation and session.data_source_preference == "web" and re.search(r"允许.{0,8}(?:继续)?(?:检索|搜索)|(?:是否|还是|要不要).{0,8}继续.{0,8}(?:检索|搜索|多搜)", args.question):
-                    violation = "公开检索已获授权，不应反复询问是否继续；执行剩余必要取证或用deliver_outcome交付说明报告"
                 if violation:
                     finish_attempts["invalid"] += 1
                     if finish_attempts["invalid"] >= 2:
@@ -2551,6 +2565,10 @@ class ResearchService:
             result = self._facts(
                 session, args, required_metrics=explicit_requested_metrics
             )
+            if pending_valuation:
+                progress = valuation_progress(session, self.valuation_assembler)
+                if progress["status"] == "unsupported_model_scope":
+                    return close_outcome(progress)
             clean_after = {
                 fact.fact_id for fact in session.facts
                 if fact.status == "proposed" and not fact.warnings
@@ -2655,7 +2673,7 @@ class ResearchService:
             return self._facts(session, args)
 
         fact_specs = [] if confirmed_source in {"online", "web"} and not pending_valuation else [
-            ToolSpec("propose_facts", "从原文或用户消息提出无歧义的候选，并保留原始值、期间、单位和口径。scope使用consolidated、parent、unknown；仅普通股股份总数可用issuer，必须有同一连续原文明确发行人、截至日期及股数单位，不可引用分红基数/流通股/金额股本代替。字段或年份有多种合理对应时先补原文，不得静默映射。年报未直接披露 EBIT、EBITDA、税率、折旧摊销、资本开支、营运资本变动或有息负债合计时，应提出原始基础科目（如profit_before_tax、income_tax_expense、interest_expense、独立折旧摊销组成含使用权资产、cash_paid_for_ppe_intangibles、三项现金流营运资本调整及五项债务组成），让确定性组装器计算并留痕；不得自行计算或把未找到项当零。更正用replaces指定字段ID，确认后才替换。", ProposeFacts,
+            ToolSpec("propose_facts", "从原文或用户消息提出无歧义的候选，并保留原始值、期间、单位和口径。scope使用consolidated、parent、unknown；仅发行人普通股股份总数可用issuer，可引用明确主体/截止日/单位的正文，或同一正式年报中带单位、变动前后数量表头及完整总数行的股份变动表；不能引用分红基数、流通股或金额股本。字段或年份有多种合理对应时先补原文，不得静默映射。年报未直接披露 EBIT、EBITDA、税率、折旧摊销、资本开支、营运资本变动或有息负债合计时，应提出原始基础科目（如profit_before_tax、income_tax_expense、interest_expense、独立折旧摊销组成含使用权资产、cash_paid_for_ppe_intangibles、三项现金流营运资本调整及五项债务组成），让确定性组装器计算并留痕；不得自行计算或把未找到项当零。更正用replaces指定字段ID，确认后才替换。", ProposeFacts,
                      propose_fact_batch),
         ]
         valuation_specs = [
@@ -2971,7 +2989,18 @@ class ResearchService:
                         if file_id not in retry_files or existing_doc.parse_status != "unreadable":
                             continue
                         session.documents.remove(existing_doc)
-                    meta = self.store.get_file(file_id)
+                    try:
+                        meta = self.store.get_file(file_id)
+                    except (KeyError, ValueError):
+                        # A stale upload token is a per-file failure, just like
+                        # an unreadable PDF. Never invent metadata for it or let
+                        # it prevent the remaining valid uploads from parsing.
+                        message = f"附件 {self._redact_text(file_id)} 的引用已失效或不存在；未读取该文件，已继续处理其他附件。需要时请重新上传。"
+                        if message not in session.gaps:
+                            session.gaps.append(message)
+                        self.store.append_event(session_id, type="document.unavailable", stage="document", status="warning",
+                            summary=message, payload={"file_id": self._redact_text(file_id)})
+                        continue
 
                     def parse(meta=meta):
                         blocks, warnings = parse_document(meta, check_cancel=self._check_execution)

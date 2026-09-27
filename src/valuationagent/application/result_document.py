@@ -9,8 +9,9 @@ import json
 from io import BytesIO
 from functools import lru_cache
 from pathlib import Path
+from decimal import Decimal
 
-from valuationagent.application.research_valuation import METRIC_LABELS
+from valuationagent.application.research_valuation import METRIC_LABELS, _period
 from valuationagent.application.valuation_plan import preview_session, _build_for_methods
 from valuationagent.schemas.models import required_financial_metrics
 
@@ -115,6 +116,15 @@ def build_result_document(service, session):
     if result:
         limitations.extend(result.warnings)
     issue = session.last_issue
+    # A source-risk inventory is a diagnostic, not a promoted financial fact.
+    # Before a final baseline exists, use the latest eligible candidate year
+    # solely to locate risk-bearing rows and disclose that selection explicitly.
+    periods = [_period(f.period) for f in session.facts if f.role == "historical" and f.status != "rejected"]
+    periods = [period for period in periods if period and period.month == 12 and period.day == 31
+               and (not session.draft.valuation_date or period <= session.draft.valuation_date)]
+    source_risks = service.valuation_assembler.source_risks(session, max(periods)) if periods else None
+    if source_risks:
+        source_risks["baseline_selection"] = "最新候选年度，仅用于原文风险定位；不表示已确认财务基期或已完成估值。"
     document = {
         "schema": "valuation-outcome-v1", "source_revision": session.revision,
         "session_id": session.session_id, "generated_at": str(session.updated_at),
@@ -136,6 +146,7 @@ def build_result_document(service, session):
         "gaps": gaps, "next_steps": steps if not numeric else ["使用完整估值任务导出 Excel 底稿、PDF 报告和 JSON 离线复算包。"],
         "limitations": list(dict.fromkeys(limitations)), "searches": session.search_history,
         "latest_issue": {"code": issue.code, "message": issue.message, "status": issue.status} if issue else None,
+        "source_risk_review": source_risks,
         "model": {"provider": session.model_provider, "name": session.model_name, "prompt_version": session.prompt_version},
         "sensitivity_status": "详见正式结果" if numeric else "未计算：尚无有效数值基准；不生成虚构价格敏感性表。",
     }
@@ -166,6 +177,26 @@ def ensure_result_document(service, session=None):
     return document
 
 
+def _forecast_lines(proposal):
+    """Readable paths in PDF/HTML; the full precision lives in the JSON."""
+    if not proposal:
+        return ["暂无已提出的预测假设。未擅自填入增长、利润率或折现率。"]
+    inputs = proposal["inputs"]
+    labels = {"pessimistic": "审慎", "base": "基准", "optimistic": "乐观"}
+    lines = [f"状态：{'已确认' if proposal['status'] == 'confirmed' else '待集中确认'}。以下均为估计或观点，不是历史事实。",
+             proposal["rationale"]]
+    for key, title in (("revenue_growth_scenarios", "收入增长率"),
+                       ("ebit_margin_scenarios", "EBIT利润率")):
+        for scenario, label in labels.items():
+            path = (inputs.get(key) or {}).get(scenario)
+            if path:
+                values = "、".join(f"{Decimal(str(value)) * 100}%" for value in path)
+                lines.append(f"{title}·{label}（第1至{len(path)}年）：{values}")
+    lines.append(f"WACC：{Decimal(str(inputs['wacc'])) * 100}%；永续增长率：{Decimal(str(inputs['terminal_growth'])) * 100}%")
+    lines.extend("风险：" + risk for risk in proposal["risks"])
+    return lines
+
+
 def document_sections(doc):
     """One content model for HTML and PDF so their conclusions cannot drift."""
     sections = [
@@ -184,8 +215,14 @@ def document_sections(doc):
     if doc.get("unconfirmed_candidates"):
         sections.append(("已提取候选（未确认为事实）", [f"{f['period']} · {f['metric']}：{f['raw_value']} {f['unit']} · {f['state']}\n来源 {f['source_id']}" + ("\n待核验：" + "；".join(f['warnings']) if f['warnings'] else "") for f in doc["unconfirmed_candidates"]]))
     assumptions = doc["forecast_assumptions"]
+    source_risks = doc.get("source_risk_review")
+    if source_risks:
+        sections.append(("原文风险科目检查", [source_risks["baseline_selection"], *source_risks["limitations"],
+            *[f"{r['label']} · 来源 {r['block_id']} · 第{r['page'] or '?'}页 · "
+              + ("已绑定财务字段，仍需评估估值调整" if r['resolved'] else "尚未绑定当前基期，不可忽略")
+              for r in source_risks["matches"]]]))
     sections += [
-        ("假设与观点", [assumptions["rationale"], json.dumps(assumptions["inputs"], ensure_ascii=False), *assumptions["risks"]] if assumptions else ["暂无已提出的预测假设。未擅自填入增长、利润率或折现率。"]),
+        ("假设与观点", _forecast_lines(assumptions)),
         ("敏感性分析", [doc["sensitivity_status"]]),
         ("缺口与下一步", doc["gaps"] + doc["next_steps"]),
         ("来源清单", [f"{s['name']} · {s['role']} · {s['block_count']} 原文块\n{s.get('source_url') or '本地资料'}\nSHA-256: {s['sha256'] or '未记录'}" + ("\n读取限制：" + "；".join(s['warnings']) if s.get('warnings') else "") for s in doc["sources"]] or ["暂无取得的原始资料。用户无需先上传文件；公开资料仍须实际检索、下载并核验。"]),

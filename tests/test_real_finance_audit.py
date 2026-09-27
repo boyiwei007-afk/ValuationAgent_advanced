@@ -18,6 +18,7 @@ from valuationagent.schemas.research import FactCandidate
 from valuationagent.schemas.research import ResearchDraft, ResearchSession
 from valuationagent.finance.integrity import (
     EQUITY_BRIDGE_REVIEW_LABELS,
+    equity_bridge_review_findings,
     validate_equity_bridge_inputs,
     verify_calculations,
 )
@@ -204,6 +205,35 @@ def test_explicit_zero_risk_fact_does_not_trigger_positive_exposure_gate():
     assert not validate_equity_bridge_inputs(request, request.financials)
 
 
+@pytest.mark.parametrize("metric", list(EQUITY_BRIDGE_REVIEW_LABELS))
+@pytest.mark.parametrize("method", ["dcf", "ev_ebitda"])
+def test_nonzero_negative_bridge_amount_cannot_bypass_review(metric, method):
+    # A deficit is not an approved zero market-value adjustment.  Negative
+    # restricted funds / deposits likewise need review of sign and basis.
+    request = structured_request(method, metric, "-10")
+    findings = validate_equity_bridge_inputs(request, request.financials)
+    assert findings and findings[0].severity == "blocking"
+    assert EQUITY_BRIDGE_REVIEW_LABELS[metric] + "=-10" in findings[0].message
+    with pytest.raises(ValueError, match="桥接需专项复核"):
+        verify_calculations(request, request.financials, None, [], None, [])
+
+
+@pytest.mark.parametrize("amount", ["NaN", "Infinity", "-Infinity"])
+def test_independent_bridge_gate_rejects_nonfinite_values_from_plugins(amount):
+    # Normal schema validation rejects these already.  An independent output
+    # guard also protects against model_construct / third-party plugin bypass.
+    findings = equity_bridge_review_findings(["dcf"], {"minority_interest": D(amount)})
+    assert findings and findings[0].severity == "blocking"
+
+
+def test_zero_amount_is_explicitly_different_from_unmeasured_exposure():
+    # Document the function's coverage boundary.  The caller must separately
+    # ensure that source review is complete; these two returns do NOT establish
+    # equivalent evidence coverage.
+    assert not equity_bridge_review_findings(["dcf"], {"minority_interest": D(0)})
+    assert not equity_bridge_review_findings(["dcf"], {})
+
+
 def test_research_bridge_review_retains_raw_evidence_and_allows_pe_subset():
     session = ResearchSession(session_id="test_finance_scope", draft=ResearchDraft(methods=["dcf"]))
     session.facts = [fact("少数股东权益", "10"), fact("归母净利润", "140"),
@@ -243,3 +273,83 @@ def test_generic_total_shares_requires_issuer_scope_not_a_statement_amount():
     assert "普通股股数" in assembler.structured_readiness_error(session)
     shares.scope = "issuer"
     assert assembler._structured_financials(session)[0].common_shares == D("100")
+
+
+def test_real_midea_year_end_shares_cannot_override_later_disclosed_issuer_total():
+    # Two different issuer totals appear in the same 2024 annual report:
+    # page 136 year end and page 3 as of the later annual-report disclosure.
+    session = ResearchSession(session_id="test_midea_later_shares", draft=ResearchDraft(
+        company="美的集团", ticker="000333.SZ", valuation_date=date(2025, 6, 30), methods=["pe"],
+    ))
+    shares = fact("股份总数", "7655955883")
+    shares.fact_id = "midea:share"
+    shares.block_id = "midea:136"
+    shares.scope, shares.unit = "issuer", "股"
+    session.facts = [shares]
+    blocks = [
+        {"file_id": "midea", "block_id": "midea:136", "text": "三、股份总数 7,655,955,883"},
+        {"file_id": "midea", "block_id": "midea:3", "text":
+         "以截至本报告披露之日公司总股本 7,660,355,772股扣除回购专户股份后的股本为分红基数"},
+    ]
+    assembler = ResearchValuationAssembler(block_loader=lambda _: blocks)
+    issue = assembler.later_issuer_shares_issue(session)
+    assert "7660355772股不同" in issue
+    assert "分红基数不能替代" in issue
+    with pytest.raises(ValueError, match="不能将年末数直接用作较晚估值日"):
+        assembler._structured_financials(session)
+
+
+def test_later_issuer_shares_guard_does_not_borrow_other_source_or_dividend_base():
+    session = ResearchSession(session_id="test_share_source_scope", draft=ResearchDraft(
+        valuation_date=date(2025, 6, 30), methods=["pe"],
+    ))
+    shares = fact("股份总数", "100")
+    shares.scope, shares.unit, shares.block_id = "issuer", "股", "issuer_report:136"
+    session.facts = [shares]
+    assembler = ResearchValuationAssembler(block_loader=lambda _: [
+        {"file_id": "issuer_report", "text": "截至本报告披露之日以总股本100股扣除回购后，分红基数为90股"},
+        {"file_id": "other_company", "text": "截至本报告披露之日公司总股本200股"},
+    ])
+    assert assembler.later_issuer_shares_issue(session) == ""
+
+
+def test_verified_report_disclosure_shares_replace_latest_per_share_denominator_only():
+    session = ResearchSession(session_id="test_midea_share_timeline", draft=ResearchDraft(
+        company="美的集团", ticker="000333.SZ", valuation_date=date(2025, 6, 30), methods=["pe"],
+    ))
+    annual = fact("股份总数", "7655955883")
+    annual.scope, annual.unit, annual.block_id = "issuer", "股", "midea:136"
+    newer = fact("总股本", "7660355772")
+    newer.fact_id, newer.scope, newer.unit = "midea:current", "issuer", "股"
+    newer.block_id, newer.period = "midea:3", "2025-03-29"
+    newer.verification = {"binding": "issuer_report_disclosure_shares", "scope": "issuer",
+                          "period_end": "2025-03-29"}
+    session.facts = [fact("归母净利润", "140"), annual, newer]
+    assembler = ResearchValuationAssembler(block_loader=lambda _: [
+        {"file_id": "midea", "block_id": "midea:3", "text":
+         "截至本报告披露之日公司总股本7,660,355,772股扣除已回购股份，"
+         "可参与分红股份数为7,631,903,546股"},
+    ])
+    assert not assembler.later_issuer_shares_issue(session)
+    snapshots = assembler._structured_financials(session)
+    assert len(snapshots) == 1
+    assert snapshots[0].period_end == date(2024, 12, 31)
+    assert snapshots[0].common_shares == D("7660355772")
+    assert snapshots[0].common_shares_as_of == date(2025, 3, 29)
+    assert snapshots[0].calculation_methods["common_shares"] == "issuer_shares_as_of[2025-03-29]"
+    assert snapshots[0].evidence["common_shares"][0].evidence_id == newer.fact_id
+
+    # Uploading the same official PDF and later fetching its public copy gives
+    # two file IDs, but their verified content hashes identify one disclosure.
+    annual.source_sha256 = newer.source_sha256 = "a" * 64
+    newer.block_id = "official_copy:3"
+    assert not assembler.later_issuer_shares_issue(session)
+    assert assembler._structured_financials(session)[0].common_shares == D("7660355772")
+
+
+@pytest.mark.parametrize("share_date", [date(2024, 1, 1), date(2025, 7, 1)])
+def test_structured_request_rejects_share_date_outside_period_to_valuation_window(share_date):
+    request = structured_request("pe", "minority_interest")
+    request.financials.common_shares_as_of = share_date
+    with pytest.raises(ValueError, match="issuer share-count date"):
+        ValuationRequest.model_validate(request.model_dump(mode="json"))

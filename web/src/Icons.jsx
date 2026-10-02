@@ -1,4 +1,5 @@
 const paths = {
+  trash: 'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7',
   plus: 'M12 5v14M5 12h14', arrow: 'M5 12h14m-6-6 6 6-6 6', send: 'm5 12 14-7-5 14-2-7-7 0Zm7 0 7-7',
   chat: 'M20 11a8 8 0 0 1-8 8H8l-5 3 1.5-6A8 8 0 1 1 20 11Z',
   chart: 'M4 4v16h16M8 15v-4m4 4V7m4 8v-6', file: 'M14 3H5v18h14V8l-5-5Zm0 0v5h5M8 12h8m-8 4h5',

@@ -535,6 +535,10 @@ def test_complete_equity_bridge_uses_leases_claims_associates_and_diluted_shares
         "non_operating_provisions": D("10"),
         "common_shares": D("100"),
         "diluted_shares": D("110"),
+        "statement_items": {
+            **req.financials.statement_items,
+            "trading_financial_assets": D("0"),
+        },
     })
     assumptions = model.resolve_assumptions(req, req.financials)
     forecast = model.forecast(req, req.financials, assumptions)
@@ -547,6 +551,50 @@ def test_complete_equity_bridge_uses_leases_claims_associates_and_diluted_shares
     assert dcf.bridge["diluted_or_common_shares"] == D("110.0000")
     assert dcf.bridge_unmeasured_items == []
     assert any("账面值作为市场价值代理" in item for item in dcf.scenario_warnings)
+
+
+def test_equity_bridge_adds_trading_financial_assets_without_overwriting_cash():
+    model = FinanceTeamModel()
+    req = request()
+    req.financials = req.financials.model_copy(update={
+        "cash_and_non_operating_assets": D("1000"),
+        "interest_bearing_debt": D("400"),
+        "common_shares": D("100"),
+        "statement_items": {
+            **req.financials.statement_items,
+            "trading_financial_assets": D("300"),
+        },
+    })
+    assumptions = model.resolve_assumptions(req, req.financials)
+    forecast = model.forecast(req, req.financials, assumptions)
+    dcf = model.dcf(req, req.financials, assumptions, forecast)
+
+    expected_equity = dcf.enterprise_value + D("1000") + D("300") - D("400")
+    assert abs(dcf.equity_value - expected_equity) < D("0.01")
+    assert dcf.bridge["trading_financial_assets"] == D("300.0000")
+    assert any("交易性金融资产使用报表列示" in item for item in dcf.scenario_warnings)
+
+
+def test_equity_bridge_does_not_double_count_trading_assets_when_aggregate_flagged():
+    model = FinanceTeamModel()
+    req = request()
+    req.financials = req.financials.model_copy(update={
+        "cash_and_non_operating_assets": D("1300"),
+        "interest_bearing_debt": D("400"),
+        "common_shares": D("100"),
+        "statement_items": {
+            **req.financials.statement_items,
+            "trading_financial_assets": D("300"),
+            "cash_and_non_operating_assets_includes_trading_financial_assets": D("1"),
+        },
+    })
+    assumptions = model.resolve_assumptions(req, req.financials)
+    forecast = model.forecast(req, req.financials, assumptions)
+    dcf = model.dcf(req, req.financials, assumptions, forecast)
+
+    expected_equity = dcf.enterprise_value + D("1300") - D("400")
+    assert abs(dcf.equity_value - expected_equity) < D("0.01")
+    assert "trading_financial_assets" not in dcf.bridge
 
 
 def test_user_stable_roic_must_exceed_terminal_growth():
@@ -626,8 +674,9 @@ def test_bridge_rejects_conflicting_top_level_and_statement_item_values():
         model.dcf(req, req.financials, assumptions, forecast)
 
 
-def test_reference_compatibility_accepts_diluted_share_denominator():
+def test_explicit_demo_accepts_diluted_share_denominator():
     req = request(industry=None)
+    req.mode = "demo"
     original_shares = req.financials.common_shares
     req.financials = req.financials.model_copy(update={
         "common_shares": None,
@@ -640,6 +689,15 @@ def test_reference_compatibility_accepts_diluted_share_denominator():
     forecast = model.forecast(req, req.financials, assumptions)
     result = model.dcf(req, req.financials, assumptions, forecast)
     assert result.per_share_value.is_finite()
+
+
+def test_production_never_falls_back_to_demo_when_industry_is_missing():
+    req = request(industry=None)
+    model = FinanceTeamModel()
+    assert model.model_version_for(req) == model.version
+    assert any(item.rule_id == "INDUSTRY_CONFIRMATION_REQUIRED"
+               and item.severity == "blocking"
+               for item in model.validate(req, req.financials))
 
 
 def test_comparability_controls_block_review_years_and_exclude_marked_years():

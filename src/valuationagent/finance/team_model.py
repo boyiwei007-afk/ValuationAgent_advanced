@@ -86,28 +86,24 @@ class FinanceTeamModel:
         self.reference = ReferenceFinancialModel()
 
     @staticmethod
-    def _use_reference_compatibility(request: ValuationRequest) -> bool:
-        """Route demos and historical requests without an industry transparently."""
+    def _is_demo(request: ValuationRequest) -> bool:
+        """Only explicitly synthetic requests may use the demonstration engine."""
 
-        return request.mode == "demo" or not (request.company.industry or "").strip()
+        return request.mode == "demo"
 
     def model_version_for(self, request: ValuationRequest) -> str:
         """Expose the calculation engine that actually produced the result."""
 
         return (
             self.reference.version
-            if self._use_reference_compatibility(request)
+            if self._is_demo(request)
             else self.version
         )
 
     def resolve_industry_parameters(self, request: ValuationRequest) -> dict:
-        if self._use_reference_compatibility(request):
+        if self._is_demo(request):
             return {
-                "mode": (
-                    "synthetic_demo"
-                    if request.mode == "demo"
-                    else "legacy_reference_compatibility"
-                ),
+                "mode": "synthetic_demo",
                 "financial_industry_supported": False,
             }
         return self.registry.resolve(request.company.industry).as_dict()
@@ -139,21 +135,8 @@ class FinanceTeamModel:
                 ),
                 *bridge_findings,
             ]
-        if self._use_reference_compatibility(request):
-            findings = self.reference.validate(request, financials)
-            if request.mode != "demo":
-                findings.append(
-                    ValidationFinding(
-                        rule_id="LEGACY_REFERENCE_COMPATIBILITY",
-                        severity="warning",
-                        message=(
-                            "未提供行业，当前任务使用参考模型兼容路径；补充非金融行业后，"
-                            "系统才会启用金融小组正式模型。"
-                        ),
-                        recommended_action="补充公司所属行业并重新运行正式估值。",
-                    )
-                )
-            return findings
+        if self._is_demo(request):
+            return self.reference.validate(request, financials)
         findings = self.reference.validate(
             request,
             financials,
@@ -766,7 +749,7 @@ class FinanceTeamModel:
     def resolve_assumptions(
         self, request: ValuationRequest, financials: FinancialSnapshot
     ) -> AssumptionSet:
-        if "dcf" not in request.methods or self._use_reference_compatibility(request):
+        if "dcf" not in request.methods or self._is_demo(request):
             return self.reference.resolve_assumptions(request, financials)
         industry = self.registry.resolve(request.company.industry)
         history = self._history(request, financials)
@@ -1591,7 +1574,7 @@ class FinanceTeamModel:
         financials: FinancialSnapshot,
         assumptions: AssumptionSet,
     ) -> list[ForecastYear]:
-        if self._use_reference_compatibility(request):
+        if self._is_demo(request):
             return self.reference.forecast(request, financials, assumptions)
         return self._forecast_scenario(request, financials, assumptions, "base")
 
@@ -1675,7 +1658,7 @@ class FinanceTeamModel:
         assumptions: AssumptionSet,
         forecast: list[ForecastYear],
     ) -> DcfResult:
-        if self._use_reference_compatibility(request):
+        if self._is_demo(request):
             return self.reference.dcf(request, financials, assumptions, forecast)
         scenario_values: dict[str, Decimal] = {}
         base_values = None
@@ -1833,7 +1816,7 @@ class FinanceTeamModel:
         financials: FinancialSnapshot,
         peers: list[PeerCompany],
     ) -> list[MultipleResult]:
-        if self._use_reference_compatibility(request):
+        if self._is_demo(request):
             return self.reference.relative(request, financials, peers)
 
         def calculate(
@@ -1958,7 +1941,7 @@ class FinanceTeamModel:
         financials: FinancialSnapshot,
         assumptions: AssumptionSet,
     ) -> list[SensitivityCell]:
-        if self._use_reference_compatibility(request):
+        if self._is_demo(request):
             return self.reference.sensitivity(request, financials, assumptions)
         forecast = self._forecast_scenario(request, financials, assumptions, "base")
         cells: list[SensitivityCell] = []
@@ -2013,7 +1996,7 @@ class FinanceTeamModel:
         report distinguishes an untested factor from a low-impact factor.
         """
 
-        if self._use_reference_compatibility(request):
+        if self._is_demo(request):
             return []
 
         def per_share(variant: AssumptionSet) -> Decimal | None:
@@ -2727,7 +2710,7 @@ class FinanceTeamModel:
 
         industry_quality = "unknown"
         metadata_completeness = "unknown"
-        if has_dcf and not self._use_reference_compatibility(request):
+        if has_dcf and not self._is_demo(request):
             industry = self.registry.resolve(request.company.industry)
             industry_quality = industry.quality
             metadata_completeness = industry.metadata_completeness

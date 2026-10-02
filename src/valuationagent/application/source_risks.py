@@ -15,6 +15,7 @@ from valuationagent.finance.integrity import EQUITY_BRIDGE_REVIEW_LABELS
 
 
 RISK_ALIASES = {
+    "trading_financial_assets": ("交易性金融资产",),
     "minority_interest": ("少数股东权益", "noncontrolling_interest"),
     "restricted_cash": (
         "受限货币资金", "使用受到限制的货币资金", "存放中央银行法定存款准备金",
@@ -107,13 +108,17 @@ def _risk_row(line):
     return None
 
 
-def _verified_fact(fact, metric, file_id, baseline, quote, block_id, source_sha256):
+def _verified_fact(
+    fact, metric, file_id, baseline, quote, block_id, source_sha256,
+    equivalent_file_ids=(),
+):
+    fact_file_id = str(_get(fact, "block_id", "")).split(":", 1)[0]
     if (_get(fact, "status") != "confirmed" or _get(fact, "warnings", [])
             or _get(fact, "role") != "historical" or _get(fact, "scope") != "consolidated"
             or _get(fact, "source_type", "document") != "document"
             or _metric(_get(fact, "metric")) != metric
             or _period_end(_get(fact, "period")) != baseline
-            or str(_get(fact, "block_id", "")).split(":", 1)[0] != file_id):
+            or fact_file_id not in {file_id, *equivalent_file_ids}):
         return False
     verification = _get(fact, "verification", {}) or {}
     if (verification.get("scope") != "consolidated"
@@ -133,9 +138,13 @@ def _verified_fact(fact, metric, file_id, baseline, quote, block_id, source_sha2
     # A reviewed non-zero already invokes the separate financial model gate.
     # Zero must bind this exact source row: a zero somewhere else in the same
     # filing cannot hide another non-zero/blank-year exposure.
-    if amount == 0 and (_get(fact, "block_id") != block_id
-                        or _compact(verification["source_row"]) != _compact(quote)):
-        return False
+    if amount == 0:
+        fact_block_id = str(_get(fact, "block_id", ""))
+        same_block = fact_block_id == block_id
+        if not same_block and fact_file_id in equivalent_file_ids:
+            same_block = fact_block_id.rsplit(":", 1)[-1] == str(block_id).rsplit(":", 1)[-1]
+        if not same_block or _compact(verification["source_row"]) != _compact(quote):
+            return False
     return True
 
 
@@ -169,6 +178,10 @@ def source_risk_inventory(session, blocks, baseline_period_end: date):
         scanned += 1
         loaded_counts[file_id] += 1
         sha256 = location.get("source_sha256") or _get(doc, "sha256", "")
+        equivalent_file_ids = {
+            candidate_id for candidate_id, candidate in documents.items()
+            if sha256 and _get(candidate, "sha256", "") == sha256
+        }
         for line in str(block.get("text", "")).splitlines():
             metric = _risk_row(line)
             if metric is None:
@@ -180,7 +193,7 @@ def source_risk_inventory(session, blocks, baseline_period_end: date):
             seen.add(identity)
             accepted = [fact for fact in facts if _verified_fact(
                 fact, metric, file_id, baseline_period_end, quote,
-                block.get("block_id"), sha256,
+                block.get("block_id"), sha256, equivalent_file_ids,
             )]
             matches.append({
                 "metric": metric, "label": EQUITY_BRIDGE_REVIEW_LABELS[metric],

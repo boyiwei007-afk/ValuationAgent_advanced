@@ -1,8 +1,8 @@
-const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+const base = (import.meta.env?.VITE_API_BASE_URL || '').replace(/\/$/, '')
 
 export async function api(path, options = {}) {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), options.method ? 180000 : 15000)
+  const timer = setTimeout(() => controller.abort(), options.method ? 180000 : 30000)
   const abort = () => controller.abort()
   options.signal?.addEventListener('abort', abort, { once: true })
   if (options.signal?.aborted) controller.abort()
@@ -47,7 +47,8 @@ async function downloadArtifact(path, filename) {
     throw err
   } finally { clearTimeout(timer) }
 }
-export const downloadResearch = (id, format) => downloadArtifact(`/api/research-sessions/${id}/export?format=${format}`, `${id}.${format}`)
+export const downloadWorkspace = (id, format) => downloadArtifact(`/api/workspaces/${id}/export?format=${format}`, `${id}.${format}`)
+export const downloadSavedArtifact = (id, artifact) => downloadArtifact(`/api/workspaces/${id}/artifacts/${artifact.artifact_id}`, `${artifact.artifact_id}-${artifact.filename}`)
 export const downloadRun = (id, format) => downloadArtifact(`/api/runs/${id}/export?format=${format}`, `valuation-${id}.${format}`)
 export async function uploadFile(file, role) {
   if (file.size > 50 * 1024 * 1024) throw new Error('文件不能超过 50 MB / Maximum file size: 50 MB')
@@ -55,11 +56,4 @@ export async function uploadFile(file, role) {
   data.append('file', file)
   data.append('role', role)
   return api('/api/files', { method: 'POST', body: data })
-}
-export function eventStream(runId, after) { return new EventSource(`${base}/api/runs/${runId}/events?after=${after}`) }
-export function downloadJson(name, data) {
-  const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
-  const link = document.createElement('a')
-  link.href = url; link.download = name; link.click()
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }

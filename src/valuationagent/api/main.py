@@ -6,16 +6,7 @@ import os
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import (
-    BackgroundTasks,
-    FastAPI,
-    File,
-    Form,
-    Header,
-    HTTPException,
-    Request,
-    UploadFile,
-)
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -24,8 +15,10 @@ from fastapi.sse import EventSourceResponse
 
 from valuationagent.application.runner import ValuationRunner
 from valuationagent.application.research import ResearchService
+from valuationagent.application.workspaces import ValuationWorkspaceService
 from valuationagent.application.reporting import ValuationReportExporter
-from valuationagent.api.research import register_research_routes
+from valuationagent.api.workspaces import register_workspace_routes
+from valuationagent.api.access import register_access
 from valuationagent.finance.factory import create_financial_model
 from valuationagent.finance.tools import FinanceResearchToolProvider
 from valuationagent.market import create_data_provider
@@ -35,22 +28,9 @@ from valuationagent.llm.client import (
     ModelSessionRegistry,
     OpenAICompatibleClient,
 )
-from valuationagent.schemas.models import (
-    Capability,
-    ChatInput,
-    ChatMessage,
-    ModelConnectionInput,
-    ModelSessionPublic,
-    RunAccepted,
-    RunCreateBody,
-    RunEvent,
-    RunRecord,
-    RunStatus,
-    ValuationOutput,
-    RevisionInput,
-    ResumeInput,
-)
-from valuationagent.storage.sqlite import SQLiteRunStore
+from valuationagent.schemas.models import Capability, ChatMessage, ModelConnectionInput, ModelSessionPublic, RunEvent, RunRecord, RunStatus, ValuationOutput
+from valuationagent.storage.sqlite import SQLiteRunStore, WorkspaceStateError
+from valuationagent.llm.context import AGENT_PROMPT_VERSION
 
 
 TERMINAL_STATUSES = {
@@ -74,8 +54,8 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="ValuationAgent API",
-        version="0.5.0",
-        description="Shared backend for agent conversation, valuation workflow, audit events and web visualization.",
+        version="0.6.0-dev",
+        description="Valuation-first agent workspace with evidence, approval, deterministic modeling, challenge and versioning.",
     )
     origins = [
         item.strip()
@@ -91,8 +71,13 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Content-Type", "Last-Event-ID"],
     )
+    register_access(app, origins)
 
     app.state.store = store
+    @app.exception_handler(WorkspaceStateError)
+    async def invalid_workspace_state(request, exc):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     @app.middleware("http")
     async def cache_policy(request: Request, call_next):
         response = await call_next(request)
@@ -108,16 +93,19 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         search_provider=search_provider,
         tool_providers=(FinanceResearchToolProvider(),),
     )
+    app.state.workspaces = ValuationWorkspaceService(
+        store, app.state.research, runner
+    )
 
     def execute_background(run_id):
         try:
-            runner.execute(run_id)
+            app.state.workspaces.execute(run_id)
         except ValueError:
             # A concurrent request may already own the execution lease.
             return
 
-    register_research_routes(
-        app, app.state.research, sessions, runner, execute_background
+    register_workspace_routes(
+        app, app.state.workspaces, sessions, execute_background
     )
 
     @app.exception_handler(RequestValidationError)
@@ -140,13 +128,16 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "service": "valuationagent", "version": "0.5.0"}
+        return {"status": "ok", "service": "valuationagent", "version": "0.6.0-dev", "agent_version": AGENT_PROMPT_VERSION}
 
     @app.get("/api/capabilities", response_model=list[Capability])
     def capabilities() -> list[Capability]:
         return [
-            Capability(capability_id="research_sessions", available=True,
-                       detail="资料不完整也能开始研究；选项与文字复核、来源、恢复及研究报告"),
+            Capability(
+                capability_id="valuation_workspaces",
+                available=True,
+                detail="估值优先工作区、数据需求、集中复核、不可变版本、挑战层、决策层和复现清单",
+            ),
             Capability(capability_id="research_document_parsing", available=True,
                        detail="研究会话读取文本 PDF、XLSX、CSV、JSON、TXT；语义抽取需要模型，OCR 待接入"),
             Capability(
@@ -202,7 +193,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             Capability(
                 capability_id="interactive_agent_recovery",
                 available=True,
-                detail="模型、工具和文件异常保存进度并返回可操作的恢复选项",
+                detail="模型、工具和文件异常保留进度，可重新连接或补充输入后继续",
             ),
             Capability(
                 capability_id="agent_tool_extensions",
@@ -212,7 +203,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             Capability(
                 capability_id="agent_application_contracts",
                 available=True,
-                detail="意图、上下文、证据、搜索查询、政策卡片和导出产物契约已冻结",
+                detail="单一工具循环共享工作区状态、分层上下文、来源证据和搜索查询契约",
             ),
             Capability(
                 capability_id="search_provider_contract",
@@ -234,11 +225,6 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                 detail="Tushare Pro点时A股年报、每日估值指标及非金融行业可比公司筛选",
             ),
             Capability(
-                capability_id="pdf_excel_extraction",
-                available=False,
-                detail="原有估值上传路径仍需标准 JSON；研究会话已支持原文读取和候选字段提取",
-            ),
-            Capability(
                 capability_id="pdf_excel_reporting",
                 available=True,
                 detail="正式估值结果支持JSON、Excel审计工作簿与PDF报告",
@@ -256,65 +242,13 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
 
     @app.get("/api/workflow-definition")
     def workflow_definition() -> dict:
+        from valuationagent.workflow.graph import STAGES
+
         return {
-            "version": "0.5.0",
+            "version": "workspace-agent-v1",
             "stages": [
-                {"id": "data_intake", "label": "数据输入", "order": 1, "tone": "cyan"},
-                {
-                    "id": "agent_planning",
-                    "label": "Agent 规划",
-                    "order": 2,
-                    "tone": "violet",
-                },
-                {
-                    "id": "financial_validation",
-                    "label": "财务审核",
-                    "order": 3,
-                    "tone": "amber",
-                },
-                {
-                    "id": "industry_parameters",
-                    "label": "行业识别与参数",
-                    "order": 4,
-                    "tone": "cyan",
-                },
-                {
-                    "id": "assumption_resolution",
-                    "label": "假设形成",
-                    "order": 5,
-                    "tone": "violet",
-                },
-                {
-                    "id": "financial_forecast",
-                    "label": "经营预测",
-                    "order": 6,
-                    "tone": "cyan",
-                },
-                {
-                    "id": "dcf_valuation",
-                    "label": "DCF 估值",
-                    "order": 7,
-                    "tone": "green",
-                },
-                {
-                    "id": "relative_valuation",
-                    "label": "相对估值",
-                    "order": 8,
-                    "tone": "green",
-                },
-                {
-                    "id": "sensitivity",
-                    "label": "敏感性分析",
-                    "order": 9,
-                    "tone": "amber",
-                },
-                {
-                    "id": "reconciliation",
-                    "label": "区间验证",
-                    "order": 10,
-                    "tone": "violet",
-                },
-                {"id": "reporting", "label": "结果输出", "order": 11, "tone": "green"},
+                {"id": stage, "label": label, "order": index}
+                for index, (stage, label) in enumerate(STAGES, 1)
             ],
         }
 
@@ -351,25 +285,6 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    @app.post("/api/runs", response_model=RunAccepted, status_code=202)
-    def create_run(
-        body: RunCreateBody, background_tasks: BackgroundTasks
-    ) -> RunAccepted:
-        llm = None
-        if body.model_session_id:
-            try:
-                llm = sessions.client(body.model_session_id)
-            except KeyError as exc:
-                raise HTTPException(
-                    status_code=404, detail="model session not found"
-                ) from exc
-        try:
-            record = runner.create_run(body.request, llm)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        background_tasks.add_task(execute_background, record.run_id)
-        return RunAccepted(run_id=record.run_id, status=record.status)
 
     @app.get("/api/runs", response_model=list[RunRecord])
     def list_runs(limit: int = 50) -> list[RunRecord]:
@@ -454,31 +369,6 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         get_run_or_404(run_id)
         return store.list_messages(run_id)
 
-    @app.post("/api/runs/{run_id}/model-session", status_code=204)
-    def attach_run_model(run_id: str, body: ResumeInput):
-        """Reconnect a persisted task without executing or revising its valuation."""
-        get_run_or_404(run_id)
-        if not body.model_session_id:
-            raise HTTPException(status_code=422, detail="model_session_id is required")
-        if store.active(run_id):
-            raise HTTPException(status_code=409, detail="run is already executing")
-        try:
-            runner.attach_model(run_id, sessions.client(body.model_session_id))
-        except KeyError:
-            raise HTTPException(
-                status_code=404, detail="model session not found"
-            ) from None
-
-    @app.post("/api/runs/{run_id}/messages", response_model=ChatMessage)
-    def add_message(run_id: str, body: ChatInput) -> ChatMessage:
-        get_run_or_404(run_id)
-        try:
-            return runner.converse(run_id, body.content)
-        except LlmError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from None
-
     @app.get("/api/runs/{run_id}/revisions", response_model=list[RunRecord])
     def revisions(run_id: str):
         get_run_or_404(run_id)
@@ -488,39 +378,6 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     def artifacts(run_id: str):
         get_run_or_404(run_id)
         return store.artifacts(run_id)
-
-    @app.post("/api/runs/{run_id}/reviews", response_model=RunRecord, status_code=201)
-    def review(run_id: str, body: RevisionInput):
-        get_run_or_404(run_id)
-        try:
-            return runner.revise(run_id, body, execute=False)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from None
-
-    @app.post(
-        "/api/runs/{run_id}/revisions", response_model=RunAccepted, status_code=202
-    )
-    def revise(run_id: str, body: RevisionInput, background_tasks: BackgroundTasks):
-        child = review(run_id, body)
-        background_tasks.add_task(execute_background, child.run_id)
-        return RunAccepted(run_id=child.run_id, status=child.status)
-
-    @app.post("/api/runs/{run_id}/resume", response_model=RunAccepted, status_code=202)
-    def resume(
-        run_id: str, background_tasks: BackgroundTasks, body: ResumeInput | None = None
-    ):
-        record = get_run_or_404(run_id)
-        if store.active(run_id):
-            raise HTTPException(status_code=409, detail="run is already executing")
-        if body and body.model_session_id:
-            try:
-                runner.attach_model(run_id, sessions.client(body.model_session_id))
-            except KeyError:
-                raise HTTPException(
-                    status_code=404, detail="model session not found"
-                ) from None
-        background_tasks.add_task(execute_background, run_id)
-        return RunAccepted(run_id=run_id, status=record.status)
 
     # The built web app shares this origin and the same runner/database as CLI.
     # Mount only public build artifacts, never project files or uploaded data.

@@ -1,5 +1,4 @@
 from __future__ import annotations
-from decimal import Decimal
 
 from fastapi.testclient import TestClient
 
@@ -25,38 +24,24 @@ def demo_body():
 
 
 def test_api_run_events_results_and_conversation(tmp_path):
-    app = create_app(tmp_path / "api-runtime")
+    from test_unified_workspace_agent import ScriptedModel, completed_workspace
+    from valuationagent.schemas.research import ResearchTurn
+
+    app, service, workspace, _ = completed_workspace(
+        tmp_path, ScriptedModel(("read_valuation", {}), ("finish_response", {"answer": "WACC 已列在计算假设中。"}))
+    )
+    record = app.state.store.get_run(workspace.active_run_id)
     with TestClient(app) as client:
-        response = client.post("/api/runs", json=demo_body())
-        assert response.status_code == 202
-        run_id = response.json()["run_id"]
-
-        record = client.get(f"/api/runs/{run_id}")
-        assert record.status_code == 200
-        assert record.json()["status"] == "completed"
-        assert len(record.json()["input_hash"]) == 64
-
-        history = client.get(f"/api/runs/{run_id}/events/history")
-        assert history.status_code == 200
-        assert any(event["type"] == "run.completed" for event in history.json())
-
-        results = client.get(f"/api/runs/{run_id}/results")
-        assert results.status_code == 200
-        assert Decimal(results.json()["dcf"]["per_share_value"]) > 0
-
-        answer = client.post(
-            f"/api/runs/{run_id}/messages", json={"content": "请说明 WACC"}
-        )
-        assert answer.status_code == 200
-        assert "WACC" in answer.json()["content"]
-
-        messages = client.get(f"/api/runs/{run_id}/messages")
-        assert messages.status_code == 200
-        assert {item["role"] for item in messages.json()} >= {"user", "assistant"}
-
-        with client.stream("GET", f"/api/runs/{run_id}/events") as stream:
+        assert client.post("/api/runs", json=demo_body()).status_code == 405
+        assert client.get(f"/api/runs/{record.run_id}/results").status_code == 200
+        reply = client.post(f"/api/workspaces/{workspace.workspace_id}/messages", json={"content": "请说明 WACC"})
+        assert reply.status_code == 202
+        snapshot = client.get(f"/api/workspaces/{workspace.workspace_id}").json()
+        assert "WACC" in snapshot["messages"][-1]["content"]
+        assert snapshot["workspace"]["active_run_id"] == record.run_id
+        with client.stream("GET", f"/api/runs/{record.run_id}/events") as stream:
             assert stream.status_code == 200
-            lines = [line for line in stream.iter_lines() if line]
+            lines = list(stream.iter_lines())
         assert any("event: run.completed" in line for line in lines)
 
 
@@ -72,7 +57,7 @@ def test_capabilities_report_runtime_adapters(tmp_path):
     assert capabilities["interactive_agent_recovery"]["available"] is True
     assert capabilities["agent_tool_extensions"]["available"] is True
     assert capabilities["ticker_data_provider"]["available"] is True
-    assert capabilities["pdf_excel_extraction"]["available"] is False
+    assert capabilities["research_document_ingestion"]["available"] is True
 
 
 def test_upload_records_hash_but_does_not_claim_to_parse(tmp_path):
@@ -95,4 +80,4 @@ def test_upload_records_hash_but_does_not_claim_to_parse(tmp_path):
             item["capability_id"]: item
             for item in client.get("/api/capabilities").json()
         }
-        assert capabilities["pdf_excel_extraction"]["available"] is False
+        assert capabilities["research_document_ingestion"]["available"] is True

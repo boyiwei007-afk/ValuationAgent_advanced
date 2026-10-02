@@ -48,14 +48,22 @@ class ResearchDraft(ApiModel):
     ticker: str = Field(default="", max_length=20)
     industry: str = Field(default="", max_length=120)
     valuation_date: date | None = None
+    information_cutoff_date: date | None = None
+    peer_pricing_date: date | None = Field(default=None, description="相对估值统一使用的可核验行情日期；默认估值日。非交易日等原因可明确选择估值日前七天内的日期，不修改估值日或信息截止日，不凭猜测声称该日是最近交易日。")
+    peer_pricing_rationale: str = Field(default="", max_length=800, description="选择不同于估值日的行情日时说明依据及陈旧性风险，随可比样本冻结和披露。")
     objective: str = Field(default="", max_length=2000)
     methods: list[Literal["dcf", "pe", "ps", "ev_ebitda"]] = Field(default_factory=list)
 
-
-class ResearchChoice(ApiModel):
-    id: str = Field(min_length=1, max_length=80)
-    label: str = Field(min_length=1, max_length=160)
-    description: str = Field(default="", max_length=400)
+    @model_validator(mode="after")
+    def pricing_date_bounds(self):
+        if self.peer_pricing_date:
+            if self.valuation_date and not 0 <= (self.valuation_date - self.peer_pricing_date).days <= 7:
+                raise ValueError("可比行情日期须在估值日前七天内，不能晚于估值日")
+            if self.information_cutoff_date and self.peer_pricing_date > self.information_cutoff_date:
+                raise ValueError("可比行情日期不能晚于信息截止日")
+            if self.valuation_date and self.peer_pricing_date != self.valuation_date and len(self.peer_pricing_rationale.strip()) < 12:
+                raise ValueError("不同行情日期须说明选择依据和陈旧性风险，不得静默替换")
+        return self
 
 
 class ResearchMemoryItem(ApiModel):
@@ -81,23 +89,39 @@ class ResearchIssue(ApiModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-class ResearchQuestion(ApiModel):
-    question_id: str
-    kind: Literal[
-        "task", "data_source", "facts", "clarification",
-        "search_unavailable", "search_failed", "recovery",
-    ]
-    title: str = Field(min_length=1, max_length=600)
-    options: list[ResearchChoice] = Field(min_length=1, max_length=4)
-    fact_ids: list[str] = Field(default_factory=list)
-    superseded_fact_ids: list[str] = Field(default_factory=list)
-    proposed_draft: ResearchDraft | None = None
-    valuation_review: dict[str, Any] | None = None
+class SemanticMappingAlternative(ApiModel):
+    """A plausible accounting interpretation retained for audit, not hidden."""
+
+    standard_metric: str = Field(default="", max_length=120)
+    semantic_role: Literal[
+        "operating", "financing", "financial_subsidiary", "investing",
+        "tax", "equity", "non_operating", "unknown",
+    ] = "unknown"
+    confidence: float = Field(default=0, ge=0, le=1)
+    rationale: str = Field(default="", max_length=600)
 
 
 class FactCandidate(ApiModel):
     fact_id: str = ""
     metric: str = Field(min_length=1, max_length=120)
+    standard_metric: str = Field(
+        default="",
+        max_length=120,
+        description="LLM基于完整上下文建议的标准字段；metric始终保留原始科目名。",
+    )
+    semantic_role: Literal[
+        "operating", "financing", "financial_subsidiary", "investing",
+        "tax", "equity", "non_operating", "unknown",
+    ] = "unknown"
+    ebit_treatment: Literal["include", "exclude", "review"] = "review"
+    fcff_treatment: Literal["include", "exclude", "review"] = "review"
+    equity_bridge_treatment: Literal["include", "exclude", "review"] = "review"
+    mapping_confidence: float = Field(default=0, ge=0, le=1)
+    mapping_rationale: str = Field(default="", max_length=1200)
+    alternative_interpretations: list[SemanticMappingAlternative] = Field(
+        default_factory=list,
+        max_length=4,
+    )
     raw_value: str = Field(min_length=1, max_length=100)
     unit: Literal["元", "千元", "万元", "百万元", "亿元", "股", "千股", "万股", "百万股", "亿股", "%", "ratio", "unknown"] = "unknown"
     normalized_value: str | None = None
@@ -107,7 +131,9 @@ class FactCandidate(ApiModel):
     peer_ticker: str = Field(default="", max_length=24)
     peer_name: str = Field(default="", max_length=200)
     multiple_basis: Literal["FY", "TTM", "forward", "unknown"] = "unknown"
+    denominator_period_end: date | None = None
     block_id: str = Field(min_length=1, max_length=200)
+    table_id: str = ""
     quote: str = Field(min_length=1, max_length=2400)
     source_type: Literal["document", "user_note"] = "document"
     status: Literal["proposed", "confirmed", "rejected"] = "proposed"
@@ -129,19 +155,45 @@ class DocumentSummary(ApiModel):
     size_bytes: int = Field(default=0, ge=0)
     warnings: list[str] = Field(default_factory=list)
     parse_status: Literal["parsed", "partial", "unreadable"] = "parsed"
+    provenance_type: Literal[
+        "user_upload", "official_index", "official_filing",
+        "public_web", "search_snippet", "structured_provider", "unknown",
+    ] = "unknown"
+    authority_tier: Literal["A", "B", "C", "D", "E"] = "D"
+    source_confidence: float = Field(default=0.5, ge=0, le=1)
+    provider: str = Field(default="", max_length=120)
+    source_url: str = Field(default="", max_length=2000)
+    acquisition_ref: str = Field(default="", max_length=100)
+
+
+class DecisionOption(ApiModel):
+    label: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=600)
+
+
+class DecisionPrompt(ApiModel):
+    question: str = Field(min_length=1, max_length=1000)
+    options: list[DecisionOption] = Field(min_length=2, max_length=4)
 
 
 class ResearchSession(ApiModel):
     session_id: str
     revision: int = 1
     language: Language = Language.ZH_CN
-    requires_model: bool = False
     data_source_preference: Literal["", "online", "web", "upload"] = ""
+    information_cutoff_date: date | None = None
     # A user goal may span several evidence/confirmation turns.  Keep it in
     # authoritative session state so accepting one candidate batch resumes the
     # original valuation request instead of dropping back to an idle chat.
     pending_action: Literal["", "valuation"] = ""
+    # Terminal outcome of the latest bounded research attempt. This remains
+    # visible until stronger evidence produces a new outcome.
+    outcome_status: Literal["", "insufficient_data"] = ""
+    outcome_reason: str = Field(default="", max_length=2400)
     search_history: list[dict[str, Any]] = Field(default_factory=list, max_length=120)
+    plan: list[dict[str, str]] = Field(default_factory=list, max_length=12)
+    pending_decision: DecisionPrompt | None = None
+    resume_context: dict[str, Any] = Field(default_factory=dict)
     search_retry_epoch: int = Field(default=0, ge=0)
     # Empty until the user accepts the controller-owned combined plan.  A
     # reviewed subset lets one data-starved method be excluded without silently
@@ -154,29 +206,24 @@ class ResearchSession(ApiModel):
     staged_supersessions: dict[str, list[str]] = Field(default_factory=dict)
     draft: ResearchDraft = Field(default_factory=ResearchDraft)
     status: Literal[
-        "collecting", "waiting_confirmation", "awaiting_financial_model",
+        "collecting", "awaiting_input",
         "ready_for_valuation", "submitted"
     ] = "collecting"
     documents: list[DocumentSummary] = Field(default_factory=list)
     facts: list[FactCandidate] = Field(default_factory=list)
+    table_interpretations: list[dict[str, Any]] = Field(default_factory=list)
+    reading_attempts: list[dict[str, Any]] = Field(default_factory=list, max_length=128)
     gaps: list[str] = Field(default_factory=list)
     memory: list[ResearchMemoryItem] = Field(default_factory=list, max_length=80)
-    question: ResearchQuestion | None = None
     last_issue: ResearchIssue | None = None
     summary: str = ""
-    agent_protocol_version: str = "research-agent-v2"
-    prompt_version: str = "research-2026-09-27.20"
+    agent_protocol_version: str = "workspace-agent-v1"
+    prompt_version: str = "workspace-agent-2026-10-01.8"
     model_provider: str = ""
     model_name: str = ""
     valuation_run_id: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-class ResearchCreate(ApiModel):
-    language: Language = Language.ZH_CN
-    model_session_id: str | None = None
-    data_source_preference: Literal["", "web", "upload"] = ""
 
 
 class ResearchTurn(ApiModel):
@@ -185,13 +232,9 @@ class ResearchTurn(ApiModel):
     language: Language | None = None
     content: str = Field(default="", max_length=8000)
     file_ids: list[str] = Field(default_factory=list, max_length=8)
-    question_id: str | None = None
-    option_id: str | None = None
 
     @model_validator(mode="after")
     def meaningful_turn(self):
-        if not self.content.strip() and not self.file_ids and not self.option_id:
-            raise ValueError("请输入需求、上传文件或选择一个选项。")
-        if self.option_id and not self.question_id:
-            raise ValueError("选项必须关联当前确认问题。")
+        if not self.content.strip() and not self.file_ids:
+            raise ValueError("请输入需求或上传文件。")
         return self

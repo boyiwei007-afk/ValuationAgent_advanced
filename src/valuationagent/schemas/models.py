@@ -48,7 +48,6 @@ class AssumptionSourceType(StrEnum):
 
 class RunMode(StrEnum):
     DEMO = "demo"
-    LIVE = "live"
     SNAPSHOT = "snapshot"
 
 
@@ -175,6 +174,7 @@ class PeerCompany(ApiModel):
     financial_period_end: date | None = None
     multiple_basis: Literal["FY", "TTM", "forward", "unknown"] = "unknown"
     evidence: dict[str, list[EvidenceRef]] = Field(default_factory=dict)
+    calculation_methods: dict[str, str] = Field(default_factory=dict)
 
 
 def required_financial_metrics(methods):
@@ -374,6 +374,10 @@ class ModelConnectionInput(ApiModel):
     api_key: SecretStr = Field(min_length=1)
     timeout_seconds: float = Field(default=90.0, gt=1, le=180)
     thinking: Literal["auto", "enabled", "disabled"] = "auto"
+    reasoning_protocol: Literal["auto", "chat_template"] = "auto"
+    temperature: float | None = Field(default=0, ge=0, le=2)
+    tool_call_format: Literal["native", "json_content"] = "native"
+    supports_images: bool = False
 
     @field_validator("base_url")
     @classmethod
@@ -399,11 +403,11 @@ class ModelSessionPublic(ApiModel):
     base_url: str
     model: str
     created_at: datetime
-
-
-class RunCreateBody(ApiModel):
-    request: ValuationRequest
-    model_session_id: str | None = None
+    supports_images: bool = False
+    tool_call_format: Literal["native", "json_content"] = "native"
+    reasoning_protocol: Literal["auto", "chat_template"] = "auto"
+    thinking: Literal["auto", "enabled", "disabled"] = "auto"
+    temperature: float | None = Field(default=0, ge=0, le=2)
 
 
 class ForecastYear(ApiModel):
@@ -592,10 +596,6 @@ class ChatMessage(ApiModel):
     related_run_id: str | None = None
 
 
-class ChatInput(ApiModel):
-    content: str = Field(min_length=1, max_length=8000)
-
-
 class RunRecord(ApiModel):
     run_id: str
     status: RunStatus
@@ -611,11 +611,6 @@ class RunRecord(ApiModel):
     result: ValuationOutput | None = None
     error: dict[str, Any] | None = None
     review: dict[str, Any] | None = None
-
-
-class RunAccepted(ApiModel):
-    run_id: str
-    status: RunStatus
 
 
 class Capability(ApiModel):

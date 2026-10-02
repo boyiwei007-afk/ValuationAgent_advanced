@@ -28,20 +28,20 @@ def test_other_selected_equity_method_can_still_collect_its_own_inputs(tmp_path)
 
 
 def test_unsupported_scope_stops_tool_loop_with_saved_report(tmp_path):
-    model = ScriptedModel([("propose_facts", {"candidates": [{
-        "metric": "受限货币资金", "raw_value": "10", "unit": "万元", "period": "2025",
-        "scope": "consolidated", "block_id": "file_test:1", "quote": "受限货币资金 10 9",
-    }]})])
-    service, session, source = configured_service(tmp_path, model)
-    source["text"] += "\n受限货币资金 10 9"
-    service.store.save_research_blocks(session.session_id, "file_test", [source])
-    state = service.turn(session.session_id, ResearchTurn(content="开始自动化DCF估值"))
-    assert state["session"]["question"] is None
+    from valuationagent.application.agent_runtime import WorkspaceAgentRuntime
+    from observation_fixtures import fixture_observations, run_turn, extraction_steps
+    service, session, _ = configured_service(tmp_path)
+    runtime = WorkspaceAgentRuntime(service, session)
+    args = fixture_observations(runtime, [{"metric": "受限货币资金", "standard_metric": "restricted_cash",
+        "raw_value": "10", "unit": "万元", "semantic_role": "non_operating"}])
+    state, _ = run_turn(runtime, [*extraction_steps(args), ("check_preparation", {}),
+        ("finish_response", {"answer": "桥接需专项复核，不输出DCF数值。", "outcome": "insufficient_data"})])
+    assert "question" not in state["session"]
     assert state["session"]["last_issue"] is None
     assert state["result_document"]["status"] == "insufficient_data"
     assert "桥接需专项复核" in state["session"]["summary"]
-    assert state["session"]["facts"][0]["status"] == "proposed"
-
+    assert state["session"]["facts"][0]["status"] == "confirmed"
+    assert not service.store.list_runs()
 
 def test_unverified_or_older_risk_does_not_pretend_to_be_confirmed_current_exposure(tmp_path):
     service, session, _ = configured_service(tmp_path)

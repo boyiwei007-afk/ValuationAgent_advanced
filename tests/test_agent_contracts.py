@@ -1,49 +1,17 @@
 from datetime import date
+import json
 from unittest.mock import patch
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
-from valuationagent.schemas.agent import (
-    ArtifactManifest,
-    ContextSnapshot,
-    EvidenceItem,
-    IntentResult,
-    PolicyImpactCard,
-    SearchQuery,
-)
-from valuationagent.llm.intent import interpret_intent
+from valuationagent.schemas.agent import SearchQuery
 from valuationagent.search.providers import MockSearchProvider, UnavailableSearchProvider
-from valuationagent.llm.client import OpenAICompatibleClient
+from valuationagent.llm.client import ContextWindowError, OpenAICompatibleClient
+from valuationagent.llm.agent import model_tool_result, run_tool_loop
+from valuationagent.core.tools import NoArguments, ToolRegistry, ToolSpec
 from valuationagent.schemas.models import ModelConnectionInput
-
-
-def test_agent_contracts_keep_intent_and_evidence_structured():
-    intent = IntentResult(
-        intent="new_valuation",
-        confidence=0.92,
-        slots={"ticker": "600519", "methods": ["dcf", "pe"]},
-        requires_confirmation=True,
-    )
-    context = ContextSnapshot(
-        session_id="research_demo",
-        revision=2,
-        summary="待确认公司的研究范围",
-        task_state={"company": "贵州茅台"},
-        confirmed_fact_ids=["fact_1"],
-    )
-    evidence = EvidenceItem(
-        evidence_id="evidence_1",
-        source_type="document",
-        source="annual-report.pdf",
-        quote="营业收入 100 亿元",
-        locator={"page": 42},
-        status="proposed",
-    )
-    assert intent.slots["ticker"] == "600519"
-    assert context.revision == 2
-    assert evidence.locator["page"] == 42
 
 
 def test_search_query_normalizes_domains_and_mock_never_calls_network():
@@ -83,13 +51,8 @@ def test_search_query_normalizes_domains_and_mock_never_calls_network():
 def test_search_unavailable_is_explicit_and_policy_needs_finance_review():
     query = SearchQuery(query="600519 年报", information_cutoff=date(2026, 9, 19))
     result = UnavailableSearchProvider().search(query)
-    card = PolicyImpactCard(impact_id="policy_1", topic="监管政策", source_ids=["evidence_1"])
-    artifact = ArtifactManifest(artifact_id="artifact_1", format="html", name="research.html", revision=1)
     assert result.status == "not_configured"
     assert result.hits == []
-    assert card.requires_finance_review is True
-    assert card.approved_mapping is False
-    assert artifact.status == "building"
 
 
 def test_search_query_rejects_empty_or_oversized_budget():
@@ -135,65 +98,112 @@ def test_openai_compatible_client_normalizes_object_tool_arguments():
         assert OpenAICompatibleClient(config).test_connection().startswith("OK")
 
 
-@pytest.mark.parametrize(
-    ("message", "expected"),
-    [
-        ("我想研究 600519，先整理年报", "new_valuation"),
-        ("请立即开始正式估值", "run_valuation"),
-        ("/valuation", "run_valuation"),
-        ("Run the formal valuation", "run_valuation"),
-        ("请解释 WACC 和敏感性分析", "ask_explanation"),
-        ("把 WACC 改为 8%", "revise_assumption"),
-        ("分析这份监管政策", "policy_analysis"),
-        ("/export html", "request_export"),
-    ],
-)
-def test_intent_baseline_is_explicit_and_context_aware(message, expected):
-    result = interpret_intent(message, {"company": "贵州茅台", "revision": 3})
-    assert result.intent == expected
-    assert result.slots["company"] == "贵州茅台"
+def test_tool_loop_recovers_from_two_truncated_json_calls_with_smaller_retry():
+    class TruncatedThenValid:
+        def __init__(self):
+            self.calls = 0
 
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            arguments = "{" if self.calls < 3 else "{}"
+            return {"tool_calls": [{
+                "id": f"call_{self.calls}",
+                "type": "function",
+                "function": {"name": "finish", "arguments": arguments},
+            }]}
 
-def test_intent_extracts_company_name_immediately_after_a_share_code():
-    result = interpret_intent("我想研究 600276 恒瑞医药的历史财务数据并估值（申万行业：医药生物—化学制药）")
-    assert result.slots["ticker"] == "600276"
-    assert result.slots["company"] == "恒瑞医药"
-    assert result.slots["industry"] == "医药生物—化学制药"
-
-    compact = interpret_intent("研究600276恒瑞医药（行业：医药生物）")
-    assert compact.slots["company"] == "恒瑞医药"
-    assert "company" not in interpret_intent("研究 600276 历史数据").slots
-
-    parenthesized = interpret_intent("请对贵州茅台（600519.SH）开展估值")
-    assert parenthesized.slots["ticker"] == "600519.SH"
-    assert parenthesized.slots["company"] == "贵州茅台"
-
-
-def test_intent_extracts_explicit_valuation_date_and_methods():
-    result = interpret_intent(
-        "研究 600276 恒瑞医药，估值日：2025-12-31，方法：DCF、PE"
+    model = TruncatedThenValid()
+    registry = ToolRegistry([
+        ToolSpec("finish", "finish", NoArguments, lambda _: {"_terminal": True, "answer": "ok"}),
+    ])
+    result = run_tool_loop(
+        model,
+        [{"role": "system", "content": "test"}],
+        registry,
+        lambda _name, _arguments, invoke: invoke(),
+        max_rounds=4,
     )
-
-    assert result.slots["valuation_date"] == "2025-12-31"
-    assert result.slots["methods"] == ["dcf", "pe"]
-
-    trailing = interpret_intent("对贵州茅台（600519.SH）只使用 DCF 和 PE 方法")
-    assert trailing.slots["methods"] == ["dcf", "pe"]
+    assert result["answer"] == "ok"
+    assert result["_agent_trace"]["tool_errors"] == 2
+    assert model.calls == 3
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        "为什么不能执行正式估值？",
-        "暂不开始估值，先核对数据",
-        "系统提示中提到了 /valuation 命令，这是怎么回事？",
-    ],
-)
-def test_valuation_mentions_are_not_mistaken_for_submission(message):
-    assert interpret_intent(message).intent != "run_valuation"
+def test_tool_batch_executes_in_order_with_all_results_returned_before_next_model_call():
+    visited = []
+    class Model:
+        calls = 0
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                outputs = [json.loads(message["content"]) for message in messages if message["role"] == "tool"]
+                assert [output["position"] for output in outputs] == [1, 2]
+                assert visited == [1, 2]
+            names = ["step", "step"] if self.calls == 1 else ["finish"]
+            return {"tool_calls": [{"id": f"call_{self.calls}_{index}", "function": {"name": name, "arguments": "{}"}}
+                                   for index, name in enumerate(names)]}
+    def step(_):
+        visited.append(len(visited) + 1)
+        return {"position": len(visited)}
+    registry = ToolRegistry([ToolSpec("step", "step", NoArguments, step),
+                             ToolSpec("finish", "finish", NoArguments, lambda _: {"_terminal": True})])
+    result = run_tool_loop(Model(), [{"role": "system", "content": "test"}], registry,
+                           lambda name, args, invoke: invoke(), max_rounds=3)
+    assert result["_agent_trace"]["protocol_errors"] == 0
+    assert result["_agent_trace"]["tools"] == ["step", "step", "finish"]
 
 
-def test_tushare_opt_out_overrides_previous_valuation_intent():
-    result = interpret_intent("不使用 Tushare")
-    assert result.intent == "provide_material"
-    assert result.slots["data_source"] == "not_tushare"
+def test_tool_batch_validates_all_identifiers_before_any_side_effect():
+    from valuationagent.llm.client import LlmError
+    class Model:
+        def chat(self, *args, **kwargs):
+            return {"tool_calls": [{"id": "duplicate", "function": {"name": "step", "arguments": "{}"}}] * 2}
+    visited = []
+    registry = ToolRegistry([ToolSpec("step", "step", NoArguments, lambda _: visited.append(True))])
+    with pytest.raises(LlmError, match="唯一id"):
+        run_tool_loop(Model(), [], registry, lambda name, args, invoke: invoke())
+    assert not visited
+
+
+def test_prompt_projection_retains_numbered_lines_and_does_not_mutate_audit():
+    original = {"blocks": [{"block_id": "file:1", "text": "first\nsecond\n", "location": {"page": 2},
+                            "lines": [{"line": 1, "text": "first"}, {"line": 2, "text": "second"}]}]}
+    projected = model_tool_result(original)
+    assert "text" not in projected["blocks"][0]
+    assert projected["blocks"][0]["lines"] == original["blocks"][0]["lines"]
+    assert original["blocks"][0]["text"] == "first\nsecond\n"
+    assert model_tool_result({"text": "different", "lines": []})["text"] == "different"
+
+
+def test_context_recovery_never_reexecutes_tools_or_removes_system_scope():
+    visited = []
+    class Model:
+        calls = 0
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            assert messages[0]["content"] == "authoritative scope"
+            if self.calls == 2:
+                raise ContextWindowError("LLM_CONTEXT_LIMIT")
+            if self.calls == 3:
+                assert "context_omitted" in messages[-1]["content"]
+                assert visited == [True]
+            name = "read" if self.calls == 1 else "finish"
+            return {"tool_calls": [{"id": str(self.calls), "function": {"name": name, "arguments": "{}"}}]}
+    def read(_):
+        visited.append(True)
+        return {"text": "large source " * 1000}
+    registry = ToolRegistry([ToolSpec("read", "read", NoArguments, read), ToolSpec("finish", "finish", NoArguments, lambda _: {"_terminal": True})])
+    result = run_tool_loop(Model(), [{"role": "system", "content": "authoritative scope"}], registry,
+                           lambda name, args, invoke: invoke(), max_rounds=3, max_context_chars=20000)
+    assert result["_agent_trace"]["context_recoveries"] == 1
+    assert visited == [True]
+
+
+def test_context_error_is_classified_without_echoing_vendor_content(monkeypatch):
+    original = httpx.Client
+    def handler(request):
+        return httpx.Response(400, json={"message": "The input (35010 tokens) is longer than the model's context length (32768 tokens). private-content"})
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    model = OpenAICompatibleClient(ModelConnectionInput(model="test", api_key="fixture"))
+    with pytest.raises(ContextWindowError) as error:
+        model.chat([])
+    assert "private-content" not in str(error.value)

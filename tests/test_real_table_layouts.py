@@ -151,6 +151,29 @@ def test_new_single_relative_column_does_not_inherit_previous_two_column_table()
     assert checks["year_column"] == 2024
 
 
+def test_real_haitian_wrapped_capex_uses_numeric_physical_line_geometry():
+    text = """佛山市海天调味食品股份有限公司2024年年度报告
+合并现金流量表
+2024年 1—12 月
+单位：元  币种：人民币
+项目                 附注          2024年度          2023年度
+  收回投资收到的现金                    七、78（2）     14,004,050,000.00 14,293,300,000.00
+  收到其他与投资活动有关的现金               七、78（2）        637,840,088.17    396,450,220.76
+  购建固定资产、无形资产和其他               七、78（2）      1,575,700,218.89  1,924,147,446.25
+长期资产支付的现金"""
+    warnings, checks = _bind(
+        text,
+        "购建固定资产、无形资产和其他长期资产支付的现金",
+        "1,575,700,218.89",
+        company="佛山市海天调味食品股份有限公司",
+        unit="元",
+    )
+    assert not warnings, warnings
+    assert checks["year_column"] == 2024
+    assert checks["column_alignment"] == "same_block_right_edges"
+    assert checks["note_column_excluded"] is True
+
+
 def test_numbered_new_statement_does_not_inherit_previous_statement_units():
     text = """美的集团股份有限公司
 母公司资产负债表

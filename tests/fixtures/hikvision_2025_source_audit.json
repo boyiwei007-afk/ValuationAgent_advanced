@@ -1,0 +1,11 @@
+{
+  "case_id": "hikvision-2025-official-pages-9-132",
+  "source_sha256": "a805779efb81bea8158e119ad7c733c4669b8d492dc03c7613199970bfa4b8b2",
+  "source_url": "https://static.cninfo.com.cn/finalpage/2026-04-18/1225123062.PDF",
+  "review_basis": "Coding assistant separately rendered and inspected physical pages 9 and 132; not supplied to the extracting model. Page 9 explicitly labels annual columns and yuan amounts. Page 132 describes cancellation completed on 2025-09-04, not a 2025-12-31 share-count statement. This checks only these anchors, not whether the same total is disclosed for year end elsewhere.",
+  "checks": [
+    {"pages": [9], "metric": "revenue", "scope": "consolidated", "role": "historical", "unit": "元", "currency": "CNY", "expected": {"2025": "92507796069.94", "2024": "92495525118.30"}},
+    {"pages": [9], "metric": "net_income_parent", "scope": "consolidated", "role": "historical", "unit": "元", "currency": "CNY", "expected": {"2025": "14195371894.42", "2024": "11977327023.54"}},
+    {"pages": [132], "metric": "common_shares", "scope": "issuer", "role": "historical", "unit": "股", "currency": "CNY", "expected": {"2025-09-04": "9164871550"}}
+  ]
+}

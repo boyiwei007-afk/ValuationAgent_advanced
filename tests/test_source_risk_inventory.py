@@ -42,6 +42,7 @@ def reviewed(*, metric="少数股东权益", value="1000", period="2024年度", 
     ("吸收存款及同业存放 0.00 900.00", "financial_institution_deposits"),
     ("拆出资金 10,000 9,000", "interbank_lending"),
     ("不能随时支取的同业存款 100.00", "restricted_interbank_deposits"),
+    ("交易性金融资产 七、2 7,617,576,114.87 5,841,004,849.56", "trading_financial_assets"),
     ("其中：少 数 股 东 权 益 100.00", "minority_interest"),
     ("（一）少数股东权益（元） -100.00 90.00", "minority_interest"),
 ])
@@ -110,6 +111,22 @@ def test_confirmed_verified_same_source_nonzero_is_handed_to_financial_gate():
     result = source_risk_inventory(session, blocks, BASELINE)
     assert not result["unresolved"] and result["matches"][0]["fact_ids"] == ["fact_risk"]
     assert "非零风险仍受估值桥接门禁" in result["matches"][0]["message"]
+
+
+def test_identical_official_file_copy_reuses_verified_fact_by_content_hash():
+    session, _ = fixture()
+    session.documents.append(DocumentSummary(
+        file_id="file_b", name="official-copy.pdf", role="evidence",
+        block_count=1, sha256=HASH,
+    ))
+    copied = [{
+        "file_id": "file_b", "block_id": "file_b:1",
+        "text": "少数股东权益   1,000.00  900.00", "location": {"page": 6},
+    }]
+    session.facts = [reviewed()]
+    result = source_risk_inventory(session, copied, BASELINE)
+    assert not result["unresolved"]
+    assert result["matches"][0]["fact_ids"] == ["fact_risk"]
 
 
 @pytest.mark.parametrize("period", ["2024-12-31", "2024年12月31日", "2024年1-12月", "2024-01-01至2024-12-31"])

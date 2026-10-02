@@ -20,12 +20,3 @@ export const MODEL_PRESETS = [
     base_url: 'https://api.openai.com/v1',
   },
 ]
-
-export const COMPANY_PRESETS = [
-  { value: '600519 贵州茅台', label: '600519 · 贵州茅台' },
-  { value: '000858 五粮液', label: '000858 · 五粮液' },
-  { value: '300750 宁德时代', label: '300750 · 宁德时代' },
-  { value: '000333 美的集团', label: '000333 · 美的集团' },
-  { value: '600276 恒瑞医药', label: '600276 · 恒瑞医药' },
-  { value: '603893 瑞芯微', label: '603893 · 瑞芯微' },
-]

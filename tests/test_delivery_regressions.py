@@ -1,7 +1,6 @@
 """Regressions from the acceptance audit: bad evidence, recovery and scale."""
 import copy
 import json
-import threading
 from datetime import date
 from decimal import Decimal as D
 from io import BytesIO
@@ -13,6 +12,7 @@ from openpyxl import Workbook, load_workbook
 from pypdf import PdfReader
 from openpyxl.worksheet._read_only import ReadOnlyWorksheet
 
+from valuationagent.application.agent_runtime import WorkspaceAgentRuntime
 from valuationagent.api.main import create_app
 from valuationagent.application.research import CandidateInput, ProposeFacts, ResearchService
 from valuationagent.application.research_valuation import ResearchValuationAssembler
@@ -22,7 +22,7 @@ from valuationagent.application.reporting import ValuationReportExporter
 from valuationagent.core.documents import parse_document
 from valuationagent.core.evidence import bind_evidence
 from valuationagent.finance.team_model import FinanceTeamModel
-from valuationagent.llm.client import LlmError, OpenAICompatibleClient
+from valuationagent.llm.client import OpenAICompatibleClient
 from valuationagent.schemas.models import FinancialSnapshot, ModelConnectionInput, PeerCompany, ValuationRequest
 from valuationagent.schemas.research import DocumentSummary, FactCandidate, ResearchDraft, ResearchSession, ResearchTurn
 from valuationagent.storage.sqlite import SQLiteRunStore
@@ -67,7 +67,7 @@ def test_evidence_accepts_correct_table_and_preserves_source_metadata(tmp_path):
     block.update(file_id=meta["file_id"], block_id=meta["file_id"] + ":1")
     store.save_research_blocks(session.session_id, meta["file_id"], [block])
     session.documents.append(DocumentSummary(file_id=meta["file_id"], name="财务.txt", role="historical_financials", block_count=1, sha256=meta["sha256"]))
-    service._facts(session, ProposeFacts(candidates=[candidate(block_id=block["block_id"])]))
+    WorkspaceAgentRuntime(service, session).facts(ProposeFacts(candidates=[candidate(block_id=block["block_id"])]))
     fact = session.facts[0]
     assert not fact.warnings
     assert fact.verification["year_column"] == 2025
@@ -130,7 +130,7 @@ def test_cancel_queued_turn_preserves_recoverable_session(tmp_path):
     result = service.turn(sid, turn, reserved=True)
     assert result["execution"]["status"] == "cancelled"
     assert result["session"]["last_issue"]["code"] == "EXECUTION_CANCELLED"
-    assert result["session"]["question"]["kind"] == "recovery"
+    assert "question" not in result["session"]
 
 
 def test_server_restart_marks_expired_job_interrupted(tmp_path):
@@ -196,7 +196,7 @@ def test_research_pe_snapshot_does_not_require_four_years_or_fcff_fields():
     for i in range(3):
         session.facts.append(FactCandidate(fact_id=f"peer_{i}", metric="pe", raw_value="10", normalized_value="10", unit="ratio",
             period="2026-06-30", scope="consolidated", status="confirmed", role="comparable", peer_name=f"同业{i}", peer_ticker=f"P{i}",
-            multiple_basis="FY", block_id="file:1", quote="市盈率10倍"))
+            multiple_basis="FY", denominator_period_end=date(2025, 12, 31), block_id="file:1", quote="FY2025市盈率10倍"))
     request = assembler.build(session)
     assert request.financials.revenue is None and not request.historical_financials
 
@@ -245,17 +245,21 @@ def test_dcf_bundle_replays_without_network_and_matches_independent_present_valu
 
 
 def test_api_turn_survives_reload_and_duplicate_request_does_not_add_messages(tmp_path):
+    from test_unified_workspace_agent import ScriptedModel
     app = create_app(tmp_path)
+    workspace = app.state.workspaces.create(llm=ScriptedModel(("finish_response", {"answer": "已说明估值方法。"})))
+    url = f"/api/workspaces/{workspace.workspace_id}"
     with TestClient(app) as client:
-        sid = client.post('/api/research-sessions', json={}).json()['session']['session_id']
         body = {"request_id": "request_api_once", "content": "说明估值方法"}
-        assert client.post(f'/api/research-sessions/{sid}/turns', json=body).status_code == 202
-        first = client.get(f'/api/research-sessions/{sid}?compact=true').json()
-        assert first['execution']['status'] == 'completed'
-        assert client.post(f'/api/research-sessions/{sid}/turns', json=body).status_code == 202
-        second = client.get(f'/api/research-sessions/{sid}?compact=true').json()
-        assert first['messages'] == second['messages']
-        assert client.get(f'/api/research-sessions/{sid}').headers['cache-control'] == 'no-store'
+        assert client.post(url + "/messages", json=body).status_code == 202
+        first = client.get(url).json()
+        assert first["execution"]["status"] == "completed"
+        assert client.post(url + "/messages", json=body).status_code == 202
+        second = client.get(url).json()
+        assert first["messages"] == second["messages"]
+        assert client.get(url).headers["cache-control"] == "no-store"
+    fresh = create_app(tmp_path).state.workspaces.snapshot(workspace.workspace_id)
+    assert fresh["messages"] == first["messages"]
 
 
 def test_comparable_alias_normalization_is_explicit():
@@ -326,19 +330,21 @@ def test_xlsx_formal_recalc_excludes_operating_cash_and_treats_names_as_text(tmp
     assert book['估值摘要']['B2'].data_type == 's'
 
 
-def test_cancellation_and_resume_preserve_pending_fact_confirmation(tmp_path):
+def test_cancellation_and_resume_preserve_unverified_facts(tmp_path):
+    from test_unified_workspace_agent import ScriptedModel
     service = ResearchService(SQLiteRunStore(tmp_path))
     session = service.create()
-    fact = FactCandidate(fact_id='fact_pending', metric='revenue', raw_value='100', normalized_value='100', unit='元', period='2025', scope='consolidated', block_id='file:1', quote='营业收入100元')
+    fact = FactCandidate(fact_id="fact_pending", metric="revenue", raw_value="100", unit="元",
+                         period="2025", scope="consolidated", block_id="file:1", quote="营业收入100元")
     session.facts.append(fact)
-    service._question(session, 'facts', '确认字段', [('accept', '确认'), ('defer', '稍后')], fact_ids=[fact.fact_id])
     service.store.save_research(session)
-    turn = ResearchTurn(content='说明资料情况', request_id='cancel_pending_review')
+    turn = ResearchTurn(content="说明资料情况", request_id="cancel_pending_review")
     service.reserve_turn(session.session_id, turn)
     service.cancel_turn(session.session_id)
     stopped = service.turn(session.session_id, turn, reserved=True)
-    assert stopped['session']['question']['kind'] == 'recovery'
-    resumed = service.turn(session.session_id, ResearchTurn(question_id=stopped['session']['question']['question_id'], option_id='retry'))
-    question = resumed['session']['question']
-    assert question['kind'] == 'facts' and question['fact_ids'] == ['fact_pending']
-    assert any(choice['id'] == 'accept' for choice in question['options'])
+    assert stopped["execution"]["status"] == "cancelled"
+    service.attach(session.session_id, ScriptedModel(("finish_response", {"answer": "继续核对原文。"})))
+    resumed = service.turn(session.session_id, ResearchTurn(content="继续"))
+    assert resumed["session"]["facts"][0]["status"] == "proposed"
+    assert resumed["session"]["facts"][0]["fact_id"] == fact.fact_id
+    assert not service.store.list_runs()

@@ -39,13 +39,10 @@ def build_valuation_bundle(store, record):
                      data_source="structured", file_ids=[], assumption_file_ids=[])
     references = list(record.request.file_ids + record.request.assumption_file_ids)
     research = None
-    if store:
-        # Source linkage is explicit, not limited to the recent-history UI page.
-        with store._connect() as db:
-            row = db.execute("SELECT session_json FROM research_sessions WHERE json_extract(session_json,'$.valuation_run_id')=?", (record.run_id,)).fetchone()
-        if row:
-            research = json.loads(row[0])
-            references += [d["file_id"] for d in research["documents"]]
+    frozen_sources = store.run_sources(record.run_id) if store else None
+    if frozen_sources:
+        research = frozen_sources["research"]
+        references += [document["file_id"] for document in research["documents"]]
     manifest, blocks = [], {}
     for file_id in dict.fromkeys(references):
         if file_id.startswith("web_"):
@@ -57,14 +54,22 @@ def build_valuation_bundle(store, record):
             manifest.append({k: meta[k] for k in ("file_id", "original_name", "role", "size_bytes", "sha256")})
         if research:
             if any(d["file_id"] == file_id for d in research["documents"]):
-                blocks[file_id] = store.research_blocks(research["session_id"], file_id)
+                blocks[file_id] = frozen_sources["source_blocks"][file_id]
     package = {"schema_version": "valuation-review-v1", "run": record.model_dump(mode="json"),
                "effective_request": effective, "artifacts": artifacts, "events": events,
                "research": research, "source_manifest": manifest, "source_blocks": blocks,
-               "research_events": [e.model_dump(mode="json") for e in store.list_events(research["session_id"])] if research else [],
+               "research_events": frozen_sources["research_events"] if frozen_sources else [],
                "model_files": model_files(),
                "dependencies": {name: version(name) for name in ("pydantic", "langgraph", "httpx")},
                "replay_scope": "复算已锁定输入的财务预测、DCF、相对估值与敏感性；不重放随机模型回复或实时搜索。"}
+    if store:
+        from valuationagent.application.workspace_reporting import (
+            build_workspace_report_context,
+        )
+
+        workspace_audit = build_workspace_report_context(store, record.run_id)
+        if workspace_audit:
+            package["workspace_audit"] = workspace_audit
     package["package_sha256"] = digest(package)
     return package
 

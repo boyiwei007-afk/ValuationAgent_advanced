@@ -59,7 +59,7 @@ def add_peers(session):
             fact_id=f"synthetic_peer_{index}", metric="pe", raw_value=value,
             normalized_value=value, unit="ratio", period="2025-06-30", scope="unknown",
             role="comparable", peer_ticker=f"TEST{index}", peer_name=f"合成同业{index}",
-            multiple_basis="FY", block_id="peers:1", quote=f"合成 FY 倍数 {value}", status="confirmed",
+            multiple_basis="FY", denominator_period_end=date(2024, 12, 31), block_id="peers:1", quote=f"合成 FY2024 倍数 {value}", status="confirmed",
         ))
 
 

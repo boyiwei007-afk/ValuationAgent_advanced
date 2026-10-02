@@ -47,13 +47,26 @@ class _ReadableHtmlParser(HTMLParser):
         self._skip_depth = 0
         self._current: list[str] = []
         self.blocks: list[str] = []
+        self.locations: list[dict] = []
+        self._table = 0
+        self._table_count = 0
+        self._row = 0
+        self._cells = []
+        self._in_cell = False
+        self._spans = False
+        self._nested_depth = 0
 
     def _flush(self):
-        text = re.sub(r"[ \t\r\f\v]+", " ", "".join(self._current))
+        text = " | ".join(self._cells) if self._cells else "".join(self._current)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
         text = re.sub(r"\n\s*\n+", "\n", text).strip(" |\n")
         if text:
             self.blocks.append(text)
+            self.locations.append({"table": self._table, "row": self._row,
+                                   "cells": list(self._cells), "merged_cells": self._spans} if self._table else {})
         self._current = []
+        self._cells = []
+        self._in_cell = False
 
     def handle_starttag(self, tag, attrs):
         tag = tag.casefold()
@@ -61,6 +74,35 @@ class _ReadableHtmlParser(HTMLParser):
             self._skip_depth += 1
             return
         if self._skip_depth:
+            return
+        if self._nested_depth:
+            if tag == "table":
+                self._nested_depth += 1
+            return
+        if tag == "table":
+            if self._table:
+                self._spans = True
+                self._nested_depth = 1
+                return
+            self._flush()
+            self._table_count += 1
+            self._table = self._table_count
+            self._row = 0
+            self._spans = False
+            return
+        if tag == "tr":
+            self._flush()
+            self._row += 1
+            return
+        if tag in {"td", "th"}:
+            attributes = dict(attrs)
+            self._spans = self._spans or any(attributes.get(key, "1") != "1" for key in ("rowspan", "colspan"))
+            self._cells.append("")
+            self._in_cell = True
+            return
+        if self._in_cell:
+            if tag == "br":
+                self._cells[-1] += " "
             return
         if tag in self._BREAK:
             self._flush()
@@ -74,12 +116,32 @@ class _ReadableHtmlParser(HTMLParser):
         if tag in self._SKIP:
             self._skip_depth = max(0, self._skip_depth - 1)
             return
+        if self._nested_depth:
+            if tag == "table":
+                self._nested_depth -= 1
+            return
+        if not self._skip_depth and tag in {"td", "th"}:
+            self._in_cell = False
+            return
+        if not self._skip_depth and tag == "table":
+            self._flush()
+            if self._spans:
+                for location in self.locations:
+                    if location.get("table") == self._table:
+                        location["merged_cells"] = True
+            self._table = 0
+            return
+        if self._in_cell:
+            return
         if not self._skip_depth and tag in self._BREAK:
             self._flush()
 
     def handle_data(self, data):
-        if not self._skip_depth:
-            self._current.append(data)
+        if not self._skip_depth and not self._nested_depth:
+            if self._in_cell:
+                self._cells[-1] += data
+            else:
+                self._current.append(data)
 
     def close(self):
         super().close()
@@ -127,15 +189,13 @@ def parse_document(meta: dict, *, check_cancel=None, pdf_start_page=1, pdf_page_
             raise ValueError("PDF 已加密，请提供可读取的版本。")
         end_page = min(len(reader.pages), pdf_start_page + pdf_page_limit - 1)
         if end_page < len(reader.pages):
-            warnings.append(f"本次读取第{pdf_start_page}至{end_page}页（全文{len(reader.pages)}页）；可用read_document的start_page继续读取。")
+            warnings.append(f"本次读取第{pdf_start_page}至{end_page}页（全文{len(reader.pages)}页）；可用search_file全文定位后read_file按真实页码精读，当前缓存不代表全文。")
         for page_no in range(max(1, pdf_start_page), end_page + 1):
             if check_cancel:
                 check_cancel()
             page = reader.pages[page_no - 1]
             try:
-                # Layout mode retains report columns and table spacing much
-                # better than the legacy plain-text order in modern pypdf.
-                text = page.extract_text(extraction_mode="layout") or ""
+                text = (page.extract_text(extraction_mode="layout") or "") if "/Contents" in page else ""
             except (TypeError, ValueError, NotImplementedError):
                 text = page.extract_text() or ""
             if not text.strip():
@@ -177,7 +237,7 @@ def parse_document(meta: dict, *, check_cancel=None, pdf_start_page=1, pdf_page_
                     ]
                     if any(values) and not add(
                         " | ".join(values),
-                        {"table": table_no, "row": row_no},
+                        {"table": table_no, "row": row_no, "cells": values},
                     ):
                         break
                 if total >= MAX_CHARS or len(blocks) >= MAX_BLOCKS:
@@ -247,8 +307,8 @@ def parse_document(meta: dict, *, check_cancel=None, pdf_start_page=1, pdf_page_
         parser = _ReadableHtmlParser()
         parser.feed(text)
         parser.close()
-        for section, paragraph in enumerate(parser.blocks, 1):
-            if not add(paragraph, {"html_section": section}):
+        for section, (paragraph, location) in enumerate(zip(parser.blocks, parser.locations), 1):
+            if not add(paragraph, {"html_section": section, **location}):
                 break
         if not blocks:
             warnings.append("网页原文没有可读取的正文，可能依赖脚本渲染或访问权限。")
@@ -270,7 +330,7 @@ def parse_document(meta: dict, *, check_cancel=None, pdf_start_page=1, pdf_page_
             except csv.Error:
                 dialect = csv.excel_tab if suffix == ".tsv" else csv.excel
             for row_no, row in enumerate(csv.reader(io.StringIO(text), dialect), 1):
-                if not add(" | ".join(row), {"row": row_no}):
+                if not add(" | ".join(row), {"table": 1, "row": row_no, "cells": row}):
                     break
         else:
             for line, paragraph in enumerate(re.split(r"\n\s*\n", text), 1):

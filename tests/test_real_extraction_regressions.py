@@ -140,6 +140,102 @@ def test_explicit_issuer_shares_need_no_consolidated_statement_title(quote, peri
     assert checks["issuer"] == "600001"
 
 
+def test_hkex_final_allotment_binds_listing_date_total_without_deriving_tranches():
+    quote = (
+        "佛山市海天调味食品股份有限公司\n"
+        "开始买卖日 2025年6月19日\n"
+        "发售股份及股本\n"
+        "于上市时已发行的股份数目（于超额配股权获行使前） 5,839,632,244"
+    )
+    block = {
+        "block_id": "hkex:3",
+        "file_id": "hkex",
+        "location": {
+            "page": 3,
+            "published_at": "2025-06-18",
+            "url": "https://www.hkexnews.hk/listedco/listconews/sehk/2025/0618/final.pdf",
+        },
+        "text": quote,
+    }
+    candidate = CandidateInput(
+        metric="于上市时已发行的股份数目（于超额配股权获行使前）",
+        standard_metric="common_shares",
+        raw_value="5,839,632,244",
+        unit="股",
+        period="2025-06-19",
+        scope="issuer",
+        block_id=block["block_id"],
+        quote=quote,
+    )
+    draft = ResearchDraft(
+        company="佛山市海天调味食品股份有限公司",
+        ticker="603288.SH",
+        valuation_date=date(2025, 6, 30),
+    )
+
+    warnings, checks = bind_evidence(
+        candidate,
+        block,
+        [block],
+        draft,
+        ("common_shares", "普通股股数", "股份总数"),
+        identity_text=quote,
+    )
+
+    assert not warnings
+    assert checks["binding"] == "issuer_listing_issued_shares"
+    assert checks["period_end"] == "2025-06-19"
+    assert checks["publication_date"] == "2025-06-18"
+    assert checks["official_exchange"] == "HKEX"
+    assert checks["scope"] == "issuer"
+
+
+@pytest.mark.parametrize("change", ["host", "period", "published"])
+def test_hkex_listing_total_does_not_relax_host_date_or_cutoff(change):
+    quote = (
+        "佛山市海天调味食品股份有限公司\n"
+        "开始买卖日 2025年6月19日\n"
+        "发售股份及股本\n"
+        "于上市时已发行的股份数目（于超额配股权获行使前） 5,839,632,244"
+    )
+    location = {
+        "published_at": "2025-06-18",
+        "url": "https://www1.hkexnews.hk/listedco/listconews/sehk/final.pdf",
+    }
+    period = "2025-06-19"
+    if change == "host":
+        location["url"] = "https://example.com/final.pdf"
+    elif change == "period":
+        period = "2025-06-18"
+    else:
+        location["published_at"] = "2025-07-01"
+    block = {"block_id": "hkex:3", "file_id": "hkex", "location": location, "text": quote}
+    candidate = CandidateInput(
+        metric="于上市时已发行的股份数目（于超额配股权获行使前）",
+        standard_metric="common_shares",
+        raw_value="5,839,632,244",
+        unit="股",
+        period=period,
+        scope="issuer",
+        block_id=block["block_id"],
+        quote=quote,
+    )
+    warnings, checks = bind_evidence(
+        candidate,
+        block,
+        [block],
+        ResearchDraft(
+            company="佛山市海天调味食品股份有限公司",
+            ticker="603288.SH",
+            valuation_date=date(2025, 6, 30),
+        ),
+        ("common_shares",),
+        identity_text=quote,
+    )
+    assert warnings
+    assert "scope" not in checks
+
+
 @pytest.mark.parametrize("quote,changes", [
     ("截至2023年12月31日，公司总股本为125,619.78万股。", {}),
     ("截至2024年6月30日，公司总股本为125,619.78万股。", {"period": "2024"}),

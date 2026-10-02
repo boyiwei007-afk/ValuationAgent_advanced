@@ -449,16 +449,17 @@ def test_research_handoff_creates_a_new_run_after_confirmed_inputs_change(tmp_pa
 
 def test_web_data_services_are_session_scoped_and_secrets_are_not_persisted(tmp_path):
     app = create_app(tmp_path / "data-services")
-    session = app.state.research.create()
+    workspace = app.state.workspaces.create()
+    session = app.state.store.get_research(workspace.research_session_id)
     tavily_key = "tvly-SESSION_ONLY_TEST_KEY"
     tushare_token = "TUSHARE_SESSION_ONLY_TEST_TOKEN"
     with TestClient(app) as client:
-        before = client.get(f"/api/research-sessions/{session.session_id}/data-services")
+        before = client.get(f"/api/workspaces/{workspace.workspace_id}/data-services")
         connected = client.post(
-            f"/api/research-sessions/{session.session_id}/data-services",
+            f"/api/workspaces/{workspace.workspace_id}/data-services",
             json={"tavily_api_key": tavily_key, "tushare_token": tushare_token},
         )
-        after = client.get(f"/api/research-sessions/{session.session_id}/data-services")
+        after = client.get(f"/api/workspaces/{workspace.workspace_id}/data-services")
     assert before.status_code == 200
     assert before.json()["search"]["available"] is False
     assert before.json()["market"]["available"] is False
@@ -600,7 +601,7 @@ def test_api_exposes_research_handoff_and_formal_exports(tmp_path):
     app.state.store.save_research(research_session)
     with TestClient(app) as client:
         handoff = client.post(f"/api/research-sessions/{research_session.session_id}/valuation")
-        assert handoff.status_code == 202
+        assert handoff.status_code in {404, 405}
         xlsx = client.get(f"/api/runs/{record.run_id}/export?format=xlsx")
         pdf = client.get(f"/api/runs/{record.run_id}/export?format=pdf")
     assert xlsx.status_code == 200 and xlsx.content.startswith(b"PK")

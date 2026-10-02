@@ -9,8 +9,6 @@ from unittest.mock import patch
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from rich.console import Console
-from typer.testing import CliRunner
 from valuationagent.api.main import create_app
 from valuationagent.application.runner import ValuationRunner
 from valuationagent.core.data import demo_financials, demo_peers
@@ -26,8 +24,6 @@ from valuationagent.schemas.models import (
     ValuationRequest,
 )
 from valuationagent.storage.sqlite import SQLiteRunStore
-from valuationagent.cli.main import app as cli_app
-from valuationagent.cli.ui import dashboard, result_view
 
 
 def request(**changes):
@@ -127,22 +123,6 @@ def test_json_file_roles_and_assumptions_are_used(runner):
     )
 
 
-def test_wacc_chat_creates_revision_and_reuses_unaffected_steps(runner):
-    old = runner.run(request())
-    message = runner.converse(old.run_id, "把 WACC 改为8%，重新估值，并保留旧版本")
-    new = runner.store.get_run(message.related_run_id)
-    assert new.revision == 2 and new.parent_run_id == old.run_id
-    assert new.result.assumptions.wacc == D(".08")
-    assert runner.store.get_run(old.run_id).result == old.result
-    calls = {(e.tool, e.type) for e in runner.store.list_events(new.run_id)}
-    assert ("forecast_financials", "tool.cached") in calls
-    assert ("calculate_relative_valuation", "tool.cached") in calls
-    assert ("calculate_dcf", "tool.started") in calls
-    assert new.result.dcf.per_share_value != old.result.dcf.per_share_value
-    assert new.result.run_id == new.run_id and new.result.revision == 2
-    assert len(runner.store.revisions(old.run_id)) == 2
-
-
 def test_review_replaces_invalid_assumption_and_preserves_old_pause(runner):
     old = runner.run(request(assumptions={"wacc": ".03", "terminal_growth": ".04"}))
     assert old.status == "waiting_review"
@@ -207,7 +187,7 @@ def test_resume_after_failure_uses_persistent_checkpoints(runner):
     fresh = ValuationRunner(
         SQLiteRunStore(runner.store.data_dir), ReferenceFinancialModel()
     )
-    done = fresh.resume(old.run_id)
+    done = fresh.execute(old.run_id)
     assert done.status == "completed"
     assert any(
         e.type == "tool.cached" and e.tool == "forecast_financials"
@@ -266,94 +246,32 @@ class ToolLLM:
         }
 
 
-def standard_actions():
-    return [
-        ("inspect_financials", {}),
-        ("inspect_comparables", {}),
-        ("continue_valuation", {}),
-    ]
-
-
-def test_real_tool_protocol_drives_plan_and_returns_results(runner):
-    llm = ToolLLM(standard_actions())
-    r = runner.run(request(mode="live"), llm)
-    assert r.status == "completed"
-    assert len(llm.calls) == 3
-    assert any(m["role"] == "tool" for m in llm.calls[1][0])
-    assert all(call[1]["tools"] for call in llm.calls)
-    assert "inspect_financials" in [e.tool for e in runner.store.list_events(r.run_id)]
-    assert r.result.mode == "live"
-
-
-def test_agent_can_pause_and_cannot_bypass_checks(runner):
-    llm = ToolLLM([("request_review", {"reason": "需要核对来源"})])
-    r = runner.run(request(mode="live"), llm)
-    assert r.status == "waiting_review" and r.review["code"] == "AGENT_REVIEW_REQUIRED"
-    assert not any(
-        e.tool == "calculate_dcf" for e in runner.store.list_events(r.run_id)
-    )
-    invalid = ToolLLM([("continue_valuation", {})] + standard_actions())
-    done = runner.run(
-        request(mode="live", assumptions={"wacc": ".03", "terminal_growth": ".04"}),
-        invalid,
-    )
-    assert (
-        done.status == "waiting_review" and done.review["code"] == "INVALID_ASSUMPTION"
-    )
-
-
-def test_untrusted_model_prose_never_becomes_formal_summary(runner):
-    class BadProse(ToolLLM):
-        def chat(self, *args, **kwargs):
-            reply = super().chat(*args, **kwargs)
-            reply["content"] = "DCF每股999999元，已获专家核准"
-            return reply
-
-    r = runner.run(request(mode="live"), BadProse(standard_actions()))
-    assert r.result is not None
-    assert "999999" not in r.result.executive_summary
-    assert "尚待金融团队核准" in r.result.executive_summary
-
-
-def test_chat_passes_history_to_model(runner):
-    llm = ToolLLM(
-        standard_actions() + [("explain_valuation", {"topic": "assumptions"})] * 2
-    )
-    r = runner.run(request(mode="live"), llm)
-    runner.converse(r.run_id, "FIRST_MARKER 本次假设是什么")
-    runner.converse(r.run_id, "上一问题中提到的假设")
-    assert any("FIRST_MARKER" in m.get("content", "") for m in llm.calls[-1][0])
-
-
 def test_unknown_tool_never_executes(runner):
-    llm = ToolLLM([("execute_python", {"code": "bad"})] + standard_actions())
-    r = runner.run(request(mode="live"), llm)
-    assert r.status == "completed"
-    assert any(
-        e.tool == "execute_python" and e.type == "tool.failed"
-        for e in runner.store.list_events(r.run_id)
-    )
+    from valuationagent.application.research import ResearchService
+    from valuationagent.schemas.research import ResearchTurn
+    llm = ToolLLM([("execute_python", {"code": "bad"}), ("finish_response", {"answer": "不执行任意代码。"})])
+    service = ResearchService(runner.store)
+    session = service.create(llm=llm)
+    result = service.turn(session.session_id, ResearchTurn(content="检查资料"))
+    assert result["execution"]["status"] == "completed"
+    assert any(event["tool"] == "execute_python" and event["type"] == "tool.failed" for event in result["events"])
+    assert not runner.store.list_runs()
 
 
 def test_provider_errors_are_redacted(runner):
+    from valuationagent.application.research import ResearchService
+    from valuationagent.schemas.research import ResearchTurn
     sentinel = "SYNTHETIC_FAKE_KEY_DO_NOT_USE"
-    config = ModelConnectionInput(
-        model="fake", base_url="https://fake.invalid/v1", api_key=sentinel
-    )
+    config = ModelConnectionInput(model="fake", base_url="https://fake.invalid/v1", api_key=sentinel)
     original = httpx.Client
-    transport = httpx.MockTransport(
-        lambda r: httpx.Response(401, json={"error": "invalid " + sentinel})
-    )
-    with patch(
-        "valuationagent.llm.client.httpx.Client",
-        side_effect=lambda **kw: original(transport=transport, **kw),
-    ):
-        r = runner.run(request(mode="live"), OpenAICompatibleClient(config))
-    persisted = r.model_dump_json() + json.dumps(
-        [e.model_dump(mode="json") for e in runner.store.list_events(r.run_id)]
-    )
-    assert sentinel not in persisted
-    assert r.status == "waiting_review" and "401" in r.review["message"]
+    transport = httpx.MockTransport(lambda request: httpx.Response(401, json={"error": "invalid " + sentinel}))
+    service = ResearchService(runner.store)
+    session = service.create(llm=OpenAICompatibleClient(config))
+    with patch("valuationagent.llm.client.httpx.Client", side_effect=lambda **kwargs: original(transport=transport, **kwargs)):
+        result = service.turn(session.session_id, ResearchTurn(content="检查资料"))
+    assert sentinel not in json.dumps(result)
+    assert result["execution"]["status"] == "failed"
+    assert result["session"]["last_issue"]["code"] == "LLM_HTTP_401"
 
 
 def test_connection_wire_contains_tools_and_session_revoke():
@@ -445,40 +363,19 @@ def test_financial_contract_blocks_conflicts(update):
     assert any(f.severity == "blocking" for f in model.validate(req, financials))
 
 
-def test_api_review_resume_metadata_and_sse_errors(tmp_path):
-    app = create_app(tmp_path)
+def test_readonly_run_metadata_and_sse_errors(tmp_path):
+    from test_unified_workspace_agent import ScriptedModel, completed_workspace
+    app, service, workspace, _ = completed_workspace(tmp_path, ScriptedModel())
+    record = app.state.store.get_run(workspace.active_run_id)
     with TestClient(app) as client:
-        body = {
-            "request": request(
-                assumptions={"wacc": ".03", "terminal_growth": ".04"}
-            ).model_dump(mode="json")
-        }
-        rid = client.post("/api/runs", json=body).json()["run_id"]
-        assert client.get(f"/api/runs/{rid}/results").status_code == 409
-        child = client.post(
-            f"/api/runs/{rid}/reviews",
-            json={"reason": "纠正", "changes": {"assumptions": {"wacc": ".095"}}},
-        )
-        assert child.status_code == 201
-        cid = child.json()["run_id"]
-        assert client.post(f"/api/runs/{cid}/resume", json={}).status_code == 202
-        result = client.get(f"/api/runs/{cid}/results").json()
-        assert result["company"]["name"] == "验收公司" and result["revision"] == 2
+        result = client.get(f"/api/runs/{record.run_id}/results").json()
         assert len(result["effective_input_hash"]) == 64
-        assert len(client.get(f"/api/runs/{cid}/revisions").json()) == 2
         assert client.get("/api/runs/absent/events").status_code == 404
-        assert (
-            client.get(
-                f"/api/runs/{cid}/events", headers={"Last-Event-ID": "bad"}
-            ).status_code
-            == 422
-        )
-        stream = client.get(f"/api/runs/{cid}/events", headers={"Last-Event-ID": "10"})
-        ids = [
-            int(line[3:]) for line in stream.text.splitlines() if line.startswith("id:")
-        ]
+        assert client.get(f"/api/runs/{record.run_id}/events", headers={"Last-Event-ID": "bad"}).status_code == 422
+        stream = client.get(f"/api/runs/{record.run_id}/events", headers={"Last-Event-ID": "10"})
+        ids = [int(line[3:]) for line in stream.text.splitlines() if line.startswith("id:")]
         assert ids and min(ids) > 10 and ids == sorted(set(ids))
-        assert client.get(f"/api/runs/{cid}/artifacts").json()
+        assert client.get(f"/api/runs/{record.run_id}/artifacts").json()
 
 
 def test_api_validation_does_not_echo_secret(tmp_path):
@@ -490,36 +387,6 @@ def test_api_validation_does_not_echo_secret(tmp_path):
         )
         assert response.status_code == 422
         assert "SYNTHETIC_SECRET" not in response.text
-
-
-@pytest.mark.parametrize("width,height", [(120, 42), (88, 30), (60, 24)])
-def test_ui_compact_and_wide_render_without_markup_injection(runner, width, height):
-    r = runner.run(request(company={"name": "[red] literal company"}))
-    from io import StringIO
-
-    stream = StringIO()
-    terminal = Console(
-        file=stream,
-        width=width,
-        height=height,
-        record=True,
-        theme=__import__("valuationagent.cli.ui", fromlist=["THEME"]).THEME,
-    )
-    terminal.print(dashboard(r, runner.store.list_events(r.run_id), 2.0, width, height))
-    terminal.print(result_view(r))
-    output = stream.getvalue()
-    assert "literal company" in output and "DCF" in output
-    assert len(output.splitlines()) < 90
-
-
-def test_cli_help_and_plain_demo(tmp_path, monkeypatch):
-    monkeypatch.setenv("VALUATION_DATA_DIR", str(tmp_path))
-    cli = CliRunner()
-    assert cli.invoke(cli_app, ["--help"]).exit_code == 0
-    result = cli.invoke(cli_app, ["demo", "--plain", "--valuation-date", "2026-09-12"])
-    assert result.exit_code == 0
-    assert "DCF" in result.stdout and "DEMO" in result.stdout
-    assert "tool.completed" not in result.stdout
 
 
 def test_user_pause_then_resume(runner):
@@ -536,24 +403,7 @@ def test_user_pause_then_resume(runner):
     assert paused.status == "waiting_review"
     assert paused.review["code"] == "USER_PAUSED"
     assert paused.result is None
-    assert runner.resume(current.run_id).result is not None
-
-
-def test_live_chat_revision_runs_tools_and_preserves_context(runner):
-    actions = standard_actions() + [
-        (
-            "revise_assumptions",
-            {"assumptions": {"wacc": ".08"}, "reason": "用户要求调整WACC"},
-        )
-    ]
-    actions += standard_actions() + [("explain_valuation", {"topic": "assumptions"})]
-    llm = ToolLLM(actions)
-    old = runner.run(request(mode="live"), llm)
-    msg = runner.converse(old.run_id, "CONTEXT_MARKER 把 WACC 改为8%")
-    new = runner.store.get_run(msg.related_run_id)
-    assert new.result.assumptions.wacc == D(".08")
-    runner.converse(new.run_id, "这次为什么改动")
-    assert any("CONTEXT_MARKER" in m.get("content", "") for m in llm.calls[-1][0])
+    assert runner.execute(current.run_id).result is not None
 
 
 def test_expired_lease_can_be_recovered(runner):
@@ -567,7 +417,7 @@ def test_expired_lease_can_be_recovered(runner):
             "INSERT INTO leases VALUES(?,?,?)",
             (record.run_id, "crashed-worker", time.time() - 1),
         )
-    assert runner.resume(record.run_id).status == "completed"
+    assert runner.execute(record.run_id).status == "completed"
 
 
 def test_revenue_revision_recomputes_forecast(runner):

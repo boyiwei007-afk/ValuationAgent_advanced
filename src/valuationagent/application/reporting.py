@@ -65,7 +65,7 @@ def _source_note(ref):
 class ValuationReportExporter:
     """Generate reviewer-friendly reports without changing model results."""
 
-    def xlsx(self, record: RunRecord) -> bytes:
+    def xlsx(self, record: RunRecord, audit_context=None) -> bytes:
         try:
             from openpyxl import Workbook
             from openpyxl.chart import BarChart, Reference
@@ -75,6 +75,18 @@ class ValuationReportExporter:
             raise ValueError("Excel报告组件未安装，请安装 valuationagent[reports]。") from exc
 
         result = _completed(record)
+        audit_context = audit_context or {}
+        decision_meta = ((audit_context.get("decisions") or [{}])[-1] or {})
+        decision_labels = {
+            "accepted": "已接受，可按披露范围使用",
+            "accepted_with_warnings": "附带警示接受",
+            "review_required": "需复核，不得作为正式数值结论",
+            "rejected": "已拒绝，不得作为估值结论",
+        }
+        conclusion_status = decision_labels.get(
+            decision_meta.get("outcome"),
+            "计算完成（未绑定工作区决策账本）",
+        )
         wb = Workbook()
         wb.remove(wb.active)
         navy, teal, pale, amber = "14273D", "0F8B8D", "EAF4F4", "FFF3CD"
@@ -136,6 +148,8 @@ class ValuationReportExporter:
                 else None
              ), "成功方法的区间并列展示，不强行平均" if result.reconciliation.relative_range else "没有成功方法"],
             ["交叉验证", result.reconciliation.conclusion, "不同方法保持独立，不强行平均"],
+            ["决策层结论状态", conclusion_status,
+             decision_meta.get("selected_action", "正式使用前应核验适用范围与关键假设")],
             ["结论", result.executive_summary, ""],
             ["原请求估值方法", " / ".join(str(method).upper() for method in record.request.requested_methods),
              "用户在最终方案确认前选择的方法"],
@@ -288,7 +302,7 @@ class ValuationReportExporter:
                 ["贴现政策", record.request.discount_policy, "贴现期沿用系统本次运行结果"],
                 ["稳定期ROIC", stable_roic, (
                     "终值再投资率 = g / 稳定期ROIC"
-                    if normalized_terminal else "参考兼容模型未使用稳定期再投资公式"
+                    if normalized_terminal else "本次计算未使用稳定期再投资公式"
                 )],
                 ["经营必需现金", -result.dcf.bridge.get("operating_cash_requirement", Decimal(0)), "从现金中扣除，仅剩余现金参与股权价值桥接"],
                 ["其他股权桥接净调整", other_bridge_adjustment, "联营投资等为加项；少数股东权益、优先股、养老金与预计负债等为扣项"],
@@ -623,6 +637,91 @@ class ValuationReportExporter:
         if not result.forecast:
             wb.remove(forecast)
 
+        if audit_context:
+            disposition_by_finding = {
+                item["finding_id"]: item
+                for item in audit_context.get("finding_dispositions", [])
+            }
+            challenge = sheet("挑战与处置", (22, 14, 30, 54, 22, 54, 54))
+            challenge_rows = [[
+                "异议ID", "严重性", "类别", "异议", "处置", "处置依据", "后续动作"
+            ]]
+            for finding in audit_context.get("findings", []):
+                disposition = disposition_by_finding.get(finding["finding_id"], {})
+                challenge_rows.append([
+                    finding["finding_id"], finding["severity"], finding["category"],
+                    finding["title"] + "\n" + finding["analysis"],
+                    disposition.get("decision", "待处理"),
+                    disposition.get("rationale", ""),
+                    disposition.get("resulting_action", finding.get("recommendation", "")),
+                ])
+            if len(challenge_rows) == 1:
+                challenge_rows.append(["-", "-", "-", "未形成重大异议", "-", "-", "-"])
+            rows(challenge, challenge_rows)
+            header(challenge)
+
+            adopted_evidence = {
+                item["evidence_id"] for item in audit_context.get("evidence_usage", [])
+                if item.get("adopted")
+            }
+            evidence_book = sheet("证据账本", (22, 12, 24, 34, 50, 16, 16, 14, 26))
+            evidence_rows = [[
+                "证据ID", "等级", "来源类型", "发布机构/来源", "URL/定位", "截止日合规",
+                "综合评分", "本版本采用", "状态/限制",
+            ]]
+            for item in audit_context.get("evidence_ledger", []):
+                location = " · ".join(
+                    f"{key}={value}" for key, value in (item.get("locator") or {}).items()
+                    if value not in (None, "")
+                )
+                evidence_rows.append([
+                    item["evidence_id"], item["authority_tier"], item["source_type"],
+                    item.get("publisher") or item.get("provider") or item.get("title"),
+                    "\n".join(part for part in (item.get("url"), location) if part),
+                    item.get("information_cutoff_ok"), item.get("confidence"),
+                    "是" if item["evidence_id"] in adopted_evidence else "否",
+                    item.get("status", "") + ("；" + "、".join(item.get("limitations") or []) if item.get("limitations") else ""),
+                ])
+            if len(evidence_rows) == 1:
+                evidence_rows.append(["-", "-", "-", "无工作区证据记录", "", "", "", "", ""])
+            rows(evidence_book, evidence_rows)
+            header(evidence_book)
+
+            actions_book = sheet("行动账本", (23, 18, 24, 52, 24, 18, 25))
+            action_rows = [["行动ID", "执行者", "动作", "可核验摘要", "工具", "耗时ms", "状态"]]
+            for item in audit_context.get("action_ledger", []):
+                action_rows.append([
+                    item["action_id"], item["actor"], item["action_type"], item["summary"],
+                    "@".join(part for part in (item.get("tool_name"), item.get("tool_version")) if part),
+                    item.get("duration_ms"), item["status"],
+                ])
+            rows(actions_book, action_rows)
+            header(actions_book)
+
+            version_book = sheet("版本与复现", (30, 72, 64))
+            workspace = audit_context.get("workspace") or {}
+            version = audit_context.get("version") or {}
+            spec = audit_context.get("model_spec") or {}
+            calculation = audit_context.get("calculation") or {}
+            version_rows = [
+                ["项目", "值", "说明"],
+                ["工作区", workspace.get("workspace_id", "-"), workspace.get("title", "")],
+                ["运行模式", workspace.get("run_policy", "-"), "review=审阅模式；automatic=自动模式"],
+                ["估值版本", f"V{version.get('number', record.revision)}", version.get("reason", "")],
+                ["ModelSpec", spec.get("model_spec_id", "-"), spec.get("snapshot_hash", "")],
+                ["估值日", spec.get("valuation_date", str(result.valuation_date)), ""],
+                ["信息截止日", spec.get("information_cutoff_date", "-"), "估值不得静默使用该日之后发布的信息"],
+                ["实际执行日", spec.get("execution_date", "-"), ""],
+                ["计算记录", calculation.get("calculation_id", "-"), calculation.get("status", "")],
+                ["输入哈希", calculation.get("input_hash", record.input_hash), ""],
+                ["结果哈希", calculation.get("result_hash", "-"), ""],
+                ["金融模型", spec.get("financial_model_name", result.model_version), spec.get("financial_model_version", result.model_version)],
+                ["计算复现", (audit_context.get("reproducibility") or {}).get("calculation", "not_packaged"), "计算不需要重新联网或重新调用LLM"],
+                ["数据获取复现", (audit_context.get("reproducibility") or {}).get("data_acquisition", "not_packaged"), "网页可能变化，以快照、引文和哈希为准"],
+            ]
+            rows(version_book, version_rows)
+            header(version_book)
+
         for ws in wb.worksheets:
             if ws.title == "DCF复算" and dcf_data_start is not None:
                 ws.auto_filter.ref = f"A11:O{dcf_data_start + len(result.forecast) - 1}"
@@ -644,7 +743,7 @@ class ValuationReportExporter:
         wb.save(output)
         return output.getvalue()
 
-    def pdf(self, record: RunRecord) -> bytes:
+    def pdf(self, record: RunRecord, audit_context=None) -> bytes:
         try:
             from reportlab.lib import colors
             from reportlab.lib.enums import TA_CENTER
@@ -733,9 +832,27 @@ class ValuationReportExporter:
             canvas.drawRightString(A4[0] - 16*mm, 9*mm, f"Page {document.page}")
             canvas.restoreState()
 
+        audit_context = audit_context or {}
+        workspace_meta = audit_context.get("workspace") or {}
+        version_meta = audit_context.get("version") or {}
+        spec_meta = audit_context.get("model_spec") or {}
+        calculation_meta = audit_context.get("calculation") or {}
+        checkpoint_meta = audit_context.get("checkpoint") or {}
+        decision_meta = ((audit_context.get("decisions") or [{}])[-1] or {})
+        decision_labels = {
+            "accepted": "已接受，可按披露范围使用",
+            "accepted_with_warnings": "附带警示接受",
+            "review_required": "需复核，不得作为正式数值结论",
+            "rejected": "已拒绝，不得作为估值结论",
+        }
+        conclusion_status = decision_labels.get(
+            decision_meta.get("outcome"),
+            "计算完成（未绑定工作区决策账本）",
+        )
+
         story = [p("ValuationAgent 正式估值报告", title),
                  p(f"{result.company.name or ''} · {result.company.ticker or ''} · 基准日 {result.valuation_date}"),
-                 Spacer(1, 5*mm), p("估值摘要", h2)]
+                 Spacer(1, 5*mm), p("1. 估值摘要与结论", h2)]
         story.append(table([
             ["方法", "每股价值", "估值区间/状态"],
             ["DCF", result.dcf.per_share_value if result.dcf else "—",
@@ -747,6 +864,15 @@ class ValuationReportExporter:
                f"{item.range_low} – {item.range_high}" if item.status == "success" else item.reason]
               for item in result.relative],
         ], [35*mm, 38*mm, 85*mm]))
+        story.append(table([
+            ["决策层结论状态", conclusion_status],
+            ["处置要求", decision_meta.get("selected_action", "正式使用前应核验适用范围与关键假设")],
+        ], [42*mm, 116*mm], header=False))
+        if decision_meta.get("outcome") in {"review_required", "rejected"}:
+            story.append(p(
+                "重要：本报告保留计算结果仅用于诊断和复核，不构成可直接采用的正式数值结论。",
+                h2,
+            ))
         if record.request.excluded_methods:
             story += [p("数据缺失与方法降级披露", h2), table([
                 ["原选方法", "处理", "原因"],
@@ -755,7 +881,29 @@ class ValuationReportExporter:
                     for method, reason in record.request.excluded_methods.items()
                 ],
             ], [30*mm, 40*mm, 88*mm])]
-        story += [Spacer(1, 3*mm), p(result.executive_summary), p("数据质量", h2), table([
+        story += [Spacer(1, 3*mm), p(result.executive_summary)]
+        story += [p("2. 研究对象、估值日和信息截止日", h2), table([
+            ["项目", "记录值", "审计说明"],
+            ["研究对象", result.company.name or "-", result.company.ticker or "未记录证券代码"],
+            ["估值日", result.valuation_date, "市场参数与股权价值口径的时点"],
+            ["信息截止日", spec_meta.get("information_cutoff_date") or workspace_meta.get("information_cutoff_date") or result.valuation_date,
+             "不得静默采用该日之后发布的信息"],
+            ["实际执行日", spec_meta.get("execution_date") or workspace_meta.get("execution_date") or "未记录",
+             "与估值日、信息截止日分别记录"],
+            ["币种", result.company.currency, "除非表格另有说明"],
+        ], [37*mm, 43*mm, 78*mm])]
+        story += [p("3. 公司类型、行业和模型选择", h2), table([
+            ["项目", "结论", "依据/范围"],
+            ["公司类型", checkpoint_meta.get("company_type") or workspace_meta.get("company_type") or "未单独记录",
+             "公司类型决定行业化适配与可用模型"],
+            ["行业", result.company.industry or checkpoint_meta.get("industry") or "未确认",
+             workspace_meta.get("industry_strategy") or "沿用已冻结金融模型的行业适配"],
+            ["请求方法", "、".join(str(item).upper() for item in record.request.requested_methods),
+             "用户目标或自动基准方案"],
+            ["实际方法", "、".join(str(item).upper() for item in record.request.methods),
+             "仅执行通过确定性输入检查的方法"],
+        ], [37*mm, 43*mm, 78*mm])]
+        story += [p("4. 数据来源与证据覆盖", h2), table([
             ["指标", "结论", "说明"],
             ["总体置信度", result.data_quality.confidence,
              f"结果等级 {result.data_quality.result_grade} · 可比历史 {result.data_quality.comparable_years}/{result.data_quality.historical_years} 年"],
@@ -766,12 +914,8 @@ class ValuationReportExporter:
               if result.dcf else "仅统计本次相对估值所需的基期财务字段")],
             ["可比样本", result.data_quality.peer_sample_quality,
              "；".join(result.data_quality.notes) or "未产生额外质量提示"],
-        ], [38*mm, 34*mm, 86*mm]), p("关键假设", h2), table([
-            ["参数", "数值", "依据"],
-            ["WACC", f"{result.assumptions.wacc:.2%}" if result.dcf else "不适用", result.assumptions.rationale.get("wacc", "")],
-            ["永续增长率", f"{result.assumptions.terminal_growth:.2%}" if result.dcf else "不适用", result.assumptions.rationale.get("terminal_growth", "")],
-            ["稳定期ROIC", f"{result.dcf.stable_roic:.2%}" if result.dcf and result.dcf.stable_roic is not None else "不适用", result.assumptions.rationale.get("stable_roic", "")],
-            ["假设来源", result.assumptions.source, "模型与输入审计轨迹保存在系统中"],
+            ["证据账本", len(audit_context.get("evidence_ledger", [])),
+             "每条事实保留发布机构、URL/文件、定位、引文、哈希、等级与截止日判断"],
         ], [38*mm, 34*mm, 86*mm])]
         if result.effective_financials:
             base = result.effective_financials
@@ -786,18 +930,54 @@ class ValuationReportExporter:
                     _baseline_method(base, field),
                     "；".join(ref.evidence_id for ref in refs) or "-",
                 ])
-            story += [p("基期财务与确定性推导", h2), table(
+            story += [p("5. 历史财务标准化", h2), table(
                 baseline_rows,
                 [31*mm, 31*mm, 65*mm, 31*mm],
             )]
+        else:
+            story += [p("5. 历史财务标准化", h2), p("本版本没有可用于正式计算的基期财务快照。", small)]
+
+        adjustment_rows = [["调整项目", "处理方式", "理由/影响"]]
+        if result.effective_financials:
+            base = result.effective_financials
+            for field, method in base.calculation_methods.items():
+                if field.startswith("reconciliation.") or any(
+                    token in str(method).lower() for token in ("adjust", "derive", "reclass", "exclude")
+                ):
+                    adjustment_rows.append([field, method, "按冻结输入的可核验计算口径处理"])
+            if base.comparability_note:
+                adjustment_rows.append(["可比性", base.comparability_status, base.comparability_note])
+        for method, reason in record.request.excluded_methods.items():
+            adjustment_rows.append([method.upper(), "方法降级/排除", reason])
+        if len(adjustment_rows) == 1:
+            adjustment_rows.append(["无单列调整", "保持披露口径", "未识别需要单列披露的非经常性或重分类调整"])
+        story += [p("6. 非经常性及口径调整", h2), table(
+            adjustment_rows, [40*mm, 43*mm, 75*mm]
+        )]
+
+        story += [p("7. 经营预测及全部假设", h2), table([
+            ["参数", "基准值", "依据"],
+            ["收入增速路径", "、".join(f"{value:.2%}" for value in result.assumptions.revenue_growth), result.assumptions.rationale.get("revenue_growth", "")],
+            ["EBIT率路径", "、".join(f"{value:.2%}" for value in result.assumptions.ebit_margin), result.assumptions.rationale.get("ebit_margin", "")],
+            ["永续增长率", f"{result.assumptions.terminal_growth:.2%}" if result.dcf else "不适用", result.assumptions.rationale.get("terminal_growth", "")],
+            ["稳定期ROIC", f"{result.dcf.stable_roic:.2%}" if result.dcf and result.dcf.stable_roic is not None else "不适用", result.assumptions.rationale.get("stable_roic", "")],
+            ["假设来源", result.assumptions.source, "详细证据和用户覆盖见第15节及导出账本"],
+        ], [38*mm, 45*mm, 75*mm])]
         if result.forecast:
-            story += [PageBreak(), p(f"{len(result.forecast)}年预测与FCFF", h2)]
+            story += [PageBreak(), p(f"7.1 {len(result.forecast)}年预测与FCFF", h2)]
             story.append(table([["年", "收入增长", "EBIT率", "收入", "FCFF"]] + [
                 [item.year, f"{item.revenue_growth:.2%}", f"{item.ebit_margin:.2%}",
                  f"{item.revenue:,.0f}", f"{item.fcff:,.0f}"] for item in result.forecast
             ], [19*mm, 29*mm, 26*mm, 43*mm, 41*mm]))
+        story += [p("8. WACC 及资本成本依据", h2), table([
+            ["参数", "数值", "依据"],
+            ["WACC", f"{result.assumptions.wacc:.2%}" if result.dcf else "不适用", result.assumptions.rationale.get("wacc", "")],
+            *[[key, value, result.assumptions.rationale.get(key, "WACC组成参数")]
+              for key, value in result.assumptions.wacc_components.items()],
+            ["市场参数时点", record.request.assumptions.market_inputs_as_of or "未单列记录", record.request.assumptions.market_inputs_source or "见证据索引"],
+        ], [38*mm, 34*mm, 86*mm])]
         if result.dcf:
-            story += [p("DCF价值桥与三情景", h2), table([
+            story += [p("9. DCF 估值", h2), table([
                 ["项目", "数值", "项目", "数值"],
                 ["显性期FCFF现值", (
                     f"{result.dcf.present_value_explicit:,.0f}"
@@ -841,9 +1021,11 @@ class ValuationReportExporter:
                     + "。这些项目未被视为已确认0，本次未做相应调整，详见风险与质量说明。",
                     small,
                 ))
+        else:
+            story += [p("9. DCF 估值", h2), p("本版本未采用DCF；不展示WACC-g矩阵或终值结果。", small)]
         requested_relative = any(str(method) != "dcf" for method in record.request.methods)
         if requested_relative or result.effective_peers or result.relative:
-            story += [PageBreak(), p("可比公司与相对估值", h2)]
+            story += [PageBreak(), p("10. 相对估值", h2)]
             if result.effective_peers:
                 story.append(table([["代码", "公司", "P/E", "P/S", "EV/EBITDA", "层级/得分"]] + [
                     [peer.ticker, peer.name, peer.pe or "-", peer.ps or "-", peer.ev_ebitda or "-",
@@ -865,8 +1047,24 @@ class ValuationReportExporter:
                 [30*mm, 28*mm, 30*mm, 70*mm],
             ))
         else:
-            story.append(PageBreak())
-        story += [p("敏感性分析", h2)]
+            story += [PageBreak(), p("10. 相对估值", h2), p("本版本未采用相对估值方法。", small)]
+        story += [p("11. 股权价值桥接", h2)]
+        if result.dcf:
+            story.append(table(
+                [["桥接项目", "数值"]]
+                + [[name, value] for name, value in result.dcf.bridge.items()]
+                + [["企业价值", result.dcf.enterprise_value], ["普通股股权价值", result.dcf.equity_value]],
+                [65*mm, 60*mm],
+            ))
+            if result.dcf.bridge_unmeasured_items:
+                story.append(p(
+                    "未建立且未按0处理的桥接项目：" + "、".join(result.dcf.bridge_unmeasured_items),
+                    small,
+                ))
+        else:
+            story.append(p("本版本未采用企业价值到股权价值的DCF桥接。", small))
+
+        story += [p("12. 敏感性分析", h2)]
         growths = sorted({cell.terminal_growth for cell in result.sensitivity})
         waccs = sorted({cell.wacc for cell in result.sensitivity})
         lookup = {(cell.wacc, cell.terminal_growth): cell for cell in result.sensitivity}
@@ -878,7 +1076,7 @@ class ValuationReportExporter:
         if result.sensitivity:
             story.append(table(sensitivity_rows))
         if result.sensitivity_studies:
-            story += [p("敏感性项目与结果", h2)]
+            story += [p("12.1 敏感性项目与结果", h2)]
             if not result.dcf:
                 story.append(p("各项分别测试基期指标或同业倍数上下变动10%，其他条件不变；属于压力测试，不是概率置信区间。", small))
             impact_rows = [["编号", "参数", "低值", "基准", "高值", "影响", "状态"]]
@@ -910,7 +1108,72 @@ class ValuationReportExporter:
                     p(f"• {unavailable_notes[0]}", small),
                 ]))
                 story += [p(f"• {note}", small) for note in unavailable_notes[1:]]
-        story += [p("风险、限制与追溯", h2)]
+
+        method_values = []
+        if result.dcf:
+            method_values.append(("DCF", result.dcf.per_share_value))
+        method_values += [
+            (item.method.upper(), item.per_share_value)
+            for item in result.relative
+            if item.status == "success" and item.per_share_value is not None
+        ]
+        story += [p("13. 方法交叉验证", h2)]
+        if method_values:
+            numeric_values = [value for _, value in method_values]
+            spread = max(numeric_values) - min(numeric_values) if len(numeric_values) > 1 else 0
+            story.append(table(
+                [["方法", "每股价值"], *method_values, ["方法间极差", spread]],
+                [65*mm, 60*mm],
+            ))
+            story.append(p(
+                "不同方法衡量的经济口径并不完全相同；差异用于风险判断，不以简单平均替代专业判断。",
+                small,
+            ))
+        else:
+            story.append(p("没有可交叉验证的数值方法。", small))
+
+        story += [PageBreak(), p("14. 挑战 Agent 发现与处理", h2)]
+        dispositions = {
+            item["finding_id"]: item
+            for item in audit_context.get("finding_dispositions", [])
+        }
+        challenge_rows = [["严重性", "异议", "处置", "依据与后续动作"]]
+        for finding in audit_context.get("findings", []):
+            disposition = dispositions.get(finding["finding_id"], {})
+            challenge_rows.append([
+                finding["severity"], finding["title"],
+                disposition.get("decision", "待处理"),
+                "；".join(part for part in (
+                    disposition.get("rationale"),
+                    disposition.get("resulting_action") or finding.get("recommendation"),
+                ) if part),
+            ])
+        if len(challenge_rows) == 1:
+            challenge_rows.append(["-", "未形成需单列披露的挑战记录", "-", "直接运行未绑定工作区挑战账本"])
+        story.append(table(challenge_rows, [22*mm, 48*mm, 31*mm, 57*mm]))
+
+        story += [p("15. 用户提供数据及用户覆盖", h2)]
+        overrides = checkpoint_meta.get("user_overrides") or []
+        user_evidence = [
+            item for item in audit_context.get("evidence_ledger", [])
+            if item.get("source_type") in {"user_document", "user_statement"}
+        ]
+        user_rows = [["类别", "项目", "值/说明"]]
+        user_rows += [["用户覆盖", item.get("field") or item.get("parameter") or "未命名", item.get("value") or item] for item in overrides]
+        user_rows += [["用户证据", item.get("evidence_id"), item.get("title")] for item in user_evidence]
+        if len(user_rows) == 1:
+            user_rows.append(["无", "-", "本版本未记录用户覆盖值或用户文件证据"])
+        story.append(table(user_rows, [31*mm, 45*mm, 82*mm]))
+
+        story += [p("16. 事实、推论和观点区分", h2), table([
+            ["类型", "本报告中的定义", "示例"],
+            ["事实", "可回指原始文件、网页、引文和定位的披露数据", "历史收入、股数、净债务项目"],
+            ["转换/计算", "由已披露事实按明确公式和单位规则得到", "万元转亿元、EBIT与FCFF推导"],
+            ["模型推论", "由冻结 ModelSpec 和金融公式产生", "DCF每股价值、敏感性结果"],
+            ["观点/判断", "选择方法、同业和风险解释", "可比公司适配度、结果合理性判断"],
+        ], [28*mm, 78*mm, 52*mm])]
+
+        story += [p("17. 风险、适用范围和局限", h2)]
         story.append(p(
             "口径说明：已确认财务及其原文定位属于事实；经营路径与资本成本属于假设；"
             "估值区间、敏感性和结论属于模型推论，不构成投资建议。",
@@ -918,6 +1181,33 @@ class ValuationReportExporter:
         ))
         notes = result.warnings or ["系统未产生运行警告；关键假设、同业口径与业务判断仍需人工复核。"]
         story += [p(f"• {note}") for note in notes]
+
+        story += [p("18. 数据缺失与代理方法", h2)]
+        gap_rows = [["项目", "处理", "影响"]]
+        for method, reason in record.request.excluded_methods.items():
+            gap_rows.append([method.upper(), "排除该方法", reason])
+        for field in result.data_quality.degraded_fields:
+            gap_rows.append([field, "降级或代理", "已降低结果质量等级并在敏感性/风险中披露"])
+        if result.dcf:
+            for item in result.dcf.bridge_unmeasured_items:
+                gap_rows.append([item, "保持未知，不按0填充", "股权价值桥可能不完整"])
+        if len(gap_rows) == 1:
+            gap_rows.append(["无重大缺失", "无额外代理", "仍需结合适用范围审阅"])
+        story.append(table(gap_rows, [44*mm, 46*mm, 68*mm]))
+
+        story += [p("19. 版本变更记录", h2)]
+        versions = audit_context.get("versions") or []
+        if versions:
+            story.append(table(
+                [["版本", "原因", "状态", "变更归因"]] + [
+                    [f"V{item['number']}", item["reason"], item["status"], item.get("change_attribution") or item.get("changes") or "-"]
+                    for item in versions
+                ],
+                [18*mm, 53*mm, 28*mm, 59*mm],
+            ))
+        else:
+            story.append(p(f"独立运行修订号 V{record.revision}；未绑定工作区版本账本。", small))
+
         evidence_rows = [["性质", "字段", "来源", "定位"]]
         if result.effective_financials:
             for field, refs in result.effective_financials.evidence.items():
@@ -947,14 +1237,40 @@ class ValuationReportExporter:
                 for ref in refs:
                     evidence_rows.append(["可比事实", f"{peer.ticker} {metric}", ref.source,
                         f"{peer.name} · {peer.as_of_date} · {peer.multiple_basis}；{_source_note(ref)}"])
+        workspace_evidence_ids = {row[1] for row in evidence_rows[1:]}
+        for item in audit_context.get("evidence_ledger", []):
+            if item.get("evidence_id") in workspace_evidence_ids:
+                continue
+            locator = " · ".join(
+                f"{key}={value}" for key, value in (item.get("locator") or {}).items()
+                if value not in (None, "")
+            )
+            evidence_rows.append([
+                item.get("source_type", "证据"), item.get("evidence_id", "-"),
+                f"[{item.get('authority_tier', '-')}] {item.get('publisher') or item.get('title')}",
+                "；".join(part for part in (item.get("url"), locator, item.get("source_sha256")) if part),
+            ])
+        story += [p("20. 来源索引", h2)]
         if len(evidence_rows) > 1:
-            story += [p("证据索引", h2), table(
+            story += [table(
                 evidence_rows,
                 [18*mm, 32*mm, 40*mm, 74*mm],
             )]
-        story += [Spacer(1, 3*mm), p(
-            f"模型版本：{result.model_version}　运行ID：{record.run_id}　输入哈希：{result.effective_input_hash or result.input_hash}", small
-        )]
+        else:
+            story.append(p("本版本未携带可展示的来源索引。", small))
+
+        story += [p("21. 复现清单和模型版本", h2), table([
+            ["项目", "记录值", "复现说明"],
+            ["运行ID", record.run_id, "定位确定性计算运行"],
+            ["工作区/版本", workspace_meta.get("workspace_id", "未绑定"), f"V{version_meta.get('number', record.revision)}"],
+            ["ModelSpec", spec_meta.get("model_spec_id", "未绑定"), spec_meta.get("snapshot_hash", "")],
+            ["金融模型版本", result.model_version, spec_meta.get("financial_model_version", "")],
+            ["输入哈希", calculation_meta.get("input_hash") or result.effective_input_hash or record.input_hash, "校验冻结输入"],
+            ["结果哈希", calculation_meta.get("result_hash") or "未绑定", "校验完整数值结果"],
+            ["计算复现", (audit_context.get("reproducibility") or {}).get("calculation", "运行包可离线复算"), "无需重新搜索或调用LLM"],
+            ["数据获取复现", (audit_context.get("reproducibility") or {}).get("data_acquisition", "依赖保存的来源引用"), "网页变化时以快照、引文和哈希为准"],
+            ["舍入规则", spec_meta.get("rounding_policy", "Decimal精度；展示时按字段舍入"), "报告显示精度不改变底层计算"],
+        ], [38*mm, 54*mm, 66*mm])]
         doc.build(story, onFirstPage=page_decor, onLaterPages=page_decor)
         return output.getvalue()
 
@@ -967,10 +1283,14 @@ class ValuationReportExporter:
             if selected == "pdf":
                 return render_run_diagnostic(diagnostic), "application/pdf", "pdf"
             return json.dumps(diagnostic, ensure_ascii=False, indent=2).encode("utf-8"), "application/json", "json"
+        from valuationagent.application.workspace_reporting import (
+            build_workspace_report_context,
+        )
+        audit_context = build_workspace_report_context(store, record.run_id)
         if selected == "xlsx":
-            return self.xlsx(record), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
+            return self.xlsx(record, audit_context), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
         if selected == "pdf":
-            return self.pdf(record), "application/pdf", "pdf"
+            return self.pdf(record, audit_context), "application/pdf", "pdf"
         if selected == "json":
             import json
             from valuationagent.application.reproducibility import build_valuation_bundle

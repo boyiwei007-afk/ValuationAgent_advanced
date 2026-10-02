@@ -74,7 +74,7 @@ def build_result_document(service, session):
         issue = record.review or record.error
         conclusion = f"正式计算未形成有效估值。{issue.get('message', '') if issue else '请检查计算任务中的复核说明。'}"
     elif executable:
-        status = "awaiting_review" if session.question or any(f.status == "proposed" and not f.warnings for f in session.facts) else "ready"
+        status = "awaiting_review" if any(f.status == "proposed" and not f.warnings for f in session.facts) else "ready"
         conclusion = "以下方法已具备提交条件：" + " / ".join(METHODS[m] for m in executable) + "。尚未生成数值估值，确认方案后进入确定性计算。"
     else:
         status = "insufficient_data"
@@ -105,8 +105,6 @@ def build_result_document(service, session):
         steps.append("连接推理模型后，可自动理解需求、定位公开资料并提取字段；报告下载本身不依赖模型服务。")
     if session.data_source_preference == "upload" and not session.documents:
         steps.append("当前选择了上传模式；若不提供文件，可切换为公开资料检索。")
-    if session.question:
-        steps.append(session.question.title)
     limitations = [
         "结论只覆盖所列公司、估值日和方法；资料缺失不等于相应指标为零。",
         "搜索结果属于来源线索；只有通过来源、年度、单位与口径核验并确认的字段才能进入计算。",
@@ -141,7 +139,6 @@ def build_result_document(service, session):
                                     "state": "待补证，不可计算" if f.warnings else "通过来源校验，尚待最终方案确认"}
                                    for f in session.facts if f.status == "proposed"],
         "research_summary": session.summary,
-        "pending_review": session.question.model_dump(mode="json") if session.question else None,
         "forecast_assumptions": session.forecast_proposal.model_dump(mode="json") if session.forecast_proposal else None,
         "gaps": gaps, "next_steps": steps if not numeric else ["使用完整估值任务导出 Excel 底稿、PDF 报告和 JSON 离线复算包。"],
         "limitations": list(dict.fromkeys(limitations)), "searches": session.search_history,
@@ -225,7 +222,14 @@ def document_sections(doc):
         ("假设与观点", _forecast_lines(assumptions)),
         ("敏感性分析", [doc["sensitivity_status"]]),
         ("缺口与下一步", doc["gaps"] + doc["next_steps"]),
-        ("来源清单", [f"{s['name']} · {s['role']} · {s['block_count']} 原文块\n{s.get('source_url') or '本地资料'}\nSHA-256: {s['sha256'] or '未记录'}" + ("\n读取限制：" + "；".join(s['warnings']) if s.get('warnings') else "") for s in doc["sources"]] or ["暂无取得的原始资料。用户无需先上传文件；公开资料仍须实际检索、下载并核验。"]),
+        ("来源清单", [
+            f"{s['name']} · {s['role']} · {s['block_count']} 原文块\n"
+            f"可信等级 {s.get('authority_tier', 'D')} · 来源置信度 {round(float(s.get('source_confidence', 0.5)) * 100)}%"
+            f" · {s.get('provenance_type', 'unknown')} · {s.get('provider') or '未标明提供方'}\n"
+            f"{s.get('source_url') or '本地资料'}\nSHA-256: {s['sha256'] or '未记录'}"
+            + ("\n读取限制：" + "；".join(s['warnings']) if s.get('warnings') else "")
+            for s in doc["sources"]
+        ] or ["暂无取得的原始资料。用户无需先上传文件；公开资料仍须实际检索、下载并核验。"]),
         ("检索与异常记录", [f"{s.get('query', '')} · {s.get('purpose', '')} · {s.get('status', 'attempted')} · {s.get('provider', '')}\n{s.get('attempted_at', '')}" for s in doc["searches"]] or ["尚无已记录的网络检索请求；不宣称已经查遍公开来源。"]),
         ("风险与边界", doc["limitations"]),
         ("复核信息", [f"报告标识 SHA-256: {doc['report_id']}", f"研究版本：v{doc['source_revision']}；生成时间：{doc['generated_at']}", "模型：" + "/".join([doc["model"]["provider"] or "未连接", doc["model"]["name"] or "未连接"]), "原始资料、工具调用和更完整审计见 JSON 复核包。"]),
@@ -234,9 +238,6 @@ def document_sections(doc):
         sections[-3][1].append(f"最近异常：{doc['latest_issue']['code']} · {doc['latest_issue']['message']}")
     if doc.get("research_summary"):
         sections.insert(1, ("研究说明（非数值计算结论）", [doc["research_summary"]]))
-    if doc.get("pending_review"):
-        question = doc["pending_review"]
-        sections.insert(-1, ("待确认事项", [question["title"], *[option["label"] + "：" + option.get("description", "") for option in question["options"]]]))
     return sections
 
 

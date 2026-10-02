@@ -268,13 +268,26 @@ class CninfoAnnouncementProvider:
         return html.unescape(re.sub(r"<[^>]+>", "", str(value or ""))).strip()
 
     def search_annual_reports(
+        self, ticker: str, years: Sequence[int], *, cutoff: date | None = None,
+        company_name: str | None = None,
+    ) -> SearchResult:
+        return self.search_reports(ticker, years, cutoff=cutoff, company_name=company_name)
+
+    def search_reports(
         self,
         ticker: str,
         years: Sequence[int],
         *,
         cutoff: date | None = None,
         company_name: str | None = None,
+        report_type: str = "annual",
     ) -> SearchResult:
+        labels = {"annual": "年度报告", "semiannual": "半年度报告", "q1": "第一季度报告", "q3": "第三季度报告"}
+        if report_type not in labels:
+            raise ValueError("不支持的定期报告类型。")
+        report_label = labels[report_type]
+        def matches_year(title, year):
+            return bool(re.search(str(year) + r"年?" + report_label, title))
         code, column = self._market(ticker)
         selected_years = sorted({int(year) for year in years if 1990 <= int(year) <= 2100})
         if not selected_years:
@@ -282,10 +295,10 @@ class CninfoAnnouncementProvider:
         if len(selected_years) > 10:
             raise ValueError("单次最多检索十个年报年份。")
         cutoff = cutoff or date.today()
-        start = date(min(selected_years) + 1, 1, 1)
+        start = date(min(selected_years) + (report_type == "annual"), 1, 1)
         end = cutoff
         query = SearchQuery(
-            query=f"{code} {' '.join(str(year) for year in selected_years)} 年度报告",
+            query=f"{code} {' '.join(str(year) for year in selected_years)} {report_label}",
             ticker=ticker,
             company_name=company_name,
             purpose="financials",
@@ -311,7 +324,7 @@ class CninfoAnnouncementProvider:
             "stock": "",
             "searchkey": code,
             "secid": "",
-            "category": "category_ndbg_szsh;",
+            "category": "category_ndbg_szsh;" if report_type == "annual" else "",
             "trade": "",
             "seDate": f"{start.isoformat()}~{end.isoformat()}",
             "sortName": "time",
@@ -365,7 +378,7 @@ class CninfoAnnouncementProvider:
                     if str(item.get("secCode") or "").strip() != code or "摘要" in title or "英文版" in title:
                         continue
                     located_years.update(
-                        year for year in selected_years if f"{year}年年度报告" in title
+                        year for year in selected_years if matches_year(title, year)
                     )
                 # Full-text code search can omit isolated historical years,
                 # and some older Shenzhen main-board codes return no hits at
@@ -433,7 +446,7 @@ class CninfoAnnouncementProvider:
             if "摘要" in normalized or "英文版" in normalized:
                 continue
             report_year = next(
-                (year for year in selected_years if f"{year}年年度报告" in normalized),
+                (year for year in selected_years if matches_year(normalized, year)),
                 None,
             )
             if report_year is None:
@@ -456,7 +469,7 @@ class CninfoAnnouncementProvider:
             ).hexdigest()[:24]
             hit = SearchHit(
                 source_id=f"cninfo_{source_id}",
-                title=title or f"{company_name or code} {report_year} 年年度报告",
+                title=title or f"{company_name or code} {report_year} 年{report_label}",
                 url=f"https://static.cninfo.com.cn/{path}",
                 domain="static.cninfo.com.cn",
                 snippet=(
@@ -479,7 +492,7 @@ class CninfoAnnouncementProvider:
         if transient_retries:
             warnings.append(f"官方目录出现瞬时故障，系统自动重试 {transient_retries} 次后成功。")
         if missing:
-            warnings.append("未定位到完整年度报告：" + "、".join(map(str, missing)))
+            warnings.append("未定位到完整" + report_label + "：" + "、".join(map(str, missing)))
         return SearchResult(
             query=query,
             provider=self.provider_id,

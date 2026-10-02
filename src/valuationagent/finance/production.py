@@ -17,6 +17,7 @@ ZERO = D(0)
 
 BRIDGE_ITEM_LABELS = {
     "lease_liabilities": "租赁负债",
+    "trading_financial_assets": "交易性金融资产",
     "associates_and_non_operating_investments": "联营及非经营性投资",
     "minority_interest": "少数股东权益",
     "preferred_equity": "优先股权益",
@@ -180,6 +181,35 @@ def resolve_equity_bridge(
         unmeasured_items.append("lease_liabilities")
 
     additions: dict[str, Decimal] = {}
+    if not _truthy_statement_flag(
+        financials, "cash_and_non_operating_assets_includes_trading_financial_assets"
+    ):
+        trading_market = financials.statement_items.get(
+            "trading_financial_assets_market_value"
+        )
+        trading_assets = (
+            D(str(trading_market))
+            if trading_market is not None
+            else financials.statement_items.get("trading_financial_assets")
+        )
+        if trading_assets is not None:
+            trading_assets = D(str(trading_assets))
+            if not trading_assets.is_finite() or trading_assets < ZERO:
+                raise ValueError("交易性金融资产桥接值必须为有限非负数。")
+        if trading_assets not in (None, ZERO) and trading_market is None:
+            if policy == "require_market_values":
+                raise ValueError(
+                    "股权价值桥接缺少trading_financial_assets_market_value，"
+                    "严格政策不允许以报表列示值替代。"
+                )
+            warnings.append(
+                "交易性金融资产使用报表列示的公允价值计量账面金额作为桥接代理。"
+            )
+        if trading_assets:
+            additions["trading_financial_assets"] = trading_assets
+        elif trading_assets is None:
+            unmeasured_items.append("trading_financial_assets")
+
     if not _truthy_statement_flag(
         financials, "cash_and_non_operating_assets_includes_associates"
     ):

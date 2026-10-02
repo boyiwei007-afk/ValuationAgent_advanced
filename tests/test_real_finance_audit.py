@@ -162,6 +162,11 @@ def test_synthetic_explicit_zero_lease_charge_is_valid_not_missing():
     ("营业总收入（营业收入）", None),
     ("普通股股数（实收资本）", None),
     ("固定资产折旧（含使用权资产折旧）", None),
+    ("利息支出", None),
+    ("利息费用", "interest_expense"),
+    ("财务费用中的利息费用", "interest_expense"),
+    ("财务费用-利息支出", "interest_expense"),
+    ("交易性金融资产", "trading_financial_assets"),
 ])
 def test_parenthesized_synonyms_must_have_the_same_exact_basis(metric, expected):
     assert normalize_financial_metric(metric) == expected
@@ -311,6 +316,26 @@ def test_only_share_count_accepts_issuer_scope_alongside_consolidated_income():
     assert shares.metric == "普通股股数（总股本）"
 
 
+def test_context_mapped_trading_assets_remain_separate_from_monetary_funds():
+    session = ResearchSession(
+        session_id="test_liquid_assets",
+        draft=ResearchDraft(methods=["pe"]),
+    )
+    shares = fact("股份总数", "100")
+    shares.scope, shares.unit = "issuer", "股"
+    cash = fact("货币资金", "1000")
+    cash.standard_metric = "cash_and_non_operating_assets"
+    trading = fact("交易性金融资产", "300")
+    trading.standard_metric = "trading_financial_assets"
+    session.facts = [fact("归母净利润", "140"), shares, cash, trading]
+
+    snapshot = ResearchValuationAssembler()._structured_financials(session)[0]
+
+    assert snapshot.cash_and_non_operating_assets == D("1000")
+    assert snapshot.statement_items["trading_financial_assets"] == D("300")
+    assert snapshot.statement_items["cash_and_non_operating_assets"] == D("1000")
+
+
 def test_generic_total_shares_requires_issuer_scope_not_a_statement_amount():
     session = ResearchSession(session_id="test_total_shares", draft=ResearchDraft(methods=["pe"]))
     shares = fact("股份总数", "100")
@@ -415,6 +440,199 @@ def test_explicitly_dated_issuer_total_is_accepted_for_latest_per_share_denomina
 
     shares.verification.pop("period_end")
     assert "普通股股数" in ResearchValuationAssembler().structured_readiness_error(session)
+
+
+def _dated_share(value, as_of, binding):
+    share = fact("股份总数", str(value))
+    share.fact_id = f"shares:{as_of}"
+    share.scope, share.unit, share.period = "issuer", "股", as_of
+    share.verification = {
+        "binding": binding,
+        "scope": "issuer",
+        "period_end": as_of,
+        "unit": "股",
+    }
+    return share
+
+
+def test_stale_share_evidence_requires_dated_check_without_blocking_other_targets():
+    session = ResearchSession(
+        session_id="stale_shares",
+        draft=ResearchDraft(
+            company="样本股份",
+            ticker="600001.SH",
+            valuation_date=date(2025, 6, 30),
+            methods=["dcf"],
+        ),
+    )
+    session.facts = [
+        fact("营业收入", "1000"),
+        _dated_share("100000000", "2024-12-31", "issuer_share_capital_note"),
+    ]
+
+    issue = ResearchValuationAssembler().capital_structure_timing_issue(session)
+
+    assert issue["kind"] == "research_required"
+    assert issue["code"] == "STALE_POINT_IN_TIME_SHARES"
+    assert "同一来源和目标避免重复检索" in issue["message"]
+    assert "不禁止处理其他年度" in issue["message"]
+    assert issue["latest_verified_date"] == "2024-12-31"
+    assert issue["required_since"] == "2025-03-02"
+
+
+def test_pending_h_share_plan_requires_official_result_status_not_user_guess():
+    session = ResearchSession(
+        session_id="pending_listing",
+        draft=ResearchDraft(
+            company="样本股份",
+            ticker="600001.SH",
+            valuation_date=date(2025, 6, 30),
+            methods=["dcf"],
+        ),
+    )
+    session.facts = [
+        fact("营业收入", "1000"),
+        _dated_share("100000000", "2024-12-31", "issuer_share_capital_note"),
+        _dated_share("100000000", "2025-04-30", "issuer_common_shares"),
+    ]
+    blocks = [{
+        "file_id": "annual",
+        "block_id": "annual:40",
+        "location": {"page": 40},
+        "text": (
+            "样本股份600001 2024年年度报告\n"
+            "《关于公司发行 H 股股票并在香港联合交易所有限公司上市的议案》"
+        ),
+    }]
+
+    issue = ResearchValuationAssembler(
+        block_loader=lambda _: blocks
+    ).capital_structure_timing_issue(session)
+
+    assert issue["kind"] == "research_required"
+    assert issue["code"] == "PENDING_CAPITAL_ACTION_STATUS"
+    assert "最终配发结果" in issue["message"]
+    assert "未经核验的股数" in issue["message"]
+
+
+def test_adjacent_official_block_resolves_completed_h_share_plan():
+    session = ResearchSession(
+        session_id="completed_listing_across_pages",
+        information_cutoff_date=date(2025, 6, 30),
+        draft=ResearchDraft(
+            company="美的集团",
+            ticker="000333.SZ",
+            valuation_date=date(2025, 6, 30),
+            methods=["dcf"],
+        ),
+    )
+    session.facts = [
+        fact("营业收入", "1000"),
+        _dated_share("7655955883", "2024-12-31", "issuer_share_capital_note"),
+        _dated_share("7655955883", "2025-06-19", "issuer_common_shares"),
+    ]
+    location = {"published_at": "2025-03-29"}
+    blocks = [
+        {
+            "file_id": "annual",
+            "block_id": "annual:196",
+            "location": location,
+            "text": "美的集团000333 关于公司发行 H 股股票并在香港联交所上市的议案；备案公司拟发行境外上市普通股。",
+        },
+        {
+            "file_id": "annual",
+            "block_id": "annual:197",
+            "location": location,
+            "text": "本次发行的565,955,300股H股股票于2024年9月17日在香港联交所主板挂牌并上市交易，超额配售权于9月25日悉数行使。",
+        },
+    ]
+
+    issue = ResearchValuationAssembler(
+        block_loader=lambda _: blocks
+    ).capital_structure_timing_issue(session)
+
+    assert issue is None
+
+
+def test_future_published_capital_plan_does_not_pollute_then_known_scope():
+    session = ResearchSession(
+        session_id="future_plan",
+        information_cutoff_date=date(2025, 3, 31),
+        draft=ResearchDraft(
+            company="样本股份",
+            ticker="600001.SH",
+            valuation_date=date(2025, 6, 30),
+            methods=["dcf"],
+        ),
+    )
+    session.facts = [
+        fact("营业收入", "1000"),
+        _dated_share("100000000", "2024-12-31", "issuer_share_capital_note"),
+        _dated_share("100000000", "2025-03-31", "issuer_common_shares"),
+    ]
+    blocks = [{
+        "file_id": "future",
+        "block_id": "future:40",
+        "location": {"published_at": "2025-05-01"},
+        "text": "样本股份600001 关于公司发行 H 股股票并在香港联交所上市的议案",
+    }]
+
+    issue = ResearchValuationAssembler(
+        block_loader=lambda _: blocks
+    ).capital_structure_timing_issue(session)
+
+    assert issue is None
+
+
+def test_material_post_balance_sheet_listing_stops_wrong_per_share_valuation():
+    session = ResearchSession(
+        session_id="completed_listing",
+        draft=ResearchDraft(
+            company="样本股份",
+            ticker="600001.SH",
+            valuation_date=date(2025, 6, 30),
+            methods=["dcf"],
+        ),
+    )
+    session.facts = [
+        fact("营业收入", "1000"),
+        _dated_share("5560600544", "2024-12-31", "issuer_share_capital_note"),
+        _dated_share("5839632244", "2025-06-19", "issuer_listing_issued_shares"),
+    ]
+    assembler = ResearchValuationAssembler()
+
+    issue = assembler.capital_structure_timing_issue(session)
+    progress = valuation_progress(session, assembler)
+
+    assert issue["kind"] == "unsupported_model_scope"
+    assert issue["code"] == "MATERIAL_POST_BALANCE_SHEET_CAPITAL_ACTION"
+    assert "5.02%" in issue["message"]
+    assert "不能只替换每股分母" in issue["message"]
+    assert progress["status"] == "unsupported_model_scope"
+    assert "交付说明报告" in progress["instruction"]
+
+
+def test_identical_weak_share_lead_does_not_block_later_verified_issuer_total():
+    session = ResearchSession(
+        session_id="share_lead_superseded",
+        draft=ResearchDraft(methods=["pe"], valuation_date=date(2025, 6, 30)),
+    )
+    verified = fact("股份总数", "5560600544")
+    verified.scope, verified.unit, verified.period = "issuer", "股", "2024-12-31"
+    verified.verification = {
+        "binding": "issuer_share_capital_note", "scope": "issuer",
+        "period_end": "2024-12-31", "unit": "股",
+    }
+    weak = fact("股份总数", "5560600544")
+    weak.fact_id = "weak_midyear"
+    weak.scope, weak.unit, weak.period = "issuer", "股", "2024-06-30"
+    weak.status = "proposed"
+    weak.warnings = ["期间冲突"]
+    session.facts = [verified, weak]
+    assert ResearchValuationAssembler.pending_blockers(session) == []
+
+    weak.normalized_value = weak.raw_value = "5560600000"
+    assert ResearchValuationAssembler.pending_blockers(session) == [weak]
 
 
 @pytest.mark.parametrize("share_date", [date(2024, 1, 1), date(2025, 7, 1)])

@@ -7,8 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "test": "node --test tests/domain.test.js",
-    "test:components": "node scripts/research-component-check.mjs",
+    "test": "node --test tests/api.test.js",
+    "test:components": "node scripts/workspace-component-check.mjs",
     "test:integration": "node scripts/integration-check.mjs",
     "preview": "vite preview"
   },

@@ -1,7 +1,7 @@
 """Package the inspected working tree, never .env, databases or local history.
 
-python scripts/package_release.py --include-current-acceptance
-python scripts/package_release.py --verify output/release/ValuationAgent-20260927-v14.zip
+python scripts/package_release.py
+python scripts/package_release.py --verify output/release/ValuationAgent-advance.zip
 """
 import argparse
 import hashlib
@@ -88,12 +88,8 @@ def verify(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output', type=Path, default=ROOT / 'output/release/ValuationAgent-20260927-v14.zip')
+    parser.add_argument('--output', type=Path, default=ROOT / 'output/release/ValuationAgent-advance.zip')
     parser.add_argument('--verify', type=Path)
-    parser.add_argument('--include-acceptance', action='store_true', help='Include only this dated synthetic acceptance fixture and public-source probe metadata')
-    parser.add_argument('--include-current-acceptance', action='store_true', help='Include only 2026-09-26 synthetic reports and bounded live-check metadata')
-    parser.add_argument('--include-real-acceptance', action='store_true', help='Include 2026-09-27 real-company summaries and public source hashes, never annual-report PDFs or databases')
-    parser.add_argument('--include-submission-acceptance', action='store_true', help='Include v13 independent no-data arithmetic acceptance and real-company research summary')
     args = parser.parse_args()
     if args.verify:
         print(json.dumps(verify(args.verify), indent=2))
@@ -113,87 +109,9 @@ def main():
         if path.is_symlink() or not path.resolve().is_relative_to(ROOT):
             raise ValueError('Unsafe source path: ' + str(path))
         entries[name] = path.read_bytes()
-    if args.include_acceptance:
-        from valuationagent.storage.sqlite import SQLiteRunStore
-        fixture = ROOT / 'var/delivery-live-final-20260925'
-        for name in ('acceptance.json', 'synthetic-report.json', 'synthetic-report.xlsx', 'synthetic-report.pdf'):
-            latest = 'synthetic-report-delivery.xlsx' if name == 'synthetic-report.xlsx' and (fixture / 'synthetic-report-delivery.xlsx').is_file() else name
-            entries['acceptance/' + name] = (fixture / latest).read_bytes()
-        package = json.loads(entries['acceptance/synthetic-report.json'])
-        store = SQLiteRunStore(fixture)
-        for ref in package['source_manifest']:
-            if ref.get('role') == 'search_lead':
-                continue
-            meta = store.get_file(ref['file_id'])
-            original = Path(meta['storage_path'])
-            if not original.is_absolute():
-                original = ROOT / original
-            if not original.resolve().is_relative_to(fixture):
-                raise ValueError('Acceptance source is outside the synthetic fixture')
-            content = original.read_bytes()
-            if sha(content) != ref['sha256']:
-                raise ValueError('Acceptance source hash mismatch')
-            entries['acceptance/sources/' + ref['file_id'] + original.suffix] = content
-        for source, target in (
-            ('var/delivery-benchmark-20260925/metrics.json', 'acceptance/local-performance.json'),
-            ('var/delivery-source-20260925/source-check.json', 'acceptance/official-source-probe.json'),
-        ):
-            entries[target] = (ROOT / source).read_bytes()
-    if args.include_current_acceptance:
-        for folder, target, names in (
-            ('output/acceptance-20260926', 'acceptance/v8/no-data', ('acceptance.json', 'no-data-outcome.pdf', 'no-data-outcome.html', 'no-data-outcome.json', 'unfinished-run-diagnostic.pdf')),
-            ('var/live-upload-20260926', 'acceptance/v8/upload', ('acceptance.json', 'synthetic-valuation.pdf', 'synthetic-valuation.xlsx', 'synthetic-valuation.json')),
-            ('var/live-no-upload-20260926-release', 'acceptance/v8/public-source', ('acceptance.json',)),
-            ('var/performance-20260926', 'acceptance/v8/performance', ('metrics.json',)),
-        ):
-            for name in names:
-                entries[target + '/' + name] = (ROOT / folder / name).read_bytes()
-        # Ship the synthetic uploaded source as well as the computed bundle,
-        # so reviewers can verify the original text and its bound file hash.
-        from valuationagent.storage.sqlite import SQLiteRunStore
-        fixture = ROOT / 'var/live-upload-20260926'
-        store = SQLiteRunStore(fixture)
-        package = json.loads(entries['acceptance/v8/upload/synthetic-valuation.json'])
-        for ref in package['source_manifest']:
-            if ref.get('role') == 'search_lead':
-                continue
-            meta = store.get_file(ref['file_id'])
-            original = Path(meta['storage_path'])
-            if not original.is_absolute():
-                original = ROOT / original
-            if not original.resolve().is_relative_to(fixture):
-                raise ValueError('Acceptance source is outside the synthetic fixture')
-            content = original.read_bytes()
-            if sha(content) != ref['sha256']:
-                raise ValueError('Acceptance source hash mismatch')
-            entries['acceptance/v8/upload/sources/' + ref['file_id'] + original.suffix] = content
-    if args.include_real_acceptance:
-        real_root = ROOT / 'var/real-company-20260926'
-        for code in ('000333', '300750', '600887'):
-            entries[f'acceptance/v9/sources/{code}/manifest.json'] = (real_root / 'sources' / code / 'manifest.json').read_bytes()
-            entries[f'acceptance/v9/upload/{code}/acceptance.json'] = (real_root / 'final-20260927' / code / 'acceptance.json').read_bytes()
-        entries['acceptance/v9/zero-upload/600887/acceptance.json'] = (real_root / 'zero-upload-final-20260927/600887/acceptance.json').read_bytes()
-        entries['acceptance/v9/resumed/000333/acceptance.json'] = (real_root / 'resumed-20260927/000333/acceptance.json').read_bytes()
-        for code in ('000333', '300750', '600887'):
-            entries[f'acceptance/v9/verified-upload/{code}/acceptance.json'] = (real_root / 'verified-20260927' / code / 'acceptance.json').read_bytes()
-        entries['acceptance/v9/verified-zero-upload/600887/acceptance.json'] = (real_root / 'zero-upload-verified-20260927/600887/acceptance.json').read_bytes()
-        entries['acceptance/v9/final-closure/000333/acceptance.json'] = (real_root / 'closure-20260927/000333/acceptance.json').read_bytes()
-        entries['acceptance/v9/final-zero-upload-closure/600887/acceptance.json'] = (real_root / 'zero-upload-closure-20260927/600887/acceptance.json').read_bytes()
-    if args.include_submission_acceptance:
-        local = ROOT / 'output/acceptance-20260927-v13'
-        for name in ('acceptance.json', 'no-data-outcome.json', 'no-data-outcome.html',
-                     'no-data-outcome.pdf', 'unfinished-run-diagnostic.pdf'):
-            entries['acceptance/v13/local/' + name] = (local / name).read_bytes()
-        real_root = ROOT / 'var/real-company-20260926'
-        entries['acceptance/v13/real-upload/600887/acceptance.json'] = (
-            real_root / 'v13-share-recheck-20260927/600887/acceptance.json'
-        ).read_bytes()
-        entries['acceptance/v13/sources/600887/manifest.json'] = (
-            real_root / 'sources/600887/manifest.json'
-        ).read_bytes()
     for name, data in entries.items():
         validate_entry(name, data)
-    manifest = {'schema': 'valuationagent-release-v1', 'version': '0.5.0-independent-acceptance-20260927-v14',
+    manifest = {'schema': 'valuationagent-release-v1', 'version': '0.6.0.dev0',
                 'source': 'inspected working tree, including uncommitted changes',
                 'excludes': ['environment configuration except root .env.example', 'recognized credentials',
                              'keys and certificates', 'user data directories', 'databases and journals',

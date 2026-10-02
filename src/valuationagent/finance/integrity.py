@@ -13,6 +13,7 @@ D = Decimal
 # Restricted-cash and financial-institution balances remain outside this
 # generic contract and block enterprise-value methods until specialist review.
 EQUITY_BRIDGE_REVIEW_LABELS = {
+    "trading_financial_assets": "交易性金融资产",
     "minority_interest": "少数股东权益",
     "preferred_equity": "优先股权益",
     "unfunded_pension": "未弥补养老金缺口",
@@ -32,6 +33,7 @@ UNSUPPORTED_COMPLEX_BRIDGE_KEYS = {
 }
 
 SUPPORTED_BOOK_PROXY_KEYS = {
+    "trading_financial_assets",
     "minority_interest",
     "preferred_equity",
     "unfunded_pension",

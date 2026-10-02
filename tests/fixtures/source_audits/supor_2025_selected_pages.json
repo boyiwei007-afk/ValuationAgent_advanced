@@ -1,0 +1,27 @@
+{
+  "case_id": "supor-2025-pages-7-36-55",
+  "source_url": "https://static.cninfo.com.cn/finalpage/2026-04-03/1225076804.PDF",
+  "source_sha256": "d323425e24b34f7cfa8fbff819cdd1b0daa47a5bd331da6d27c9f956478a6a7b",
+  "review_method": "Separate page-image inspection by the coding assistant, not the extracting qwen36-teacher. Not human-auditor certification. No expected values are provided to the valuation Agent.",
+  "reviewed_at": "2026-10-02",
+  "checks": [
+    {
+      "pages": [7],
+      "metric": "net_income_parent",
+      "scope": "consolidated",
+      "role": "historical",
+      "unit": "元",
+      "currency": "CNY",
+      "expected": {"2025": "2096720231.52", "2024": "2244444529.35", "2023": "2179798147.27"}
+    },
+    {
+      "pages": [36, 55],
+      "metric": "common_shares",
+      "scope": "issuer",
+      "role": "historical",
+      "unit": "股",
+      "currency": null,
+      "expected": {"2025-12-31": "801660653", "2024-12-31": "801538407"}
+    }
+  ]
+}

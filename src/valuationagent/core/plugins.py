@@ -18,7 +18,7 @@ from valuationagent.schemas.models import (
 
 
 class AgentToolProvider(Protocol):
-    """Adds allowlisted tools to the research Agent without changing its loop.
+    """Adds allowlisted tools to the workspace Agent without changing its loop.
 
     Providers own their dependencies and return typed ``ToolSpec`` objects.
     Every invocation is still wrapped by the application event/audit layer.
@@ -74,40 +74,3 @@ class FinancialModelPlugin(Protocol):
     def reconcile(
         self, dcf: DcfResult | None, relative: list[MultipleResult]
     ) -> ReconciliationResult: ...
-
-
-class DocumentExtractor(Protocol):
-    plugin_id: str
-    version: str
-
-    def extract(self, files: list[dict], schema: dict) -> dict[str, Any]: ...
-
-
-class RevenueForecaster(Protocol):
-    plugin_id: str
-    version: str
-
-    def forecast_revenue(
-        self, history: list[FinancialSnapshot], assumptions: AssumptionSet
-    ) -> list[ForecastYear]: ...
-
-
-class CapitalCostModel(Protocol):
-    plugin_id: str
-    version: str
-
-    def calculate(self, inputs: dict[str, Any]) -> dict[str, Any]: ...
-
-
-class PeerSelector(Protocol):
-    plugin_id: str
-    version: str
-
-    def select(self, request: ValuationRequest) -> list[PeerCompany]: ...
-
-
-class ReportExporter(Protocol):
-    plugin_id: str
-    version: str
-
-    def export(self, result: dict[str, Any], destination: str) -> dict[str, Any]: ...

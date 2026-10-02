@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 from pypdf import PdfWriter
 
+from valuationagent.application.agent_runtime import WorkspaceAgentRuntime
 from valuationagent.application.research import CandidateInput, ProposeFacts, ResearchService
 from valuationagent.application.research_export import build_research_export
 from valuationagent.application.result_document import _report_font
@@ -74,13 +75,13 @@ def test_uploaded_formats_reach_evidence_checked_candidate(tmp_path, extension):
     row = next(block for block in blocks if "营业收入" in block["text"])
     assert row["location"] and "fake_revenue" not in row["text"]
     session = service.store.get_research(session.session_id)
-    service._facts(session, ProposeFacts(candidates=[CandidateInput(metric="营业收入", raw_value="100", unit="万元", period="2025", scope="consolidated", block_id=row["block_id"], quote=row["text"])]))
+    WorkspaceAgentRuntime(service, session).facts(ProposeFacts(candidates=[CandidateInput(metric="营业收入", raw_value="100", unit="万元", period="2025", scope="consolidated", block_id=row["block_id"], quote=row["text"])]))
     assert len(session.facts) == 1
     fact = session.facts[0]
     assert not fact.warnings, fact.warnings
     assert fact.normalized_value == "1000000" and fact.source_sha256 == meta["sha256"]
     assert fact.verification["year_column"] == 2025
-    assert fact.status == "proposed"  # Extraction is not authorization to calculate.
+    assert fact.status == "confirmed"  # Extraction is not authorization to calculate.
 
 
 @pytest.mark.parametrize("kind", ["broken_pdf", "encrypted_pdf", "no_text_pdf", "bad_docx", "bad_xlsx", "bad_json"])
@@ -126,7 +127,7 @@ def test_twenty_one_candidates_are_validated_without_truncation(tmp_path):
     service.store.save_research_blocks(session.session_id, "file_1", blocks)
     session.documents.append(DocumentSummary(file_id="file_1", name="batch.txt", role="historical_financials", block_count=21))
     session.draft.company = "测试股份"
-    service._facts(session, ProposeFacts(candidates=candidates))
+    WorkspaceAgentRuntime(service, session).facts(ProposeFacts(candidates=candidates))
     assert len(session.facts) == 21
     assert all(not fact.warnings for fact in session.facts)
     with pytest.raises(ValidationError):
@@ -144,8 +145,10 @@ def test_failed_attachment_automatically_uses_allowed_public_retrieval(tmp_path)
     meta = service.store.save_upload("不可读.pdf", "historical_financials", None, b"not pdf")
     state = service.turn(session.session_id, ResearchTurn(content="开始估值", file_ids=[meta["file_id"]]))
     assert len(state["session"]["search_history"]) == 3
-    assert state["result_document"] and model.calls == 4
-    assert state["session"]["question"]["options"][0]["id"] == "report"
+    assert state["result_document"] and model.calls == 7
+    assert not state["session"]["outcome_status"]
+    assert state["session"]["resume_context"]["reason"] == "AGENT_NO_PROGRESS"
+    assert "question" not in state["session"]
 
 
 def test_explicit_upload_only_still_prohibits_search(tmp_path):
@@ -200,7 +203,7 @@ def test_keyword_retrieval_ranks_statement_rows_and_returns_headers(tmp_path):
     assert any(block["block_id"] == "file_test:2" for block in result["context_blocks"])
 
 
-def test_unmatched_correction_preserves_old_fact_but_not_block_other_valid_candidates(tmp_path):
+def test_unmatched_correction_is_rejected_atomically(tmp_path):
     from test_delivery_regressions import candidate, source
     from valuationagent.schemas.research import FactCandidate, DocumentSummary
     service = ResearchService(SQLiteRunStore(tmp_path))
@@ -210,8 +213,9 @@ def test_unmatched_correction_preserves_old_fact_but_not_block_other_valid_candi
     session.documents.append(DocumentSummary(file_id="file_1", name="test.txt", role="historical_financials", block_count=1))
     old = FactCandidate(fact_id="old_confirmed", metric="所得税费用", period="2025", raw_value="20", unit="万元", normalized_value="200000", scope="consolidated", block_id="file_1:1", quote="old", status="confirmed")
     session.facts.append(old)
-    service._facts(session, ProposeFacts(candidates=[candidate()], replaces=[old.fact_id, "unknown_id"]))
+    with pytest.raises(ValueError):
+        WorkspaceAgentRuntime(service, session).facts(ProposeFacts(candidates=[candidate()], replaces=[old.fact_id, "unknown_id"]))
+    assert session.facts == [old]
+    assert old.status == "confirmed"
+    WorkspaceAgentRuntime(service, session).facts(ProposeFacts(candidates=[candidate()]))
     assert len(session.facts) == 2 and not session.facts[-1].warnings
-    assert old.status == "confirmed" and old.normalized_value == "200000"
-    assert not session.question.superseded_fact_ids
-    assert any(e.type == "facts.correction_rejected" for e in service.store.list_events(session.session_id))

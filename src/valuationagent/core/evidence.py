@@ -7,8 +7,9 @@ import json
 import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlsplit
 
-EVIDENCE_VERSION = "table-binding-v7"
+EVIDENCE_VERSION = "table-binding-v8"
 SCOPE_PATTERN = r"(合并|母公司)(?:财务)?(?:报表(?:项目)?(?:附注|注释)?|资产负债表|利润表|现金流量表|口径)"
 STATEMENT_TITLE = (r"(?m)^\s*(?:[一二三四五六七八九十\d]+\s*[、.．]\s*)?"
                    r"(?:(?:19|20)\d{2}\s*年度?\s*)?(?:合并及公司|合并|母公司)"
@@ -78,6 +79,8 @@ def evidence_context(block, file_blocks, explicit_ids=()):
         local = [b for b in local if floor <= b.get("location", {}).get("page", -1) <= page]
     elif location.get("table"):
         local = [b for b in before if b.get("location", {}).get("table") == location["table"]][:3] + local
+        local = [entry for entry in local if not entry.get("location", {}).get("table")
+                 or entry["location"]["table"] == location["table"]]
     if location.get("sheet") or location.get("table"):
         # Long workbooks/Word tables often keep headers dozens of rows above
         # the value. Keep the latest header of each kind in addition to nearby
@@ -85,15 +88,21 @@ def evidence_context(block, file_blocks, explicit_ids=()):
         header_patterns = [SCOPE_PATTERN, r"单位\s*[:：]?",
                            r"(?:本期|本年)(?:金额|发生额|数).*(?:上期|上年)(?:金额|发生额|数)"]
         for pattern in header_patterns:
-            found = next((b for b in reversed(before[:-1]) if re.search(pattern, b["text"])), None)
+            found = next((b for b in reversed(before[:-1]) if re.search(pattern, b["text"])
+                          and (not location.get("table") or not b.get("location", {}).get("table")
+                               or b["location"]["table"] == location["table"])), None)
             if found:
                 local.append(found)
-        year_header = next((b for b in reversed(before[:-1]) if _table_columns(b["text"] + "\n_", "")[0]), None)
+        year_header = next((b for b in reversed(before[:-1]) if _table_columns(b["text"] + "\n_", "")[0]
+                            and (not location.get("table") or b.get("location", {}).get("table") == location["table"])), None)
         if year_header:
             local.append(year_header)
     # Explicit context cannot borrow a future header or another worksheet.
     ids = {b["block_id"] for b in local} | set(explicit_ids)
     context = [b for b in before if b["block_id"] in ids]
+    if location.get("table"):
+        context = [entry for entry in context if not entry.get("location", {}).get("table")
+                   or entry["location"]["table"] == location["table"]]
     if page:
         context = [b for b in context if floor <= b.get("location", {}).get("page", -1) <= page]
         for candidate in reversed(before):
@@ -118,8 +127,14 @@ def _name_in_row(name, line):
     for match in re.finditer(re.escape(name), line):
         before, after = line[:match.start()], line[match.end():]
         left = not before or not (before[-1].isalnum() or before[-1] == "_") or bool(re.search(r"\d{4}年$", before))
-        right = (not after or not (after[0].isalpha() or after[0] == "_")
-                 or bool(re.match(r"^[一二三四五六七八九十百]+[（(]\d+[）)]", after)))
+        right = (
+            not after
+            or not (after[0].isalpha() or after[0] == "_")
+            or bool(re.match(
+                r"^[一二三四五六七八九十百]+(?:[、.．]\d+(?:[（(]\d+[）)])?|[（(]\d+[）)])",
+                after,
+            ))
+        )
         if left and right:
             return True
     return False
@@ -140,9 +155,16 @@ def _metric_row(item, text, aliases):
     if quoted:
         matches = quoted
     amount = numeric_tokens(item.raw_value)
+    blank_zero = len(amount) == 1 and amount[0] == 0
     if len(matches) == 1:
         index = matches[0]
         if amount and amount[0] not in numeric_tokens(lines[index]):
+            # A zero may represent an explicitly blank annual balance-sheet
+            # cell, but only the later column-alignment gate can prove that.
+            # Keep the exact row available for that gate; every non-zero value
+            # still has to appear in the row itself.
+            if blank_zero:
+                return lines[index], "\n".join(lines[:index + 1]), ""
             # A complete label on an empty row is not permission to borrow the
             # next accounting row's amount. Only a values-only continuation
             # can extend a complete label; split labels are handled below.
@@ -170,7 +192,12 @@ def _metric_row(item, text, aliases):
             joined = compact(window)
             # Some PDF extractors insert the numeric columns between the two
             # halves of a wrapped label. Compare a numbers-stripped view too.
-            label_joined = compact(re.sub(r"[\d０-９.,，()（）+\-−%％\s]+", "", window))
+            label_text = re.sub(
+                r"[一二三四五六七八九十百]+[、.．]\s*\d+(?:[（(]\d+[）)])?",
+                "",
+                window,
+            )
+            label_joined = compact(re.sub(r"[\d０-９.,，()（）+\-−%％\s]+", "", label_text))
             if not any(
                 compact(name) and (compact(name) in joined or compact(name) in label_joined)
                 for name in names
@@ -290,17 +317,64 @@ def _aligned_note_values(block_prefix, metric_line, column_count):
     numeric column's right edge. Missing cells stay None; no zeros are inferred.
     Delimited/coordinate-bearing tables use their existing binding path.
     """
-    if "|" in metric_line or "\t" in metric_line or not re.search(r" {2,}", metric_line):
+    if "|" in metric_line or "\t" in metric_line:
         return None
-    number = re.compile(r"(?<![\w.])\(?[+\-−]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?\)?")
+    note_ref_pattern = (
+        r"[一二三四五六七八九十百]+[、.．]\s*\d+"
+        r"(?:[（(]\d+[）)])?(?:[（(][a-z][）)])?"
+    )
+    # When PDF extraction removes the gap between two currency columns,
+    # ``29,444,936,771.4130,303,850,168.56`` must be tokenised as two
+    # two-decimal amounts. Keep arbitrary decimal precision everywhere else.
+    grouped_decimal = (
+        r"(?:\.\d{2}(?=[+\-−]?(?:\d{1,3}(?:[,，]\d{3})+\.\d{2}))|\.\d+)?"
+    )
+    number = re.compile(
+        note_ref_pattern
+        + r"|(?<![\w.])\(?[+\-−]?(?:\d{1,3}(?:[,，]\d{3})+"
+        + grouped_decimal
+        + r"|\d+(?:\.\d+)?)\)?"
+    )
 
     def tokens(line):
         if "|" in line or re.search(r"\b[A-Z]{1,3}\d+\s*:", line):
             return []
         return list(number.finditer(line))
 
+    physical_lines = block_prefix.splitlines()
+    joined_metric = compact(metric_line)
+    # ``_metric_row`` may reconstruct a label wrapped around its numeric row,
+    # e.g. ``购建固定资产、无形资产和其他 [note/value columns]`` followed by
+    # ``长期资产支付的现金``.  Column geometry belongs to the one physical
+    # line carrying the values, not to the space-joined display row.
+    target_indexes = [
+        index for index in range(max(0, len(physical_lines) - 3), len(physical_lines))
+        if compact(physical_lines[index])
+        and compact(physical_lines[index]) in joined_metric
+    ]
+    layout_candidates = [
+        (index, physical_lines[index], tokens(physical_lines[index]))
+        for index in target_indexes if tokens(physical_lines[index])
+    ]
+    if layout_candidates:
+        max_cells = max(len(entry[2]) for entry in layout_candidates)
+        best = [entry for entry in layout_candidates if len(entry[2]) == max_cells]
+        if len(best) != 1:
+            return None
+        _, layout_line, metric_tokens = best[0]
+        reference_lines = physical_lines[:min(target_indexes)]
+    else:
+        layout_line, metric_tokens = metric_line, tokens(metric_line)
+        reference_lines = physical_lines[:-1]
+    # PDF text extraction commonly strips the trailing spaces from a wholly
+    # blank accounting row, leaving only its label (for example, “短期借款”).
+    # A populated row still needs visible column spacing; a label-only row may
+    # proceed only when two complete rows below establish stable right edges.
+    if metric_tokens and not re.search(r" {2,}", layout_line):
+        return None
+
     references = []
-    for line in block_prefix.splitlines()[:-1]:
+    for line in reference_lines:
         matches = tokens(line)
         if len(matches) != column_count + 1 or not re.search(r" {2,}", line):
             continue
@@ -317,11 +391,15 @@ def _aligned_note_values(block_prefix, metric_line, column_count):
         return None
     centers = [sum(edge) / len(edge) for edge in edges]
     values = [None] * (column_count + 1)
-    for match in tokens(metric_line):
+    for match in metric_tokens:
         positions = [i for i, center in enumerate(centers) if abs(match.end() - center) <= 2]
         if len(positions) != 1 or values[positions[0]] is not None:
             return None
         parsed = numeric_tokens(match[0])
+        if re.fullmatch(note_ref_pattern, match[0]):
+            # A printed reference such as 七、78（2） occupies one note cell;
+            # the parenthesized sub-item is not another accounting value.
+            parsed = parsed[:1]
         if len(parsed) != 1:
             return None
         values[positions[0]] = parsed[0]
@@ -392,6 +470,146 @@ def _bind_issuer_shares(item, block, draft, aliases, identity_text):
         checks.update(binding="issuer_report_disclosure_shares", source_row=item.quote,
                       period_end=disclosure_date.isoformat(), period=str(disclosure_date.year),
                       unit=relative["unit"])
+        if not warnings:
+            checks["scope"] = "issuer"
+        return list(dict.fromkeys(warnings)), checks
+
+    # HKEX final allotment results disclose the post-offering issuer total in
+    # a purpose-built table.  The row is more precise than deriving shares by
+    # adding offer tranches, but it often omits a trailing ``股`` because the
+    # table heading already states that every entry is a share count.  Accept
+    # this narrow layout only from HKEX, with the listing/trading date in the
+    # same cited block and the target issuer independently matched above.
+    location = block.get("location") or {}
+    source_url = str(location.get("url") or location.get("source_url") or "")
+    source_host = (urlsplit(source_url).hostname or "").rstrip(".").casefold()
+    hkex_hosts = {"hkexnews.hk", "www.hkexnews.hk", "www1.hkexnews.hk"}
+    listing_total = re.search(
+        r"(?:於|于)上市(?:時|时)已(?:發行|发行)的股份(?:數目|数目)"
+        r"(?:[（(](?:於|于)(?:超額配股權|超额配股权)(?:獲|获)行使前[）)])?"
+        r"(?P<amount>\d{1,3}(?:[,，]\d{3})+|\d+)(?:股)?",
+        quote,
+    )
+    listing_date = re.search(
+        r"(?:開始買賣日|开始买卖日|上市日期?)(?:目前預期為|目前预期为|為|为|[:：])?"
+        r"(?P<year>(?:19|20)\d{2})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日",
+        quote,
+    )
+    if listing_total or listing_date:
+        if source_host not in hkex_hosts:
+            return [*warnings, "上市时已发行股数仅可由港交所正式配发结果公告核验"], checks
+        if not listing_total or not listing_date:
+            return [*warnings, "港交所上市股数引文须同时覆盖上市日和上市时已发行股份总数"], checks
+        try:
+            effective_date = date(
+                int(listing_date["year"]),
+                int(listing_date["month"]),
+                int(listing_date["day"]),
+            )
+        except ValueError:
+            effective_date = None
+            warnings.append("上市日期无法识别")
+        try:
+            target_date = date.fromisoformat(str(item.period))
+        except ValueError:
+            target_date = None
+        if effective_date is not None and target_date != effective_date:
+            warnings.append("期间冲突：候选股数截止日须与港交所公告所列上市日一致")
+        if draft.valuation_date and effective_date and effective_date > draft.valuation_date:
+            warnings.append("上市日晚于估值日，不能提前使用发行后股数")
+        published = location.get("published_at")
+        try:
+            publication_date = date.fromisoformat(str(published)[:10])
+        except (TypeError, ValueError):
+            publication_date = None
+            warnings.append("港交所配发结果缺少可核验的公告发布日期")
+        if draft.valuation_date and publication_date and publication_date > draft.valuation_date:
+            warnings.append("配发结果公告日晚于估值日，不能使用未来信息")
+        proposed = numeric_tokens(item.raw_value)
+        source_amount = numeric_tokens(listing_total["amount"])
+        if (
+            len(proposed) != 1
+            or proposed != source_amount
+            or proposed[0] <= 0
+            or proposed[0] != proposed[0].to_integral_value()
+        ):
+            warnings.append("科目数值冲突：候选股数不是上市时已发行股份总数的正整数")
+        if item.unit != "股":
+            warnings.append("单位冲突：港交所配发结果的已发行股份总数须以股计量")
+        checks.update(
+            binding="issuer_listing_issued_shares",
+            source_row=item.quote,
+            period_end=effective_date.isoformat() if effective_date else "",
+            period=str(effective_date.year) if effective_date else "",
+            unit="股",
+            official_exchange="HKEX",
+            publication_date=(publication_date.isoformat() if publication_date else ""),
+        )
+        if not warnings:
+            checks["scope"] = "issuer"
+        return list(dict.fromkeys(warnings)), checks
+
+    # Some A-share annual reports use the statutory ``股本`` note for share
+    # counts.  Accept it only when the row is explicitly named ``股份总数``, the
+    # table exposes opening and closing balances, and the same note states the
+    # issuer/date, ordinary-share class and RMB 1 par value.  This is not the
+    # generic balance-sheet ``实收资本（或股本）`` shortcut prohibited below.
+    text = block.get("text", "")
+    capital_note_rows = [
+        line for line in text.splitlines()
+        if re.match(r"^\s*股份总数\s+", line)
+    ]
+    capital_note = (
+        len(capital_note_rows) == 1
+        and compact(capital_note_rows[0]) in quote
+        and re.search(r"(?:^|\n)\s*\d+[、.．]\s*股本\s*(?:\n|$)", text)
+        and "期初余额" in text and "期末余额" in text
+        and re.search(
+            r"于\s*(?P<year>(?:19|20)\d{2})\s*年\s*(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日[，,]?"
+            r"本公司注册资本包括普通股[，,]?每股面值人民币\s*1\s*元",
+            text,
+        )
+    )
+    if capital_note:
+        row = capital_note_rows[0]
+        values = numeric_tokens(row)
+        note_date = re.search(
+            r"于\s*((?:19|20)\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+            text,
+        )
+        try:
+            source_date = date(*map(int, note_date.groups()))
+        except (AttributeError, ValueError):
+            source_date = None
+        period = re.sub(r"\s+", "", item.period)
+        exact_date = re.fullmatch(r"((?:19|20)\d{2})(?:年|-|/)(\d{1,2})(?:月|-|/)(\d{1,2})日?", period)
+        annual = re.fullmatch(r"((?:19|20)\d{2})(?:年度?|年度?末)?", period)
+        try:
+            target_date = (date(*map(int, exact_date.groups())) if exact_date
+                           else date(int(annual[1]), 12, 31) if annual else None)
+        except ValueError:
+            target_date = None
+        proposed = numeric_tokens(item.raw_value)
+        if len(values) != 2 or any(value <= 0 or value != value.to_integral_value() for value in values):
+            warnings.append("股本附注的股份总数期初/期末列不完整或不是正整数")
+        elif len(proposed) != 1 or proposed[0] != values[-1]:
+            warnings.append("科目数值冲突：候选股数不是股本附注股份总数的期末余额")
+        if source_date is None or target_date != source_date:
+            warnings.append("期间冲突：候选股数期末日未与股本附注明确日期一致")
+        else:
+            checks.update(period=str(source_date.year), period_end=source_date.isoformat(), year_column=source_date.year)
+        if item.unit != "股":
+            warnings.append("股本附注股份总数须以股计量；不得把实收资本金额作为股数")
+        else:
+            checks["unit"] = "股"
+        if draft.valuation_date and source_date and source_date > draft.valuation_date:
+            warnings.append("股数截止日晚于估值日，不能用于该时点的历史估值")
+        checks.update(
+            binding="issuer_share_capital_note",
+            source_row=row,
+            column_alignment="explicit_opening_closing_share_total",
+            par_value_evidence="ordinary shares; RMB 1 per share",
+        )
         if not warnings:
             checks["scope"] = "issuer"
         return list(dict.fromkeys(warnings)), checks
@@ -518,7 +736,7 @@ def _bind_issuer_share_change(item, block, draft, identity_text, checks, warning
     return list(dict.fromkeys(warnings)), checks
 
 
-def bind_evidence(item, block, context, draft, aliases=(), identity_text=""):
+def bind_evidence(item, block, context, draft, aliases=(), identity_text="", table_binding=None):
     """Return review reasons and machine-readable checks for one quoted value."""
     if item.role == "comparable":
         text = "\n".join(b.get("text", "") for b in context)
@@ -590,6 +808,16 @@ def bind_evidence(item, block, context, draft, aliases=(), identity_text=""):
     if item.unit not in {"%", "ratio"}:
         inline = [unit for unit in inline if unit != "%"]
     source_unit = (label_units or inline or units or [None])[-1]
+    if table_binding:
+        source_unit = (label_units or inline or units or [table_binding["unit"]])[-1]
+        checks["table_interpretation"] = table_binding
+        anchor = table_binding["anchors"]["header"]
+        if block["block_id"] == anchor["block_id"] and len(block_prefix.splitlines()) <= anchor["end_line"]:
+            warnings.append("TABLE_FUTURE_HEADER: 数值行位于所选表头之前，不能借用后文年度列")
+        if row_range := table_binding.get("data_ranges", {}).get(block["block_id"]):
+            source_range = "\n".join(block["text"].splitlines()[row_range[0] - 1:row_range[1]])
+            if not metric_line or compact(metric_line) not in compact(source_range):
+                warnings.append("TABLE_ROW_OUTSIDE: 数值不在该表声明的数据行范围内")
     if item.unit in {"ratio", "%"}:
         # A ratio/percentage row can override a currency table's general unit.
         source_unit = "%" if "%" in metric_line or "％" in metric_line else "ratio" if "ratio" in metric_line.lower() or "比例" in metric_line else source_unit
@@ -603,6 +831,8 @@ def bind_evidence(item, block, context, draft, aliases=(), identity_text=""):
     joint_columns = _joint_statement_columns(prefix)
     scopes = re.findall(SCOPE_PATTERN, scope_prefix)
     source_scope = {"合并": "consolidated", "母公司": "parent"}.get(scopes[-1] if scopes else "")
+    if table_binding:
+        source_scope = table_binding["scope"]
     if titles and "合并及公司" in titles[-1][0]:
         # Do not inherit another page's single-scope title for a mixed table.
         source_scope = item.scope if joint_columns and item.scope in {"consolidated", "parent"} else None
@@ -614,6 +844,8 @@ def bind_evidence(item, block, context, draft, aliases=(), identity_text=""):
         checks["scope"] = source_scope
 
     header, columns = _table_columns(prefix, metric_line)
+    if table_binding:
+        header, columns = table_binding["header"], table_binding["columns"]
     target = re.search(r"(?:19|20)\d{2}", item.period)
     target_year = int(target[0]) if target else None
     years = list(dict.fromkeys(int(v) for v in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", prefix)))
@@ -679,9 +911,32 @@ def bind_evidence(item, block, context, draft, aliases=(), identity_text=""):
             values = values[1:]
             checks["note_column_excluded"] = True
         amount = numeric_tokens(" " + item.raw_value)
-        if amount and len(values) == len(columns):
+        target_is_verified_blank = (
+            len(amount) == 1 and amount[0] == 0
+            and len(values) == len(columns)
+            and any(year == target_year and value is None
+                    for year, value in zip(columns, values))
+            and aligned is not None
+        )
+        if target_is_verified_blank:
+            checks.update(
+                year_column=target_year,
+                period=str(target_year),
+                column_header=header,
+                source_blank_as_zero=True,
+            )
+        elif amount and len(values) == len(columns):
             positions = [columns[i] for i, value in enumerate(values) if columns[i] is not None and value == amount[0]]
-            if positions and target_year not in positions:
+            unique_positions = list(dict.fromkeys(positions))
+            if target_year is None and len(unique_positions) == 1:
+                # This is not an LLM guess: the year header and value column
+                # are both recovered from the same source table.
+                inferred_year = unique_positions[0]
+                checks["year_column"] = inferred_year
+                checks["period"] = str(inferred_year)
+                checks["period_resolution"] = "unique_source_column"
+                checks["column_header"] = header
+            elif positions and target_year not in positions:
                 warnings.append("年度列冲突：该数值位于" + "、".join(map(str, positions)) + "年列")
                 checks.pop("period", None)
             elif target_year in positions:

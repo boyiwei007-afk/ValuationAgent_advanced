@@ -20,7 +20,7 @@ def test_loaded_pdf_page_window_is_not_reparsed_or_marked_partial(tmp_path, monk
     monkeypatch.setattr("valuationagent.application.research.parse_document", no_reparse)
     service._clients[session.session_id] = ScriptedModel([
         ("read_document", {"file_id": file_id, "start_page": 1, "limit": 8}),
-        ("finish_response", {"answer": "缺失估值必要数据", "deliver_outcome": True}),
+        ("finish_response", {"answer": "缺失估值必要数据", "outcome": "insufficient_data"}),
     ])
     state = service.turn(session.session_id, ResearchTurn(content="开始自动化DCF估值"))
     doc = next(d for d in state["session"]["documents"] if d["file_id"] == file_id)

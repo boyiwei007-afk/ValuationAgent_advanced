@@ -54,7 +54,7 @@ def test_zero_data_still_delivers_report_and_download_is_model_independent(tmp_p
     assert len([e for e in fresh.store.list_events(session.session_id) if e.type == "report.generated"]) == 1
 
 
-def test_search_budget_survives_restart_and_report_choice_does_not_call_model(tmp_path):
+def test_exhausted_target_survives_restart_without_closing_whole_task(tmp_path):
     model = RepeatingRetrievalModel()
     service, session, _ = configured_service(tmp_path, model)
     session.draft.ticker = ""
@@ -62,36 +62,35 @@ def test_search_budget_survives_restart_and_report_choice_does_not_call_model(tm
     service.search_provider = MockSearchProvider()
     service.store.save_research(session)
     first = service.turn(session.session_id, ResearchTurn(content="开始估值"))
-    assert model.calls == 4 and len(first["session"]["search_history"]) == 3
-    chosen = service.turn(session.session_id, ResearchTurn(question_id=first["session"]["question"]["question_id"], option_id="report"))
-    assert model.calls == 4 and chosen["result_document"]
-    assert chosen["session"]["question"] is None
+    assert model.calls == 7 and len(first["session"]["search_history"]) == 3
+    assert first["result_document"] and "question" not in first["session"]
     restarted = ResearchService(SQLiteRunStore(tmp_path), search_provider=MockSearchProvider())
     restarted.attach(session.session_id, model)
     again = restarted.turn(session.session_id, ResearchTurn(content="继续"))
-    assert model.calls == 5  # First new query is stopped, without another network request.
+    assert model.calls == 11
     assert len(again["session"]["search_history"]) == 3
+    assert not again["session"]["outcome_status"]
+    assert again["session"]["resume_context"]["reason"] == "AGENT_NO_PROGRESS"
     assert again["result_document"]["status"] == "insufficient_data"
 
 
 def test_report_api_accepts_no_upload_no_model_and_escapes_untrusted_text(tmp_path):
     app = create_app(tmp_path)
     with TestClient(app) as client:
-        created = client.post("/api/research-sessions", json={"data_source_preference": "web"}).json()
-        sid = created["session"]["session_id"]
-        assert created["session"]["data_source_preference"] == "web"
-        session = app.state.store.get_research(sid)
-        session.draft.company = '<script>alert(1)</script>'
+        created = client.post("/api/workspaces", json={"data_source_preference": "web"}).json()
+        workspace = created["workspace"]
+        session = app.state.store.get_research(workspace["research_session_id"])
+        session.draft.company = "<script>alert(1)</script>"
         app.state.store.save_research(session)
-        response = client.get(f"/api/research-sessions/{sid}/export?format=html")
-        assert response.status_code == 200 and '<script>' not in response.text
+        url = f"/api/workspaces/{workspace['workspace_id']}"
+        response = client.get(url + "/export?format=html")
+        assert response.status_code == 200 and "<script>" not in response.text
         assert "&lt;script&gt;" in response.text
-        pdf = client.get(f"/api/research-sessions/{sid}/export?format=pdf")
+        pdf = client.get(url + "/export?format=pdf")
         assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF")
         assert "attachment" in pdf.headers["content-disposition"]
-        assert client.get(f"/api/research-sessions/{sid}/export?format=exe").status_code == 422
-        snapshot = client.get(f"/api/research-sessions/{sid}?compact=true").json()
-        assert snapshot["result_document"] and "valuation_result" not in snapshot["result_document"]
+        assert client.get(url + "/export?format=exe").status_code == 422
+        assert client.get(url).json()["research"]["result_document"]
 
 
 def test_output_gate_blocks_corrupted_per_share_even_if_plugin_reports_success(tmp_path):
@@ -158,13 +157,34 @@ def test_unfinished_formal_run_also_has_pdf_and_explicitly_nonreplayable_json(tm
 
 def test_model_can_deliver_missing_data_outcome_without_another_confirmation(tmp_path):
     from test_research_sessions import ScriptedModel
-    model = ScriptedModel([("finish_response", {"answer": "缺项尚未取得，不输出价格。", "deliver_outcome": True})])
+    answer = "缺项尚未取得，不输出价格。"
+    model = ScriptedModel([("finish_response", {"answer": answer, "outcome": "insufficient_data"})])
     service, session, _ = configured_service(tmp_path, model)
     state = service.turn(session.session_id, ResearchTurn(content="开始估值"))
-    assert state["session"]["question"] is None
+    assert state["messages"][-1]["content"] == answer
+    assert state["session"]["outcome_status"] == "insufficient_data"
     assert state["result_document"]["status"] == "insufficient_data"
-    assert "无需确认继续多搜" in state["messages"][-1]["content"]
-    assert any(e["type"] == "valuation.outcome_closed" for e in state["events"])
+    assert not service.store.list_runs()
+
+
+def test_repeated_unchanged_reads_stop_early_and_preserve_non_numeric_report(tmp_path):
+    class EndlessInspections:
+        calls = 0
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            return {"tool_calls": [{"id": str(self.calls), "type": "function",
+                "function": {"name": "inspect_context", "arguments": "{}"}}]}
+    model = EndlessInspections()
+    service, session, _ = configured_service(tmp_path, model)
+    state = service.turn(session.session_id, ResearchTurn(content="检查资料"))
+    assert model.calls == 4
+    assert state["session"]["last_issue"]["code"] == "AGENT_NO_PROGRESS"
+    assert state["session"]["resume_context"]
+    assert any(event.type == "tool.failed" and event.tool == "inspect_context"
+               for event in service.store.list_events(session.session_id))
+    assert state["execution"]["status"] == "failed"
+    assert not state["result_document"]["numeric_result_available"]
+    assert not service.store.list_runs()
 
 
 def test_unsupported_missing_shares_paths_end_in_report_not_fake_approval(tmp_path):
@@ -178,9 +198,9 @@ def test_unsupported_missing_shares_paths_end_in_report_not_fake_approval(tmp_pa
     model = ScriptedModel([("finish_response", invalid), ("finish_response", invalid)])
     service, session, _ = configured_service(tmp_path, model)
     state = service.turn(session.session_id, ResearchTurn(content="开始自动化估值"))
-    assert state["session"]["question"] is None
+    assert "question" not in state["session"]
     assert state["session"]["valuation_run_id"] is None
     assert not state["result_document"]["numeric_result_available"]
     assert "采信普通股股数" not in state["messages"][-1]["content"]
-    assert "无需确认继续多搜" in state["messages"][-1]["content"]
+    assert state["session"]["last_issue"]["code"] == "AGENT_NO_PROGRESS"
     assert build_research_export(service, session.session_id, "pdf")[0].startswith(b"%PDF")

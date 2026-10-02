@@ -18,7 +18,7 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('var/delivery-benchmark'))
     args = parser.parse_args()
     app = create_app(args.output)
-    service, store = app.state.research, app.state.store
+    service, store = app.state.workspaces, app.state.store
     result = {"scope": "合成负载、本机耗时，不是生产SLA", "excel": [], "snapshots": []}
     for n in (100, 400, 800):
         book = Workbook()
@@ -35,10 +35,11 @@ def main():
         result['excel'].append({"rows": n, "median_seconds": round(statistics.median(durations), 4), "blocks": len(blocks)})
     with TestClient(app) as client:
         for n in (25, 250, 1000):
-            sid = service.create().session_id
+            workspace = service.create()
+            sid = workspace.research_session_id
             for _ in range(n):
                 store.append_event(sid, type='tool.completed', stage='research', status='completed', summary='synthetic event', payload={'text': 'x' * 20000})
-            url = f'/api/research-sessions/{sid}?compact=true'
+            url = f'/api/workspaces/{workspace.workspace_id}'
             durations = []
             for _ in range(5):
                 start = time.perf_counter()

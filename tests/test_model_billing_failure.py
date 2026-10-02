@@ -35,7 +35,22 @@ def test_billing_failure_keeps_outcome_without_retry_loop(tmp_path):
     service, session, _ = configured_service(tmp_path, BillingFailure())
     state = service.turn(session.session_id, ResearchTurn(content="开始自动化DCF估值"))
     assert state["session"]["last_issue"]["retryable"] is False
-    choices = {option["id"] for option in state["session"]["question"]["options"]}
-    assert "retry" not in choices
-    assert {"report", "reconnect"} <= choices
+    assert "question" not in state["session"]
+    assert state["execution"]["status"] == "failed"
+    assert "LLM_HTTP_402" in state["messages"][-1]["content"]
     assert state["result_document"]["status"] == "insufficient_data"
+
+
+def test_connection_failure_replaces_stale_checkpoint_reason(tmp_path):
+    class UnavailableModel:
+        def chat(self, *args, **kwargs):
+            raise LlmError("LLM_NETWORK_FAILED: 模型请求传输失败。")
+
+    service, session, _ = configured_service(tmp_path, UnavailableModel())
+    session.resume_context = {"reason": "TOOL_JSON_TRUNCATED", "instruction": "obsolete issue"}
+    service.store.save_research(session)
+    state = service.turn(session.session_id, ResearchTurn(content="继续"))
+    checkpoint = state["session"]["resume_context"]
+    assert checkpoint["reason"] == "LLM_NETWORK_FAILED" and checkpoint["request_id"]
+    assert "不自动切换模型" in checkpoint["instruction"]
+    assert "obsolete issue" not in str(checkpoint)

@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from valuationagent.schemas.models import (
     ChatMessage,
     RunEvent,
@@ -32,6 +34,10 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+class WorkspaceStateError(ValueError):
+    pass
+
+
 class SQLiteRunStore:
     """Small local run store. Secrets are deliberately kept out of this class."""
 
@@ -40,7 +46,7 @@ class SQLiteRunStore:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.upload_dir = self.data_dir / "uploads"
         self.upload_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.data_dir / "valuationagent.sqlite3"
+        self.db_path = self.data_dir / "workspace-agent.sqlite3"
         self._lock = threading.RLock()
         self._initialize()
 
@@ -60,6 +66,9 @@ class SQLiteRunStore:
             connection.executescript(
                 """
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS run_sources (
+                    run_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS research_jobs (
                     session_id TEXT NOT NULL, request_id TEXT NOT NULL, body_hash TEXT NOT NULL,
                     body_json TEXT NOT NULL, status TEXT NOT NULL, stage TEXT NOT NULL,
@@ -85,6 +94,11 @@ class SQLiteRunStore:
                     report_id TEXT NOT NULL, report_json TEXT NOT NULL,
                     summary_json TEXT NOT NULL,
                     PRIMARY KEY(session_id, report_id)
+                );
+                CREATE TABLE IF NOT EXISTS workspace_artifacts (
+                    session_id TEXT NOT NULL, artifact_id TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL, content BLOB NOT NULL,
+                    PRIMARY KEY(session_id, artifact_id)
                 );
                 CREATE TABLE IF NOT EXISTS lineage (
                     run_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, parent_id TEXT,
@@ -131,8 +145,254 @@ class SQLiteRunStore:
                     storage_path TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS valuation_workspaces (
+                    workspace_id TEXT PRIMARY KEY,
+                    research_session_id TEXT NOT NULL UNIQUE,
+                    revision INTEGER NOT NULL,
+                    workspace_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS valuation_workspaces_recent
+                    ON valuation_workspaces(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS workspace_records (
+                    workspace_id TEXT NOT NULL,
+                    record_kind TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(workspace_id, record_kind, record_id)
+                );
+                CREATE INDEX IF NOT EXISTS workspace_records_by_kind
+                    ON workspace_records(workspace_id, record_kind, created_at);
                 """
             )
+
+    _WORKSPACE_RECORD_IDS = {
+        "requirement": "requirement_id",
+        "evidence": "evidence_id",
+        "evidence_usage": "usage_id",
+        "fact": "fact_id",
+        "assumption": "assumption_id",
+        "action": "action_id",
+        "checkpoint": "checkpoint_id",
+        "finding": "finding_id",
+        "disposition": "disposition_id",
+        "decision": "decision_id",
+        "model_spec": "model_spec_id",
+        "calculation": "calculation_id",
+        "version": "version_id",
+    }
+
+    def create_workspace(self, workspace):
+        """Persist one workspace without duplicating its research-session data."""
+        with self._lock, self._connect() as db:
+            db.execute(
+                "INSERT INTO valuation_workspaces VALUES(?,?,?,?,?)",
+                (
+                    workspace.workspace_id,
+                    workspace.research_session_id,
+                    workspace.revision,
+                    workspace.model_dump_json(),
+                    workspace.updated_at.isoformat(),
+                ),
+            )
+        return workspace
+
+    def freeze_run_sources(self, run_id, session):
+        snapshot = {
+            "research": session.model_dump(mode="json"),
+            "source_blocks": {
+                document.file_id: self.research_blocks(session.session_id, document.file_id)
+                for document in session.documents
+            },
+            "research_events": [
+                event.model_dump(mode="json")
+                for event in self.list_events(session.session_id)
+            ],
+        }
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO run_sources(run_id,snapshot_json) VALUES(?,?) ON CONFLICT(run_id) DO NOTHING",
+                (run_id, _json(snapshot)),
+            )
+
+    def run_sources(self, run_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT snapshot_json FROM run_sources WHERE run_id=?", (run_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def get_workspace(self, workspace_id):
+        from valuationagent.schemas.workspace import ValuationWorkspace
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT workspace_json FROM valuation_workspaces WHERE workspace_id=?",
+                (workspace_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(workspace_id)
+        return ValuationWorkspace.model_validate_json(row[0])
+
+    def workspace_for_research(self, research_session_id):
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT workspace_id FROM valuation_workspaces WHERE research_session_id=?",
+                (research_session_id,),
+            ).fetchone()
+        return self.get_workspace(row[0]) if row else None
+
+    def workspace_for_run(self, run_id):
+        """Return the workspace that owns a valuation run, if any.
+
+        The lookup deliberately uses the immutable version/model-spec records
+        instead of mutable UI state.  A historical V1 therefore remains
+        discoverable after V2 becomes active.
+        """
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT workspace_id,record_json FROM workspace_records
+                   WHERE record_kind IN ('version','model_spec')
+                   ORDER BY created_at"""
+            ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["record_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if payload.get("run_id") == run_id:
+                return self.get_workspace(row["workspace_id"])
+        return None
+
+    def save_workspace(self, workspace):
+        """Optimistic workspace update; stale browser tabs cannot overwrite state."""
+        previous = workspace.revision
+        updated = workspace.model_copy(
+            update={"revision": previous + 1, "updated_at": _utc_now()}
+        )
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                """UPDATE valuation_workspaces
+                   SET revision=?,workspace_json=?,updated_at=?
+                   WHERE workspace_id=? AND revision=?""",
+                (
+                    updated.revision,
+                    updated.model_dump_json(),
+                    updated.updated_at.isoformat(),
+                    workspace.workspace_id,
+                    previous,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("工作区已被更新，请刷新后重试。")
+        workspace.revision = updated.revision
+        workspace.updated_at = updated.updated_at
+        return workspace
+
+    def list_workspaces(self, limit=30):
+        from valuationagent.schemas.workspace import ValuationWorkspace
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT workspace_json FROM valuation_workspaces ORDER BY updated_at DESC LIMIT ?",
+                (max(1, min(limit, 100)),),
+            ).fetchall()
+        return [ValuationWorkspace.model_validate_json(row[0]) for row in rows]
+
+    def delete_workspace(self, workspace_id, *, expected_revision):
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            workspace = db.execute("SELECT * FROM valuation_workspaces WHERE workspace_id=?", (workspace_id,)).fetchone()
+            if workspace is None:
+                raise KeyError(workspace_id)
+            if workspace["revision"] != expected_revision:
+                raise ValueError("任务已更新，请刷新历史列表后重新确认删除。")
+            session_id = workspace["research_session_id"]
+            if db.execute("SELECT 1 FROM research_jobs WHERE session_id=? AND status IN ('queued','running')", (session_id,)).fetchone():
+                raise ValueError("任务仍在排队或执行，请先停止并等待执行结束，再删除。")
+            run_ids = {row[0] for row in db.execute(
+                "SELECT json_extract(record_json,'$.run_id') FROM workspace_records WHERE workspace_id=?", (workspace_id,)
+            ) if row[0]}
+            payload = json.loads(workspace["workspace_json"])
+            if payload.get("active_run_id"):
+                run_ids.add(payload["active_run_id"])
+            session = db.execute("SELECT session_json FROM research_sessions WHERE session_id=?", (session_id,)).fetchone()
+            if session and json.loads(session[0]).get("valuation_run_id"):
+                run_ids.add(json.loads(session[0])["valuation_run_id"])
+            lineage = db.execute("SELECT run_id,root_id FROM lineage").fetchall()
+            roots = {row["root_id"] for row in lineage if row["run_id"] in run_ids}
+            run_ids.update(row["run_id"] for row in lineage if row["root_id"] in roots)
+            other_refs = db.execute("SELECT json_extract(record_json,'$.run_id') FROM workspace_records WHERE workspace_id<>?", (workspace_id,)).fetchall()
+            other_refs += db.execute("SELECT json_extract(workspace_json,'$.active_run_id') FROM valuation_workspaces WHERE workspace_id<>?", (workspace_id,)).fetchall()
+            other_refs += db.execute("SELECT json_extract(session_json,'$.valuation_run_id') FROM research_sessions WHERE session_id<>?", (session_id,)).fetchall()
+            if run_ids.intersection(row[0] for row in other_refs):
+                raise ValueError("存在其他任务引用的计算版本，不能连带删除；请先处理共享引用。")
+            for run_id in {session_id, *run_ids}:
+                if db.execute("SELECT 1 FROM leases WHERE run_id=? AND expires>?", (run_id, time.time())).fetchone():
+                    raise ValueError("任务仍持有执行锁，请等待执行结束后再删除。")
+            for run_id in run_ids:
+                if db.execute("SELECT 1 FROM runs WHERE run_id=? AND status IN ('created','running')", (run_id,)).fetchone():
+                    raise ValueError("计算仍在排队或执行，请先停止并等待执行结束，再删除。")
+            for run_id in {session_id, *run_ids}:
+                for table in ("messages", "events", "event_summaries", "leases", "run_sources", "lineage", "runs"):
+                    db.execute(f"DELETE FROM {table} WHERE run_id=?", (run_id,))
+                db.execute("DELETE FROM checkpoints WHERE run_id=? OR root_id=?", (run_id, run_id))
+            for table in ("research_jobs", "research_documents", "research_reports", "workspace_artifacts", "research_sessions"):
+                db.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))
+            db.execute("DELETE FROM workspace_records WHERE workspace_id=?", (workspace_id,))
+            db.execute("DELETE FROM valuation_workspaces WHERE workspace_id=?", (workspace_id,))
+        return {"session_id": session_id, "run_ids": sorted(run_ids)}
+
+    def save_workspace_record(self, workspace_id, kind, record, *, immutable=False):
+        id_field = self._WORKSPACE_RECORD_IDS.get(kind)
+        if not id_field:
+            raise ValueError(f"unsupported workspace record kind: {kind}")
+        record_id = getattr(record, id_field)
+        now = _utc_now().isoformat()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM valuation_workspaces WHERE workspace_id=?", (workspace_id,)).fetchone():
+                raise KeyError(workspace_id)
+            if immutable and db.execute(
+                "SELECT 1 FROM workspace_records WHERE workspace_id=? AND record_kind=? AND record_id=?",
+                (workspace_id, kind, record_id),
+            ).fetchone():
+                raise ValueError(f"immutable {kind} already exists: {record_id}")
+            db.execute(
+                """INSERT INTO workspace_records
+                   (workspace_id,record_kind,record_id,record_json,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(workspace_id,record_kind,record_id) DO UPDATE SET
+                       record_json=excluded.record_json, updated_at=excluded.updated_at""",
+                (workspace_id, kind, record_id, record.model_dump_json(), now, now),
+            )
+        return record
+
+    def get_workspace_record(self, workspace_id, kind, record_id, model):
+        if kind not in self._WORKSPACE_RECORD_IDS:
+            raise ValueError(f"unsupported workspace record kind: {kind}")
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT record_json FROM workspace_records
+                   WHERE workspace_id=? AND record_kind=? AND record_id=?""",
+                (workspace_id, kind, record_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(record_id)
+        return model.model_validate_json(row[0])
+
+    def list_workspace_records(self, workspace_id, kind, model, *, limit=500):
+        if kind not in self._WORKSPACE_RECORD_IDS:
+            raise ValueError(f"unsupported workspace record kind: {kind}")
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT record_json FROM workspace_records
+                   WHERE workspace_id=? AND record_kind=?
+                   ORDER BY created_at, rowid LIMIT ?""",
+                (workspace_id, kind, max(1, min(limit, 2000))),
+            ).fetchall()
+        return [model.model_validate_json(row[0]) for row in rows]
 
     def create_run(
         self,
@@ -336,6 +596,8 @@ class SQLiteRunStore:
         now = time.time()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM research_sessions WHERE session_id=?", (session_id,)).fetchone():
+                raise KeyError(session_id)
             row = db.execute("SELECT * FROM research_jobs WHERE session_id=? AND request_id=?", (session_id, request_id)).fetchone()
             if row:
                 if row["body_hash"] != digest:
@@ -477,6 +739,8 @@ class SQLiteRunStore:
     def acquire(self, run_id: str, owner: str) -> bool:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM runs WHERE run_id=? UNION ALL SELECT 1 FROM research_sessions WHERE session_id=?", (run_id, run_id)).fetchone():
+                raise KeyError(run_id)
             row = db.execute(
                 "SELECT expires FROM leases WHERE run_id=?", (run_id,)
             ).fetchone()
@@ -519,7 +783,13 @@ class SQLiteRunStore:
             row = db.execute("SELECT session_json FROM research_sessions WHERE session_id=?", (session_id,)).fetchone()
         if row is None:
             raise KeyError(session_id)
-        return ResearchSession.model_validate_json(row[0])
+        try:
+            return ResearchSession.model_validate_json(row[0])
+        except ValidationError:
+            raise WorkspaceStateError(
+                "WORKSPACE_STATE_INCOMPATIBLE: 此工作区记录与当前数据契约不匹配（旧格式或损坏）。"
+                "原始记录未修改，也不会自动套用旧流程。请重启当前服务并新建工作区；原文件保留供归档。"
+            ) from None
 
     def save_research(self, session):
         previous = session.revision
@@ -560,6 +830,9 @@ class SQLiteRunStore:
 
     def save_research_blocks(self, session_id, file_id, blocks):
         with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM research_sessions WHERE session_id=?", (session_id,)).fetchone():
+                raise KeyError(session_id)
             db.execute("INSERT OR REPLACE INTO research_documents VALUES(?,?,?)", (session_id, file_id, _json(blocks)))
 
     def research_source_location(self, session_id, file_id):
@@ -574,3 +847,42 @@ class SQLiteRunStore:
         if row is None:
             raise ValueError("文件尚未加入当前会话，请先上传。")
         return json.loads(row[0])
+
+    def save_artifact(self, session_id, metadata, content):
+        if not isinstance(content, bytes) or not content or len(content) > 10 * 1024 * 1024:
+            raise ValueError("ARTIFACT_SIZE_LIMIT: 输出文件必须在1字节至10 MB之间。")
+        digest = hashlib.sha256(content).hexdigest()
+        identity = hashlib.sha256((session_id + _json(metadata) + ("" if metadata.get("kind") == "result_report" else digest)).encode()).hexdigest()[:32]
+        artifact_id = "artifact_" + identity
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM research_sessions WHERE session_id=?", (session_id,)).fetchone():
+                raise ValueError("ARTIFACT_SCOPE_INVALID: 工作区不存在。")
+            existing = db.execute("SELECT metadata_json, content FROM workspace_artifacts WHERE session_id=? AND artifact_id=?", (session_id, artifact_id)).fetchone()
+            if existing:
+                record = json.loads(existing[0])
+                if record["sha256"] != hashlib.sha256(existing[1]).hexdigest() or record["size_bytes"] != len(existing[1]):
+                    raise ValueError("ARTIFACT_INTEGRITY: 已有输出文件完整性检查失败。")
+                return record
+            count, size = db.execute("SELECT count(*), coalesce(sum(length(content)),0) FROM workspace_artifacts WHERE session_id=?", (session_id,)).fetchone()
+            if count >= 100 or size + len(content) > 50 * 1024 * 1024:
+                raise ValueError("ARTIFACT_QUOTA: 工作区输出达到100个文件或50 MB限额。")
+            record = {**metadata, "artifact_id": artifact_id, "sha256": digest,
+                      "size_bytes": len(content), "created_at": _utc_now().isoformat(), "number": count + 1}
+            db.execute("INSERT INTO workspace_artifacts VALUES(?,?,?,?)", (session_id, artifact_id, _json(record), content))
+            return record
+
+    def list_artifacts(self, session_id):
+        with self._connect() as db:
+            rows = db.execute("SELECT metadata_json FROM workspace_artifacts WHERE session_id=? ORDER BY rowid DESC", (session_id,)).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def get_artifact(self, session_id, artifact_id):
+        with self._connect() as db:
+            row = db.execute("SELECT metadata_json, content FROM workspace_artifacts WHERE session_id=? AND artifact_id=?", (session_id, artifact_id)).fetchone()
+        if row is None:
+            raise ValueError("ARTIFACT_NOT_FOUND: 输出文件不属于当前工作区。")
+        metadata, content = json.loads(row[0]), bytes(row[1])
+        if metadata["sha256"] != hashlib.sha256(content).hexdigest() or metadata["size_bytes"] != len(content):
+            raise ValueError("ARTIFACT_INTEGRITY: 输出文件完整性检查失败。")
+        return metadata, content

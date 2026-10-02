@@ -15,7 +15,6 @@ def scope_key(session):
 
 def preview_session(session, fact_ids=None):
     preview = session.model_copy(deep=True)
-    preview.question = None
     online_ticker = session.data_source_preference == "online" and bool(session.draft.ticker)
     candidates = {f.fact_id for f in preview.facts if f.status == "proposed" and not f.warnings
                   and (not online_ticker or f.role == "assumption")
@@ -93,10 +92,22 @@ def valuation_progress(session, assembler):
                 break
 
     if request is None:
-        scope_unsupported = bool(requested_methods and set(requested_methods) <= {"dcf", "ev_ebitda"}
-                                 and assembler.model_scope_issue(preview))
+        timing_issue = assembler.capital_structure_timing_issue(preview)
+        capital_action_unsupported = bool(
+            timing_issue and timing_issue["kind"] == "unsupported_model_scope"
+        )
+        bridge_scope_unsupported = bool(
+            requested_methods
+            and set(requested_methods) <= {"dcf", "ev_ebitda"}
+            and assembler.model_scope_issue(preview)
+        )
+        scope_unsupported = capital_action_unsupported or bridge_scope_unsupported
+        from valuationagent.application.observation_extraction import observation_next_action
+
         evidence_issues = [{"fact_id": f.fact_id, "metric": f.metric, "period": f.period,
-                            "warnings": list(f.warnings)} for f in assembler.pending_blockers(preview) if f.warnings]
+                            "role": f.role, "peer_ticker": f.peer_ticker,
+                            "warnings": list(f.warnings), "next_action": observation_next_action(f)}
+                           for f in assembler.pending_blockers(preview) if f.warnings]
         suggested_source_blocks = []
         if (
             any("股" in item["metric"] or "shares" in item["metric"] for item in evidence_issues)
@@ -120,8 +131,31 @@ def valuation_progress(session, assembler):
                 "suggested_source_blocks": suggested_source_blocks,
                 "staged_fact_ids": staged, "confirmed_fact_count": candidate_counts["confirmed"],
                 "candidate_counts": candidate_counts,
+                "capital_structure": timing_issue,
                 "instruction": ("当前所选方法需要尚未实现的专业调整，继续补普通财务字段也不能解除；立即交付说明报告，不要持续检索或承诺补一项就能计算。用户可另行明确更换方法。"
-                                if scope_unsupported else "只补当前模型必要输入。有股数来源警告时先检查suggested_source_blocks中的有日期发行人总股本原文，引用准确片段和截止日重新提交；该提示不是自动确认。基期完整但历史不足时，可调用propose_forecast提出有依据的十年三情景预测，最终由用户集中确认。历史缺失不可用假设、零值或搜索摘要替代。")}
+                                if scope_unsupported else "按evidence_issues.next_action处理具体候选；主体矛盾的解释撤回后按真实公司重新extract_observations，不改写任务主体。其余解释错误用extract_observations及replaces更正。股数时效缺口定向取得新披露，不以中报利润替换全年利润。没有证据变化时不再轮询本检查，转去读取、补证或结束并交付缺口。review模式等批准，automatic模式可生成草案；历史缺失不可用假设、零值或搜索摘要替代。")}
+    recoverable_repairs = assembler.recoverable_driver_repairs(
+        session, request.financials,
+    )
+    if recoverable_repairs:
+        return {
+            "status": "quality_repair_required",
+            "ready_for_review": False,
+            "blocking_reason": "正式年报中的资本开支基础科目已完成数值取证，但语义映射尚未合格；不能在可修复时静默改用比例回退。",
+            "blocking_detail": (
+                "请基于现有原文更正一个候选：保留原始科目名，映射为"
+                "cash_paid_for_ppe_intangibles，semantic_role=investing，"
+                "EBIT=exclude、FCFF=include、equity_bridge=exclude；由程序推导capital_expenditure。"
+            ),
+            "recoverable_driver_repairs": recoverable_repairs[:4],
+            "staged_fact_ids": staged,
+            "confirmed_fact_count": candidate_counts["confirmed"],
+            "candidate_counts": candidate_counts,
+            "instruction": (
+                "不要检索新资料，也不要提交估值方案。调用inspect_context读取列出的候选及原文，"
+                "用extract_observations和replaces更正其中一个候选的语义映射，再prepare_observation_review/review_observations；通过后重新check_preparation。"
+            ),
+        }
     degraded = bool(exclusions)
     return {"status": "ready_for_review", "ready_for_review": True, "blocking_reason": "",
             "staged_fact_ids": staged, "methods": request.methods,
@@ -147,8 +181,8 @@ def valuation_progress(session, assembler):
             ],
              "candidate_counts": candidate_counts,
             "instruction": (
-                "至少一种已选方法具备可靠输入。立即调用request_formal_valuation集中复核可执行方法及排除原因；"
+                "至少一种已选方法具备可靠输入。调用calculate_valuation冻结可执行方法及排除原因；review模式等待批准，automatic模式生成草案。"
                 "不要让缺数据的方法继续阻塞已有估值。"
                 if degraded else
-                "必要输入已齐备，立即调用request_formal_valuation集中复核并提交；不要继续搜集不影响本次模型的资料。"
+                "必要输入已齐备，调用calculate_valuation冻结并提交；review模式等待批准，automatic模式生成草案。不要继续搜集无关资料。"
             )}

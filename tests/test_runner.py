@@ -80,20 +80,3 @@ def test_unconfigured_ticker_adapter_is_explicit(tmp_path):
     assert record.status == RunStatus.WAITING_REVIEW
     assert record.review["code"] == "DATA_INPUT_UNAVAILABLE"
     assert "TUSHARE_TOKEN" in record.review["message"]
-
-
-def test_conversation_explains_assumptions(tmp_path):
-    store, runner = make_runner(tmp_path)
-    record = runner.run(
-        ValuationRequest(
-            company=CompanyInput(name="对话样例"),
-            valuation_date=date(2026, 9, 12),
-            mode=RunMode.DEMO,
-        )
-    )
-
-    response = runner.answer(record.run_id, "本次用了哪些假设？")
-
-    assert "WACC" in response
-    assert "永续增长率" in response
-    assert store.list_messages(record.run_id)[-1].role == "assistant"

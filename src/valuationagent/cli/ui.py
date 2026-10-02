@@ -1,481 +1,161 @@
-from __future__ import annotations
+"""Rich presentation for the unified workspace, independent of agent decisions."""
 import time
 from concurrent.futures import ThreadPoolExecutor
+
 from rich import box
 from rich.align import Align
 from rich.console import Console, Group
+from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.live import Live
-from rich.progress_bar import ProgressBar
 from rich.theme import Theme
-from valuationagent.workflow.graph import STAGES
-from valuationagent.core.i18n import translator
 
-THEME = Theme(
-    {
-        "accent": "#5EEAD4",
-        "title": "bold #E2E8F0",
-        "muted": "#94A3B8",
-        "good": "#6EE7B7",
-        "warn": "#FBBF24",
-        "bad": "#FB7185",
-        "border": "#33465F",
-    }
-)
-console = Console(theme=THEME, highlight=False)
-STATUS = {
-    "created": ("待执行", "muted"),
-    "running": ("执行中", "accent"),
-    "waiting_review": ("待复核", "warn"),
-    "completed": ("已完成", "good"),
-    "completed_with_warnings": ("完成 · 有提示", "warn"),
-    "failed": ("执行失败", "bad"),
-    "cached": ("已复用", "accent"),
-    "cancelled": ("已取消", "muted"),
-}
-TOOL_LABELS = {
-    "resolve_financial_input": "读取资料与来源",
-    "inspect_financials": "Agent 检查财务",
-    "inspect_comparables": "Agent 检查同业",
-    "continue_valuation": "Agent 提交执行",
-    "validate_financials": "审核财务规则",
-    "resolve_assumptions": "形成经营假设",
-    "forecast_financials": "预测自由现金流",
-    "calculate_dcf": "计算 DCF 估值",
-    "calculate_relative_valuation": "计算相对估值",
-    "run_sensitivity": "重算敏感性网格",
-    "reconcile_valuations": "比较估值区间",
-}
+console = Console(highlight=False, theme=Theme({
+    "accent": "#5EEAD4", "muted": "#94A3B8", "good": "#6EE7B7",
+    "warn": "#FBBF24", "bad": "#FB7185", "title": "bold #E2E8F0",
+}))
 BACKGROUND = "#E2E8F0 on #101B2D"
+TOOL_LABELS = {
+    "extract_observations": "按原文片段提交LLM解释", "prepare_observation_review": "读取原文复核包",
+    "review_observations": "复核主体、金额与会计口径", "inspect_extraction_progress": "选择未尝试的取证策略",
+    "list_files": "浏览统一文件工作区", "inspect_file": "检查文件结构与可用视图",
+    "read_file": "按页或单元格读取原文", "view_pdf_page": "查看原始页图",
+    "begin_file_task": "聚焦单份原文理解", "end_file_task": "返回估值主流程",
+    "search_file": "全文检索并定位原文页码",
+    "analyze_sensitivity": "按指定情景试算并保留原模型",
+    "write_workspace_report": "生成可追溯报告", "write_research_note": "保存未审阅研究笔记",
+    "list_artifacts": "查看文件交付清单", "read_artifact": "回读已生成文件",
+    "planning": "整理任务与续做检查点", "inspect_requirements": "核对模型字段与年度覆盖",
+    "search_sources": "检索公开披露", "fetch_search_source": "下载并保存原文",
+    "read_document": "定位原文与年度列", "parse_document": "解析附件",
+    "fetch_financial_history": "批量取得多年财务快照", "read_financial_evidence": "批量读取相关原文",
+    "corroborate_facts": "交叉核对多源字段",
+    "reject_candidates": "撤回错误候选并保留依据",
+    "check_preparation": "检查确定性输入", "update_plan": "更新任务计划",
+    "propose_forecast": "提出预测假设", "calculate_valuation": "冻结输入并计算",
+    "read_valuation": "复核计算结果", "finish_response": "整理本轮结论", "saved": "进度已保存",
+}
+WORDMARK = (
+    ' _    __      __            __  _             ___                    __',
+    '| |  / /___ _/ /_  ______ _/ /_(_)___  ____  /   | ____ ____  ____  / /_',
+    '| | / / __ `/ / / / / __ `/ __/ / __ \\/ __ \\/ /| |/ __ `/ _ \\/ __ \\/ __/',
+    '| |/ / /_/ / / /_/ / /_/ / /_/ / /_/ / / / / ___ / /_/ /  __/ / / / /_',
+    '|___/\\__,_/_/\\__,_/\\__,_/\\__/_/\\____/_/ /_/_/  |_\\__, /\\___/_/ /_/\\__/',
+    '                                                /____/',
+)
 
 
 def panel(body, title="", **kwargs):
-    return Panel(
-        body,
-        title=Text(title, style="muted"),
-        border_style="border",
-        style=BACKGROUND,
-        padding=(1, 2),
-        box=box.ROUNDED,
-        safe_box=False,
-        **kwargs,
-    )
+    return Panel(body, title=Text(title, style="#94A3B8"), border_style="#33465F",
+                 style=BACKGROUND, box=box.ROUNDED, padding=(1, 2), **kwargs)
 
 
-def banner(language="zh-CN"):
-    _ = translator(language)
-    title = Text()
-    title.append("V / A  ", style="bold #5EEAD4")
-    title.append("VALUATION AGENT", style="title")
-    title.append("   " + _("估值研究工作台") + "\n", style="muted")
-    title.append(_("资料与依据  /  经营假设  /  估值与复核"), style="muted")
-    return panel(title)
+class Welcome:
+    def __rich_console__(self, target, options):
+        width = min(options.max_width, 116)
+        logo = Group(*(Text(line, style="#5EEAD4", no_wrap=True) for line in WORDMARK)) if width >= 94 and target.height >= 28 else Text("V / A\nValuationAgent", justify="center", style="bold #5EEAD4")
+        workflow = "01  任务与计划    →  02  多年证据\n03  事实核验      →  04  假设与计算\n05  风险复核      →  06  报告与复算" if width >= 56 else "01  任务与计划\n02  多年证据\n03  事实核验\n04  假设与计算\n05  风险复核\n06  报告与复算"
+        yield Align.center(panel(Group(
+            Align.center(logo), Text(""),
+            Text("Agent-powered valuation research", justify="center", style="bold #E2E8F0"),
+            Text("自由对话 · 原文取证 · 确定性估值", justify="center", style="#94A3B8"),
+            Text(""), Text("WORKFLOW  /  可追溯工作台", style="#5EEAD4"),
+            Text(workflow, style="#CBD5E1"),
+            Text(""), Text("直接描述目标即可开始。模型和搜索在终端内配置。", style="#94A3B8"),
+        ), "Welcome to ValuationAgent", width=width))
 
 
-# Keep the same flowing slant font used by the TradingAgents welcome screen.
-# It is embedded as plain ASCII so the CLI has no font download or runtime
-# dependency. Thin strokes remain sharp in Windows Terminal and SVG previews.
-_WORDMARKS = {
-    'full': (
-        ' _    __      __            __  _             ___                    __',
-        '| |  / /___ _/ /_  ______ _/ /_(_)___  ____  /   | ____ ____  ____  / /_',
-        '| | / / __ `/ / / / / __ `/ __/ / __ \\/ __ \\/ /| |/ __ `/ _ \\/ __ \\/ __/',
-        '| |/ / /_/ / / /_/ / /_/ / /_/ / /_/ / / / / ___ / /_/ /  __/ / / / /_',
-        '|___/\\__,_/_/\\__,_/\\__,_/\\__/_/\\____/_/ /_/_/  |_\\__, /\\___/_/ /_/\\__/',
-        '                                                /____/',
-    ),
-    'valuation': (
-        ' _    __      __            __  _',
-        '| |  / /___ _/ /_  ______ _/ /_(_)___  ____',
-        '| | / / __ `/ / / / / __ `/ __/ / __ \\/ __ \\',
-        '| |/ / /_/ / / /_/ / /_/ / /_/ / /_/ / / / /',
-        '|___/\\__,_/_/\\__,_/\\__,_/\\__/_/\\____/_/ /_/',
-        '',
-    ),
-    'agent': (
-        '    ___                    __',
-        '   /   | ____ ____  ____  / /_',
-        '  / /| |/ __ `/ _ \\/ __ \\/ __/',
-        ' / ___ / /_/ /  __/ / / / /_',
-        '/_/  |_\\__, /\\___/_/ /_/\\__/',
-        '      /____/',
-    ),
-}
-
-def _wordmark(name, color):
-    return Group(
-        *(Text(line, style=color, no_wrap=True) for line in _WORDMARKS[name])
-    )
-
-def welcome(width=116, height=40):
-    """Entrance screen, sized independently of the compact execution dashboard."""
-    width = min(width, 116)
-    teal, blue = "#5EEAD4", "#60A5FA"
-    compact = height < (30 if width >= 94 else 36)
-    if width >= 94 and not compact:
-        logo = _wordmark("full", teal)
-    elif width >= 62 and not compact:
-        logo = Group(
-            Align.center(_wordmark("valuation", teal)),
-            Text(""),
-            Align.center(_wordmark("agent", blue)),
-        )
-    else:
-        logo = Text("ValuationAgent", style=teal, justify="center")
-    intro = Text(
-        "Agent-powered financial modeling & valuation research",
-        style="title",
-        justify="center",
-    )
-    tagline = Text(
-        "Traceable data. Explicit assumptions. Reproducible valuations.",
-        style="muted",
-        justify="center",
-    )
-    steps = [
-        ("I", "Data & Evidence"),
-        ("II", "Financial Review"),
-        ("III", "Assumptions & Forecast"),
-        ("IV", "DCF & Multiples"),
-        ("V", "Sensitivity & Validation"),
-        ("VI", "Report & Dialogue"),
-    ]
-    flow = Text()
-    per_line = 3 if width >= 100 else 2 if width >= 76 else 1
-    for index, (numeral, label) in enumerate(steps):
-        if index:
-            flow.append("\n" if index % per_line == 0 else "  →  ", style="muted")
-        flow.append(numeral + ". ", style="bold #60A5FA")
-        flow.append(label, style="#CBD5E1")
-    body = Group(
-        Text(""),
-        Align.center(logo),
-        Text(""),
-        intro,
-        tagline,
-        Text(""),
-        Text("WORKFLOW", style="bold #5EEAD4"),
-        flow,
-        Text(""),
-    )
-    if compact:
-        body = Group(
-            Align.center(logo),
-            Text(""),
-            intro,
-            Text(""),
-            Text("WORKFLOW", style="bold #5EEAD4"),
-            flow,
-        )
-    return Align.center(
-        Panel(
-            body,
-            width=width,
-            title=Text(" Welcome to ValuationAgent ", style=teal),
-            subtitle=Text(" FINANCIAL MODELING  /  VALUATION RESEARCH ", style="muted"),
-            border_style="#299A91",
-            style=BACKGROUND,
-            padding=(1, 3),
-            box=box.ROUNDED,
-            safe_box=False,
-        )
-    )
+def welcome():
+    return Welcome()
 
 
-def number(value):
-    return "—" if value is None else f"{value:,.2f}"
+def conversation(content, role="assistant"):
+    body = Markdown(content, hyperlinks=False) if role == "assistant" else Text(content)
+    return panel(body, "ValuationAgent · 回答与依据" if role == "assistant" else "你 · 目标与补充")
 
 
-def result_view(record):
-    _ = translator(record.request.language)
-    if not record.result:
-        info = (record.review or record.error or {}).get(
-            "message", _("任务尚未形成结果。")
-        )
-        return panel(Text(info, style="warn"), _("需要处理"))
-    result = record.result
-    table = Table(
-        box=box.SIMPLE_HEAD,
-        expand=True,
-        header_style="muted",
-        show_edge=False,
-        padding=(0, 1),
-    )
-    table.add_column(_("估值方法"))
-    table.add_column(_("基准 / 股"), justify="right", style="accent")
-    table.add_column(_("区间 / 股"), justify="right")
-    if result.dcf:
-        d = result.dcf
-        table.add_row(
-            _("DCF · 现金流折现"),
-            number(d.per_share_value),
-            f"{number(d.range_low)} — {number(d.range_high)}",
-        )
-    for r in result.relative:
-        table.add_row(
-            _(
-                {
-                    "pe": "P/E · 市盈率",
-                    "ps": "P/S · 市销率",
-                    "ev_ebitda": "EV/EBITDA",
-                }.get(r.method, r.method)
-            ),
-            number(r.per_share_value),
-            f"{number(r.range_low)} — {number(r.range_high)}"
-            if r.status == "success"
-            else r.reason,
-        )
-    caption = Text(
-        f"{result.currency}  ·  {result.valuation_date}  ·  v{record.revision}  ·  {result.mode.upper()}\n",
-        style="muted",
-    )
-    caption.append(result.reconciliation.conclusion, style="muted")
-    if result.warnings:
-        caption.append("\n" + "；".join(result.warnings), style="warn")
-    caption.append(
-        _("\n参考模型，待金融团队核准。")
-        if result.model_version.endswith("-reference")
-        else _("\n金融小组非金融行业模型；参数版本与降级决策随结果保存。"),
-        style="muted",
-    )
-    return panel(Group(table, caption), _("估值结果"))
+def decision_view(decision):
+    rows = [Text(decision["question"], style="bold #E2E8F0")]
+    for index, option in enumerate(decision["options"], 1):
+        rows.extend([Text(f"{index} / {chr(64 + index)}  {option['label']}", style="#5EEAD4"),
+                     Text(option["description"], style="#94A3B8")])
+    rows.append(Text("输入序号或字母选择，可追加说明；也可以直接输入自己的方案。", style="#FBBF24"))
+    return panel(Group(*rows), "方案选择 · 保留自由对话")
 
 
-def dashboard(record, events, elapsed, width=110, height=40):
-    _ = translator(record.request.language)
-    statuses = {stage: "created" for stage, _ in STAGES}
-    cached = set()
-    for event in events:
-        if event.type.startswith("stage.") and event.stage in statuses:
-            statuses[event.stage] = event.status or "created"
-        if event.type == "tool.cached":
-            cached.add(event.stage)
-    done = sum(v == "completed" for v in statuses.values())
-    completed_calls = sum(e.type == "tool.completed" for e in events)
-    cached_calls = sum(e.type == "tool.cached" for e in events)
-    state, color = STATUS.get(record.status, (record.status, "muted"))
-    company = (
-        record.request.company.name or record.request.company.ticker or _("未命名公司")
-    )
-    head = Text()
-    head.append("V / A   ", style="bold #5EEAD4")
-    head.append(company, style="title")
-    head.append(f"    {_(state)}", style=color)
-    head.append(
-        f"\n{record.request.valuation_date}  ·  {record.request.mode.upper()}  ·  v{record.revision}",
-        style="muted",
-    )
-    progress = Table.grid(expand=True)
-    progress.add_column(ratio=1)
-    progress.add_column(width=17, justify="right")
-    progress.add_row(
-        ProgressBar(
-            total=len(STAGES),
-            completed=done,
-            width=None,
-            complete_style="#299A91",
-            finished_style="#5EEAD4",
-        ),
-        Text(f"{done:02d} / {len(STAGES)}   {elapsed:4.1f}s", style="muted"),
-    )
-    stage_table = Table.grid(padding=(0, 1), expand=True)
-    stage_table.add_column(width=2)
-    stage_table.add_column(ratio=1)
-    stage_table.add_column(justify="right")
-    compact = height < 32 or width < 88
-    show = STAGES
-    if compact:
-        index = next(
-            (
-                i
-                for i, (stage, _) in enumerate(STAGES)
-                if statuses[stage] != "completed"
-            ),
-            len(STAGES) - 1,
-        )
-        show = STAGES[max(0, index - 1) : index + 2]
-    for index, (stage, label) in enumerate(STAGES):
-        if (stage, label) not in show:
-            continue
-        status = statuses[stage]
-        title, style = STATUS.get(status, (status, "muted"))
-        if stage in cached and status == "completed":
-            title, style = "复用", "accent"
-        marker = "●" if status == "running" else "✓" if status == "completed" else "!"
-        if status == "created":
-            marker = "·"
-        stage_table.add_row(
-            Text(marker, style=style),
-            Text(_(label), style="title" if status == "running" else "muted"),
-            Text(_(title), style=style),
-        )
-    feed = []
-    settled = {
-        e.tool_call_id for e in events if e.type in ("tool.completed", "tool.failed")
-    }
-    relevant = [
-        e
-        for e in events
-        if e.type
-        in (
-            "conversation.message",
-            "tool.started",
-            "tool.completed",
-            "tool.cached",
-            "review.required",
-        )
-        and not (e.type == "tool.started" and e.tool_call_id in settled)
-    ]
-    for event in relevant[-(3 if compact else 5) :]:
-        label = (
-            "Agent"
-            if event.type == "conversation.message"
-            else "复核"
-            if event.type == "review.required"
-            else "Tool"
-        )
-        line = Text(_(label) + "  ", style="accent" if label != "复核" else "warn")
-        content = event.summary
-        if event.type.startswith("tool."):
-            content = (
-                _(TOOL_LABELS.get(event.tool, event.tool or ""))
-                + " · "
-                + _(
-                    {
-                        "tool.started": "执行中",
-                        "tool.completed": "完成",
-                        "tool.cached": "复用",
-                    }[event.type]
-                )
-            )
-        elif event.stage == "reporting":
-            content = _("估值已完成，详见下方区间、依据与提示。")
-        line.append(content[:100] + ("…" if len(content) > 100 else ""), style="muted")
-        feed.append(line)
-    left = panel(stage_table, _("工作流"))
-    right = panel(
-        Group(*(feed or [Text(_("等待执行事件…"), style="muted")])), _("Agent 与工具")
-    )
-    if compact:
-        middle = Group(left, right)
-    else:
-        middle = Table.grid(expand=True, padding=(0, 1))
-        middle.add_column(ratio=2, min_width=28)
-        middle.add_column(ratio=3)
-        middle.add_row(left, right)
-    hint = (
-        "Ctrl+C 请求暂停（当前工具结束后）"
-        if record.status == "running"
-        else "/tools 查看明细 · /help 对话帮助"
-    )
-    footer = Text(
-        _(
-            "工具完成 {done}   ·   复用 {cached}   ·   事件 {events}   ·   {hint}"
-        ).format(
-            done=completed_calls, cached=cached_calls, events=len(events), hint=_(hint)
-        ),
-        style="muted",
-    )
-    return Group(panel(head), progress, middle, footer)
+def workbench(snapshot, elapsed=0):
+    research = snapshot.get("research", {})
+    session = research.get("session", {})
+    execution = snapshot.get("execution") or research.get("execution", {})
+    facts = session.get("facts", [])
+    docs = session.get("documents", [])
+    leads = sum(doc.get("provenance_type") in {"search_snippet", "official_index"} for doc in docs)
+    verified = sum(fact.get("status") == "confirmed" and not fact.get("warnings") for fact in facts)
+    pending = sum(fact.get("status") == "proposed" for fact in facts)
+    stage = execution.get("stage", "")
+    heading = Text(TOOL_LABELS.get(stage, stage or "等待你的下一条消息"), style="bold #5EEAD4")
+    if elapsed:
+        heading.append(f"  ·  {int(elapsed)}s", style="#94A3B8")
+    bound = snapshot.get("research_plan", {}).get("evidence_counts", {}).get("observations_verified", 0)
+    rows = [heading, Text(f"{len(docs) - leads} 份原文 / {leads} 条线索  ·  {bound} 原文已绑定 / {verified} 通过字段准入 / {pending} 候选待处理", style="#CBD5E1")]
+    counts = snapshot.get("research_plan", {}).get("evidence_counts", {})
+    if counts.get("semantic_review_pending") or counts.get("semantic_review_supported"):
+        rows.append(Text(f"LLM语义复核：{counts.get('semantic_review_pending', 0)} 待复核 / {counts.get('semantic_review_supported', 0)} 已支持；原文定位不等于语义正确或独立审计。", style="#FBBF24"))
+    for recovery in snapshot.get("research_plan", {}).get("extraction_recovery", {}).get("files", [])[-2:]:
+        rows.append(Text(f"读取恢复：{recovery['file_id']} · {recovery['failure_count']} 次失败 · 换视图或补证，不重复下载。", style="#94A3B8"))
+    corroborated = sum(fact.get("status") == "confirmed" and fact.get("verification", {}).get("source_assessment", {}).get("admission") == "corroborated_draft" for fact in facts)
+    if corroborated:
+        rows.append(Text(f"其中 {corroborated} 项为跨源一致的草案输入；保留第三方来源限制，不等于官方核验。", style="#FBBF24"))
+    if version := snapshot.get("runtime", {}).get("agent_version"):
+        rows.append(Text(version, style="#94A3B8"))
+    plan = snapshot.get("plan") or session.get("plan", [])
+    for step in plan:
+        marker, color = {"completed": ("✓", "#6EE7B7"), "in_progress": ("◉", "#5EEAD4")}.get(step.get("status"), ("○", "#94A3B8"))
+        rows.append(Text(f"{marker}  {step['title']}", style=color))
+    coverage = snapshot.get("research_plan", {}).get("annual_coverage", [])
+    if coverage:
+        rows.append(Text("年度覆盖（候选 / 原文绑定 / 字段准入；非模型完整度）", style="#94A3B8"))
+        rows.append(Text("  /  ".join(f"{row['year']}: {len(row.get('candidate_metrics', []))}/{len(row.get('bound_metrics', []))}/{len(row['confirmed_metrics'])}" for row in coverage), style="#CBD5E1"))
+    for group in snapshot.get("research_plan", {}).get("table_repairs", [])[:2]:
+        rows.append(Text(f"共性取证问题影响 {group['affected_count']} 条：{group['issue']}；补读原文或换视图后修正解释。", style="#FBBF24"))
+    for method in snapshot.get("research_plan", {}).get("method_readiness", []):
+        label = "输入准备通过" if method["status"] == "inputs_ready" else "输入未就绪"
+        rows.append(Text(f"{method['method'].upper()} · {label} · {method['reason'][:120]}", style="#94A3B8"))
+    events = research.get("events", [])[-5:]
+    if events:
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(ratio=3)
+        table.add_column(justify="right")
+        for event in events:
+            table.add_row(Text(TOOL_LABELS.get(event.get("tool"), event.get("summary", ""))[:100]), Text(event.get("status", ""), style="#94A3B8"))
+        rows.extend([Text("最近动作 · 原始记录可审计", style="#94A3B8"), table])
+    if session.get("resume_context"):
+        rows.append(Text("续做检查点已保存；下轮优先重检事实与未覆盖年度。", style="#FBBF24"))
+    return panel(Group(*rows), "WORKSPACE / 流程工作台")
 
 
-def execute_with_display(runner, run_id, *, plain=False):
-    started = time.perf_counter()
-    if plain or not console.is_terminal:
-        record = runner.execute(run_id)
-        console.print(result_view(record))
-        return record
+def execute_with_display(service, workspace_id, turn, target=None):
+    target = target or console
+    if not target.is_terminal:
+        return service.message(workspace_id, turn)
+    session_id = service.get(workspace_id).research_session_id
+    started = time.monotonic()
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(runner.execute, run_id)
-        with Live(console=console, refresh_per_second=8, transient=True) as live:
-            while not future.done():
-                try:
-                    record = runner.store.get_run(run_id)
-                    live.update(
-                        dashboard(
-                            record,
-                            runner.store.list_events(run_id),
-                            time.perf_counter() - started,
-                            console.width,
-                            console.height,
-                        )
-                    )
-                    time.sleep(0.08)
-                except KeyboardInterrupt:
-                    runner.request_pause(run_id)
-                    live.update(
-                        panel(
-                            Text(
-                                translator(record.request.language)(
-                                    "已请求暂停，等待当前工具结束…"
-                                ),
-                                style="warn",
-                            )
-                        )
-                    )
-            record = future.result()
-    console.print(
-        dashboard(
-            record,
-            runner.store.list_events(run_id),
-            time.perf_counter() - started,
-            console.width,
-            console.height,
-        )
-    )
-    console.print(result_view(record))
-    return record
-
-
-def show_events(store, run_id):
-    _ = translator(store.get_run(run_id).request.language)
-    table = Table(box=box.SIMPLE_HEAD, header_style="muted", expand=True)
-    for title in ("序号", "步骤 / 工具", "状态", "耗时"):
-        table.add_column(_(title))
-    for e in store.list_events(run_id):
-        if e.type.startswith("tool.") or e.type == "review.required":
-            table.add_row(
-                str(e.sequence),
-                Text(e.tool or e.stage or ""),
-                Text(e.status or ""),
-                f"{e.duration_ms} ms" if e.duration_ms is not None else "—",
-            )
-    console.print(panel(table, _("执行记录")))
-
-
-def converse_with_display(runner, run_id, content, *, plain=False):
-    if plain or not console.is_terminal:
-        return runner.converse(run_id, content)
-    started = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(runner.converse, run_id, content)
-        with Live(console=console, refresh_per_second=8, transient=True) as live:
-            while not future.done():
-                try:
-                    records = runner.store.revisions(run_id)
-                    record = records[-1]
-                    live.update(
-                        dashboard(
-                            record,
-                            runner.store.list_events(record.run_id),
-                            time.perf_counter() - started,
-                            console.width,
-                            console.height,
-                        )
-                    )
-                    time.sleep(0.08)
-                except KeyboardInterrupt:
-                    runner.request_pause(record.run_id)
-                    live.update(
-                        panel(
-                            Text(
-                                translator(record.request.language)(
-                                    "已请求暂停，等待当前工具结束…"
-                                ),
-                                style="warn",
-                            )
-                        )
-                    )
-            return future.result()
+        future = pool.submit(service.message, workspace_id, turn)
+        try:
+            with Live(console=target, refresh_per_second=4, transient=True) as live:
+                while not future.done():
+                    session = service.store.get_research(session_id)
+                    state = {"research": {"session": session.model_dump(mode="json"),
+                             "execution": service.research.execution_state(session_id),
+                             "events": service.store.event_page(session_id, limit=5)["events"]}}
+                    live.update(workbench(state, time.monotonic() - started))
+                    time.sleep(.5)
+                return future.result()
+        except KeyboardInterrupt:
+            service.research.cancel_turn(session_id)
+            target.print("正在停止当前工具并保存进度…", style="yellow")
+            future.result()
+            raise

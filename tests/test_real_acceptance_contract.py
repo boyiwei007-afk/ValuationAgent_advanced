@@ -8,10 +8,11 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-def state(numeric=False, question=None):
-    return {"session": {"pending_action": "valuation", "question": question},
-            "result_document": {"report_id": "audit-id", "status": "valued" if numeric else "insufficient_data",
-                                "numeric_result_available": numeric}}
+def state(numeric=False, policy="review"):
+    return {"workspace": {"run_policy": policy}, "research": {
+        "session": {"pending_action": "valuation"},
+        "result_document": {"report_id": "audit-id", "status": "valued" if numeric else "insufficient_data",
+                            "numeric_result_available": numeric}}}
 
 
 def test_missing_data_report_is_not_a_numeric_pass():
@@ -26,10 +27,10 @@ def test_export_creation_cannot_hide_missing_automatic_report():
     assert not checks["report_available_without_export_side_effect"]
 
 
-def test_batch_approval_and_budget_overrun_are_visible():
-    checks = module.acceptance_checks(state(question={"kind": "facts"}), report_before_export=True,
+def test_review_policy_and_budget_overrun_are_visible():
+    checks = module.acceptance_checks(state(policy="automatic"), report_before_export=True,
                                       elapsed_seconds=121, budget=60)
-    assert not checks["no_individual_fact_approval"]
+    assert not checks["review_policy_preserved"]
     assert not checks["within_budget_plus_60_seconds"]
 
 

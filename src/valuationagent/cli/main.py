@@ -1,651 +1,279 @@
+"""Terminal client for the same workspace agent used by the web client."""
 from __future__ import annotations
+
 import json
+import mimetypes
 import os
-import sys
-from datetime import date
+import re
 from pathlib import Path
-import questionary
+
 import typer
+from pydantic import ValidationError
 from rich.text import Text
-from valuationagent.core.i18n import translator
-from valuationagent.application.runner import ValuationRunner
-from valuationagent.application.reporting import ValuationReportExporter
-from valuationagent.market import create_data_provider
-from valuationagent.finance.factory import create_financial_model
-from valuationagent.llm.client import LlmError, OpenAICompatibleClient
-from valuationagent.schemas.models import Language, RevisionInput, ValuationRequest
-from valuationagent.storage.sqlite import SQLiteRunStore
-from valuationagent.cli.ui import (
-    console,
-    banner,
-    welcome,
-    panel,
-    result_view,
-    execute_with_display,
-    show_events,
-)
 
-app = typer.Typer(
-    invoke_without_command=True,
-    no_args_is_help=False,
-    pretty_exceptions_enable=False,
-    help="ValuationAgent · 对话式估值研究工作台",
-    rich_markup_mode="rich",
-)
-STYLE = questionary.Style(
-    [
-        ("qmark", "fg:#5eead4 bold"),
-        ("question", "bold"),
-        ("answer", "fg:#5eead4"),
-        ("pointer", "fg:#5eead4 bold"),
-        ("highlighted", "fg:#5eead4 bold"),
-        ("selected", "fg:#5eead4"),
-        ("instruction", "fg:#94a3b8"),
-    ]
-)
+from valuationagent.application.reproducibility import replay_bundle
+from valuationagent.application.file_workspace import FileList, FileRead, list_files, read_file
+from valuationagent.application.workspace_artifacts import ReportWrite, write_report, save_local_artifact
+from valuationagent.cli.ui import console, welcome, conversation, decision_view, workbench, execute_with_display, panel
+from valuationagent.llm.client import OpenAICompatibleClient
+from valuationagent.market.tushare import TushareApiClient, TushareDataProvider
+from valuationagent.schemas.models import ModelConnectionInput
+from valuationagent.schemas.research import ResearchTurn
+from valuationagent.search.providers import TavilySearchProvider
+
+app = typer.Typer(no_args_is_help=False, pretty_exceptions_enable=False)
+
+HELP = """直接输入需求即可对话、检索或估值。
+/model                 配置或更换模型（密钥隐藏，仅本进程保存）
+/search                配置 Tavily 搜索（可稍后配置）
+/market                配置 Tushare 结构化财务数据（可选）
+/upload 文件路径        上传附件，随下一条消息交给 Agent
+/files                 查看本工作区原文文件
+/read 文件ID            读取已保存原文（精细页码/表格可直接让 Agent 读取）
+/vision                明确启用/停用当前模型图片输入（接口须支持图片）
+/export md|pdf|html|json 生成报告并保存至当前目录 artifacts
+/artifacts             查看已生成的报告与笔记
+/save 文件ID            将生成文件保存到当前目录 artifacts
+/status                查看当前工作区
+/status --json         查看完整工作区数据
+/approve               审阅并批准冻结的估值方案
+/help                  查看命令
+/exit                  保存并退出"""
 
 
-def runtime():
-    store = SQLiteRunStore(Path(os.getenv("VALUATION_DATA_DIR", "var")))
-    return store, ValuationRunner(
-        store, create_financial_model(), create_data_provider()
-    )
-
-
-def model(live):
-    return OpenAICompatibleClient.from_environment() if live else None
-
-
-def ask(prompt):
-    value = prompt.unsafe_ask()
-    if value is None:
-        raise typer.Exit(130)
-    return value
-
-
-def select(title, choices, language="zh-CN"):
-    return ask(
-        questionary.select(
-            title,
-            choices=choices,
-            style=STYLE,
-            pointer="›",
-            instruction=translator(language)("↑↓ 选择 · 回车确认"),
-        )
-    )
-
-
-def text_input(title, default=""):
-    return ask(questionary.text(title, default=default, style=STYLE))
-
-
-def autocomplete(title, choices, default=""):
-    """Select a suggested value while keeping free-form input available."""
-    return ask(
-        questionary.autocomplete(
-            title,
-            choices=choices,
-            default=default,
-            style=STYLE,
-            # Questionary 2.1 forwards unknown kwargs to PromptSession.
-            # `instruction` is supported by select/checkbox, but not by
-            # autocomplete; bottom_toolbar works across supported versions.
-            bottom_toolbar="输入关键词筛选 · ↑↓ 选择 · Enter 确认",
-        )
-    )
-
-
-def secret_input(title):
-    """Read a secret without echoing it to the terminal or storing it."""
-    return ask(
-        questionary.password(
-            title,
-            style=STYLE,
-            bottom_toolbar="输入后不会回显",
-        )
-    )
-
-
-def read_request(path):
-    return ValuationRequest.model_validate_json(
-        Path(path).read_text(encoding="utf-8-sig")
-    )
-
-
-def friendly_error(exc, language="zh-CN"):
-    if hasattr(exc, "errors"):
+def show_error(exc):
+    if isinstance(exc, ValidationError):
         message = "；".join(
-            ".".join(str(p) for p in e["loc"]) + ": " + e["msg"] for e in exc.errors()
+            ".".join(str(part) for part in error["loc"]) + ": " + error["msg"]
+            for error in exc.errors(include_input=False, include_url=False)
         )
     else:
         message = str(exc)
-    console.print(panel(Text(message, style="warn"), translator(language)("请检查")))
-    raise typer.Exit(2)
+    console.print(panel(Text(message, style="#FB7185"), "需要处理"))
 
 
-def finish(record):
-    _ = translator(record.request.language)
-    console.print(
-        Text(
-            _("任务 {run_id}  ·  v{revision}").format(
-                run_id=record.run_id, revision=record.revision
-            ),
-            style="muted",
-        )
+def configure_model(current=None):
+    previous = current.config if current is not None else None
+    console.print(panel(Text("配置 OpenAI-compatible 接口\n连接检查会发送一次工具调用请求。密钥隐藏输入，仅本进程使用。"), "MODEL / 模型连接"))
+    base_url = typer.prompt(
+        "Base URL",
+        default=previous.base_url if previous else os.getenv("VALUATION_LLM_BASE_URL", "https://api.deepseek.com"),
     )
+    model_name = typer.prompt(
+        "模型名称（填写供应商提供的模型 ID）",
+        default=previous.model if previous else os.getenv("VALUATION_LLM_MODEL", ""),
+    )
+    tool_call_format = typer.prompt(
+        "工具格式（native 标准 / json_content 文本JSON网关）",
+        default=previous.tool_call_format if previous else os.getenv("VALUATION_LLM_TOOL_CALL_FORMAT", "native"),
+    )
+    reasoning_protocol = typer.prompt(
+        "推理参数协议（auto 默认 / chat_template 用于 SGLang、vLLM）",
+        default=previous.reasoning_protocol if previous else os.getenv("VALUATION_LLM_REASONING_PROTOCOL", "auto"),
+    )
+    thinking = typer.prompt(
+        "思考模式（auto / enabled / disabled）",
+        default=previous.thinking if previous else os.getenv("VALUATION_LLM_THINKING", "auto"),
+    )
+    temperature = typer.prompt(
+        "采样温度（0至2，按模型部署建议设置）",
+        default=previous.temperature if previous and previous.temperature is not None else float(os.getenv("VALUATION_LLM_TEMPERATURE", "0")),
+        type=float,
+    )
+    api_key = typer.prompt("API Key（隐藏输入）", hide_input=True, show_default=False)
+    config = ModelConnectionInput(base_url=base_url.strip(), model=model_name.strip(), api_key=api_key.strip(),
+                                  tool_call_format=tool_call_format.strip(), reasoning_protocol=reasoning_protocol.strip(),
+                                  thinking=thinking.strip(), temperature=temperature)
+    candidate = OpenAICompatibleClient(config)
+    candidate.test_connection()
+    console.print("模型已连接；密钥不会写入数据库或配置文件。", style="green")
+    return candidate
 
 
-@app.callback()
-def main(ctx: typer.Context):
-    if ctx.invoked_subcommand is None:
-        if sys.stdin.isatty():
-            interactive(language=None)
+def run_chat(workspace_id=None, review=False):
+    from valuationagent.api.main import create_app
+
+    service = create_app().state.workspaces
+    workspace = service.get(workspace_id) if workspace_id else service.create(
+        data_source_preference="web", run_policy="review" if review else "automatic",
+    )
+    session_id = workspace.research_session_id
+    console.print(welcome())
+    console.print("Workspace: " + workspace.workspace_id, markup=False)
+    console.print(panel(Text(HELP), "快捷命令 · 自由对话"))
+    if workspace_id:
+        snapshot = service.snapshot(workspace.workspace_id)
+        console.print(workbench(snapshot))
+        previous_answer = next((message for message in reversed(snapshot["messages"]) if message["role"] == "assistant"), None)
+        if previous_answer:
+            console.print(conversation(previous_answer["content"]))
+        if decision := snapshot["research"]["session"].get("pending_decision"):
+            console.print(decision_view(decision))
+    model = None
+    pending_files = []
+    try:
+        if os.getenv("VALUATION_LLM_MODEL") and os.getenv("VALUATION_LLM_API_KEY"):
+            model = OpenAICompatibleClient.from_environment()
         else:
-            console.print(ctx.get_help())
-
-
-@app.command()
-def demo(
-    company: str = typer.Option("估值演示公司"),
-    valuation_date: str = typer.Option(None),
-    chat: bool = typer.Option(False, "--chat", help="完成后进入对话"),
-    plain: bool = typer.Option(False, "--plain", help="静态输出，适合日志"),
-    language: Language = typer.Option(
-        Language.ZH_CN, "--language", help="对话与结果语言 / Session language"
-    ),
-):
-    """使用明确标记的合成数据体验完整流程。"""
-    try:
-        store, runner = runtime()
-        req = ValuationRequest(
-            company={
-                "name": translator(language)(company)
-                if company == "估值演示公司"
-                else company
-            },
-            valuation_date=valuation_date or date.today(),
-            mode="demo",
-            language=language,
-        )
-        record = runner.create_run(req)
-        console.print(banner(req.language))
-        record = execute_with_display(runner, record.run_id, plain=plain)
-        finish(record)
-        if chat:
-            conversation(runner, record.run_id, plain=plain)
-        elif record.status in ("waiting_review", "failed"):
-            raise typer.Exit(1)
-    except (ValueError, OSError, LlmError) as exc:
-        friendly_error(exc)
-
-
-@app.command("run")
-def run_request(
-    request_file: Path = typer.Argument(..., exists=True, dir_okay=False),
-    live: bool = typer.Option(False, "--live"),
-    chat: bool = typer.Option(False, "--chat"),
-    plain: bool = typer.Option(False, "--plain"),
-    language: Language | None = typer.Option(
-        None, "--language", help="覆盖请求中的语言 / Override request language"
-    ),
-):
-    """运行结构化请求文件，可接入模型并持续对话。"""
-    try:
-        store, runner = runtime()
-        req = read_request(request_file)
-        if live:
-            req = req.model_copy(update={"mode": "live"})
-        if language is not None:
-            req = req.model_copy(update={"language": language.value})
-        record = runner.create_run(req, model(req.mode == "live"))
-        console.print(banner(req.language))
-        record = execute_with_display(runner, record.run_id, plain=plain)
-        finish(record)
-        if chat:
-            conversation(runner, record.run_id, plain=plain)
-        elif record.status in ("waiting_review", "failed"):
-            raise typer.Exit(1)
-    except (ValueError, OSError, LlmError) as exc:
-        friendly_error(exc)
-
-
-def upload(store, path, role):
-    target = Path(path.strip('"'))
-    if target.stat().st_size > 50 * 1024 * 1024:
-        raise ValueError("文件不能超过50MB。")
-    return store.save_upload(target.name, role, None, target.read_bytes())["file_id"]
-
-
-@app.command("wizard")
-def wizard(
-    language: Language | None = typer.Option(
-        None, "--language", help="预选语言；默认进入语言选择 / Preselect language"
-    ),
-):
-    """分步选择公司、数据、假设和方法，随后进入对话工作台。"""
-    if not sys.stdin.isatty():
-        console.print(
-            "交互向导需要终端。脚本中请使用 valuationagent demo 或 valuationagent run 文件。"
-        )
-        raise typer.Exit(2)
-    try:
-        console.print(welcome(console.width, console.height))
-        console.print()
-        if language is None:
-            console.print(
-                panel(
-                    Text(
-                        "选择向导、对话与结果的语言。\nChoose a language for setup, conversation and results.",
-                        style="muted",
-                    ),
-                    "00 / Language · 语言",
-                )
-            )
-            language = select(
-                "Language / 语言",
-                [
-                    questionary.Choice("简体中文  /  Chinese", value="zh-CN"),
-                    questionary.Choice("English   /  英语", value="en-US"),
-                ],
-                language="en-US",
-            )
-        _ = translator(language)
-
-        def choose(title, choices):
-            return select(
-                _(title),
-                [questionary.Choice(_(label), value=value) for label, value in choices],
-                language,
-            )
-
-        def prompt(title, default=""):
-            return text_input(_(title), default)
-
-        console.print(
-            Text(
-                _("↑ ↓ 选择  ·  Enter 确认  ·  Space 多选  ·  Ctrl+C 退出"),
-                style="muted",
-            )
-        )
-        store, runner = runtime()
-        mode = choose(
-            "01 / 运行模式",
-            [
-                ("合成数据体验     无需 API Key", "demo"),
-                ("结构化估值       确定性模型，无需 API Key", "snapshot"),
-                ("实时 Agent       使用环境变量中的模型", "live"),
-            ],
-        )
-        base = {}
-        if mode != "demo":
-            source = choose(
-                "02 / 历史财务来源",
-                [
-                    ("结构化请求 JSON", "structured"),
-                    ("A 股代码 · 适配器待接入，可复核补数", "ticker"),
-                    ("上传文档 · JSON 可解析，PDF/Excel 待接入", "upload"),
-                ],
-            )
-            if source == "structured":
-                base = read_request(
-                    prompt("请求文件", "examples/structured_request.json")
-                ).model_dump(mode="json")
-            elif source == "ticker":
-                base["company"] = {"ticker": prompt("A 股代码，例如 600519.SH")}
-            else:
-                base["file_ids"] = [
-                    upload(store, prompt("财务文件路径"), "historical_financials")
-                ]
-            base["data_source"] = source
-        base["mode"] = mode
-        base["language"] = language
-        company = base.get("company", {})
-        company["name"] = prompt(
-            "03 / 企业或项目名称", company.get("name") or _("估值演示公司")
-        )
-        base["company"] = company
-        base["valuation_date"] = prompt("04 / 估值基准日 YYYY-MM-DD", str(date.today()))
-        assumption_source = choose(
-            "05 / 经营假设",
-            [
-                ("默认参考政策 · 用于框架测试", "automatic"),
-                ("手工设定 WACC 与永续增长率", "manual"),
-                ("上传假设文件 · JSON 可解析", "upload"),
-            ],
-        )
-        base["assumption_source"] = assumption_source
-        base["assumptions"] = {}
-        base["assumption_file_ids"] = []
-        if assumption_source == "manual":
-            from decimal import Decimal
-
-            base["assumptions"] = {
-                "wacc": Decimal(prompt("WACC（%）", "9.5")) / 100,
-                "terminal_growth": Decimal(prompt("永续增长率（%）", "3")) / 100,
-            }
-        elif assumption_source == "upload":
-            base["assumption_file_ids"] = [
-                upload(store, prompt("假设文件路径"), "assumptions")
-            ]
-        base["methods"] = ask(
-            questionary.checkbox(
-                _("06 / 估值方法"),
-                choices=[
-                    questionary.Choice(
-                        _("DCF · 现金流折现"), value="dcf", checked=True
-                    ),
-                    questionary.Choice(_("P/E · 市盈率"), value="pe", checked=True),
-                    questionary.Choice(_("P/S · 市销率"), value="ps", checked=False),
-                    questionary.Choice(
-                        _("EV/EBITDA · 企业价值倍数"), value="ev_ebitda", checked=True
-                    ),
-                ],
-                style=STYLE,
-                instruction=_("↑↓ 移动 · 空格勾选 · 回车确认"),
-            )
-        )
-        base["forecast_years"] = int(
-            select(_("07 / 预测期"), ["10", "5", "3", "7"], language)
-        )
-        base["discount_policy"] = (
-            "annual_midyear_remaining" if mode == "demo" else "year_end"
-        )
-        req = ValuationRequest.model_validate(base)
-        console.print(
-            panel(
-                Text(
-                    f"{company['name']}  ·  {req.valuation_date}  ·  {mode.upper()}\n"
-                    + _("方法 {methods}  ·  预测 {years} 年").format(
-                        methods=" / ".join(req.methods), years=req.forecast_years
-                    )
-                    + "\n"
-                    + _("语言 {language}").format(language=req.language)
-                    + "\n"
-                    + _("运行后可继续提问、修改假设或处理复核。")
-                ),
-                _("准备执行"),
-            )
-        )
-        record = runner.create_run(req, model(mode == "live"))
-        record = execute_with_display(runner, record.run_id)
-        finish(record)
-        conversation(runner, record.run_id)
-    except (KeyboardInterrupt, EOFError):
-        console.print(
-            Text(
-                translator(language)("\n已退出。已创建的任务和记录会保留。"),
-                style="muted",
-            )
-        )
-    except (ValueError, OSError, LlmError) as exc:
-        friendly_error(exc, language)
-
-
-@app.command()
-def interactive(language: Language | None = typer.Option(None, "--language")):
-    """欢迎页后直接描述需求、上传资料，用选项或文字确认。"""
-    if not sys.stdin.isatty():
-        console.print("交互研究需要终端。脚本中请使用 valuationagent run 文件。")
-        raise typer.Exit(2)
-    from valuationagent.cli.research import launch_research
-    launch_research(language=language)
-
-
-@app.command("research")
-def research_command(
-    resume: str | None = typer.Option(None, "--resume"),
-    language: Language | None = typer.Option(None, "--language"),
-):
-    """开始研究对话，或恢复已保存的研究会话。"""
-    from valuationagent.cli.research import launch_research
-    try:
-        launch_research(language=language, session_id=resume)
-    except (ValueError, KeyError, LlmError) as exc:
-        friendly_error(exc)
-
-
-HELP = """直接提问：本次用了哪些假设？  /  把 WACC 改为 8%
-/result           查看当前结果
-/assumptions      查看假设与来源
-/tools            查看工具与耗时
-/history          查看版本
-/set wacc=8%      修改假设并创建新版本
-/review 路径.json 提交更正文件（reason + changes），随后继续
-/resume           从成功步骤的检查点继续
-/help             查看帮助
-/quit             退出，保留任务"""
-
-HELP_EN = """Ask: What assumptions were used?  /  Set WACC to 8%
-/result           Show current results
-/assumptions      Show assumptions and sources
-/tools            Show tools and timing
-/history          Show revisions
-/set wacc=8%      Revise assumptions and create a new version
-/review path.json Submit corrections (reason + changes) and continue
-/resume           Resume from completed tool checkpoints
-/help             Show commands
-/quit             Exit and preserve the run"""
-
-
-def conversation(runner, run_id, plain=False):
-    language = runner.store.get_run(run_id).request.language
-    _ = translator(language)
-    if not sys.stdin.isatty():
-        console.print(Text(_("持续对话需要交互终端。"), style="warn"))
-        return
-    console.print(
-        panel(
-            Text(
-                _(
-                    "直接提问，或输入：把 WACC 改为 8%\n/help 查看命令  ·  /tools 工具明细  ·  /quit 保存并退出"
-                ),
-                style="muted",
-            ),
-            _("对话已就绪"),
-        )
-    )
+            model = configure_model()
+        service.research.attach(session_id, model)
+    except typer.Abort:
+        raise
+    except (ValueError, RuntimeError) as exc:
+        show_error(exc)
+        console.print("工作区已保留。使用 /model 重新配置，或 /exit 退出。")
     while True:
+        content = console.input("\n你 > ").strip()
+        if content == "/exit":
+            console.print("工作区已保存。下次继续：")
+            console.print("valuationagent --workspace " + workspace.workspace_id, markup=False)
+            return
+        if not content:
+            continue
         try:
-            language = runner.store.get_run(run_id).request.language
-            _ = translator(language)
-            content = console.input("[accent]" + _("你 › ") + "[/]").strip()
-            if not content:
-                continue
-            if content in ("/quit", "/exit", "退出"):
-                break
             if content == "/help":
-                console.print(
-                    panel(Text(HELP_EN if language == "en-US" else HELP), _("帮助"))
+                console.print(panel(Text(HELP), "快捷命令 · 自由对话"))
+            elif content == "/model":
+                candidate = configure_model(model)
+                service.research.attach(session_id, candidate)
+                model = candidate
+            elif content == "/search":
+                api_key = typer.prompt("Tavily API Key（隐藏输入）", hide_input=True, show_default=False)
+                service.research.attach_search(session_id, TavilySearchProvider(api_key.strip()))
+                console.print("搜索已配置；未发送测试查询，密钥仅在本进程有效。", style="green")
+            elif content == "/market":
+                token = typer.prompt("Tushare Token（隐藏输入）", hide_input=True, show_default=False)
+                service.research.attach_market(session_id, TushareDataProvider(TushareApiClient(token.strip())))
+                console.print("结构化数据已配置；尚未请求数据，Token 仅在本进程有效。没有此服务也可继续网页取证。", style="green")
+            elif content == "/status --json":
+                console.print_json(data=service.snapshot(workspace.workspace_id))
+            elif content == "/status":
+                console.print(workbench(service.snapshot(workspace.workspace_id)))
+            elif content == "/vision":
+                if not isinstance(model, OpenAICompatibleClient):
+                    raise ValueError("请先用 /model 连接支持图片的模型接口。")
+                enabled = typer.confirm("允许向当前模型发送选定的原始页图？接口必须支持图片；可能产生图片计费。", default=False)
+                model.config.supports_images = enabled
+                console.print("图片输入已启用。" if enabled else "图片输入已关闭。", markup=False)
+            elif content == "/files":
+                session = service.store.get_research(session_id)
+                console.print_json(data=list_files(service.store, session, FileList(limit=40)))
+            elif content.startswith("/read "):
+                session = service.store.get_research(session_id)
+                console.print_json(data=read_file(service.store, session, FileRead(file_id=content[6:].strip())))
+            elif content == "/artifacts":
+                console.print_json(data={"artifacts": service.store.list_artifacts(session_id)})
+            elif content == "/export" or content.startswith("/export "):
+                session = service.store.get_research(session_id)
+                artifact = write_report(service.research, session, ReportWrite(format=content[7:].strip() or "md"))
+                target = save_local_artifact(service.store, session_id, artifact["artifact_id"], Path.cwd() / "artifacts")
+                console.print(panel(Text(f"报告已保存：{target}\n状态：{artifact['status']}\nSHA-256：{artifact['sha256']}"), "ARTIFACT / 文件交付"))
+            elif content.startswith("/save "):
+                target = save_local_artifact(service.store, session_id, content[6:].strip(), Path.cwd() / "artifacts")
+                console.print("文件已保存：" + str(target), markup=False)
+            elif content == "/approve":
+                checkpoint = service.prevaluation_review(workspace.workspace_id)
+                console.print_json(data=checkpoint.model_dump(mode="json"))
+                if typer.confirm("批准这份冻结输入并计算？", default=False):
+                    record = service.approve(workspace.workspace_id, checkpoint.checkpoint_id, "CLI 用户审批")
+                    service.execute(record.run_id)
+                    console.print_json(data=service.read_valuation(session_id))
+            elif content.startswith("/upload "):
+                path = Path(content[len("/upload "):].strip().strip('"')).expanduser()
+                if path.stat().st_size > 50 * 1024 * 1024:
+                    raise ValueError("文件超过50 MB，请拆分后上传。")
+                if len(pending_files) >= 8:
+                    raise ValueError("每条消息最多附带 8 个文件，请先发送当前附件。")
+                metadata = service.store.save_upload(
+                    path.name, "evidence", mimetypes.guess_type(path.name)[0] or "application/octet-stream", path.read_bytes(),
                 )
-                continue
-            if content == "/result":
-                console.print(result_view(runner.store.get_run(run_id)))
-                continue
-            if content == "/tools":
-                show_events(runner.store, run_id)
-                continue
-            if content == "/history":
-                for r in runner.store.revisions(run_id):
-                    console.print(
-                        Text(f"v{r.revision}  {r.status}  {r.run_id}", style="muted")
-                    )
-                continue
-            if content == "/resume":
-                record = execute_with_display(runner, run_id, plain=plain)
-                finish(record)
-                continue
-            if content.startswith("/review "):
-                revision = RevisionInput.model_validate_json(
-                    Path(content[8:].strip().strip('"')).read_text(encoding="utf-8-sig")
-                )
-                child = runner.revise(run_id, revision, execute=False)
-                run_id = child.run_id
-                record = execute_with_display(runner, run_id, plain=plain)
-                finish(record)
-                continue
-            if content == "/assumptions":
-                content = _("本次用了哪些假设？")
-            if content.startswith("/set "):
-                content = content[5:]
-            from valuationagent.cli.ui import converse_with_display
-
-            message = converse_with_display(runner, run_id, content, plain=plain)
-            console.print(panel(Text(message.content), "ValuationAgent"))
-            if message.related_run_id:
-                run_id = message.related_run_id
-                console.print(result_view(runner.store.get_run(run_id)))
-                finish(runner.store.get_run(run_id))
-        except (KeyboardInterrupt, EOFError):
-            break
-        except (ValueError, OSError, LlmError) as exc:
-            console.print(panel(Text(str(exc), style="warn"), _("需要处理")))
-    console.print(
-        Text(
-            _("会话已保存。继续：valuationagent chat {run_id}").format(run_id=run_id),
-            style="muted",
-        )
-    )
+                pending_files.append(metadata["file_id"])
+                console.print("已添加附件：" + path.name + "；发送下一条消息开始解析。", markup=False)
+            elif content.startswith("/"):
+                console.print("未知命令；输入 /help 查看支持的命令。")
+            elif model is None:
+                console.print("请先使用 /model 连接模型。附件仍保留在待发送列表中。")
+            else:
+                decision = service.store.get_research(session_id).pending_decision
+                selection = re.fullmatch(r"([1-4A-Da-d])(?:[、.：:\s]+(.*))?", content, re.S)
+                if decision and selection:
+                    index = int(selection[1]) - 1 if selection[1].isdigit() else ord(selection[1].upper()) - ord('A')
+                    if index >= len(decision.options):
+                        raise ValueError("请选择列出的方案，或直接输入自己的要求。")
+                    option = decision.options[index]
+                    content = f"关于“{decision.question}”，我选择{option.label}。{option.description}" + (f"\n补充：{selection[2]}" if selection[2] else "")
+                turn = ResearchTurn(content=content, file_ids=pending_files)
+                console.print(conversation(content, "user"))
+                execute_with_display(service, workspace.workspace_id, turn, target=console)
+                pending_files = []
+                snapshot = service.snapshot(workspace.workspace_id)
+                console.print(workbench(snapshot))
+                console.print(conversation(snapshot["messages"][-1]["content"]))
+                if decision := snapshot["research"]["session"].get("pending_decision"):
+                    console.print(decision_view(decision))
+        except typer.Abort:
+            raise
+        except (ValueError, RuntimeError, KeyError, OSError) as exc:
+            show_error(exc)
+            console.print("工作区已保留，可以修正输入后继续。")
 
 
-@app.command("chat")
-def chat_command(
-    run_id: str,
-    live: bool = typer.Option(False, "--live"),
-    plain: bool = typer.Option(False, "--plain"),
-):
-    """继续已有任务的对话。"""
+def launch(workspace_id, review):
     try:
-        store, runner = runtime()
-        record = store.get_run(run_id)
-        if live or record.request.mode == "live":
-            runner.attach_model(run_id, model(True))
-        console.print(banner(record.request.language))
-        console.print(result_view(record))
-        conversation(runner, run_id, plain)
-    except KeyError:
-        friendly_error(ValueError("任务不存在，请用 valuationagent history 查看。"))
-    except (ValueError, OSError, LlmError) as exc:
-        friendly_error(exc)
+        run_chat(workspace_id, review)
+    except (EOFError, KeyboardInterrupt, typer.Abort):
+        console.print("\n已退出；已提交的工作区记录保留。")
+    except (ValueError, RuntimeError, KeyError, OSError) as exc:
+        show_error(exc)
+        raise typer.Exit(1) from None
 
 
-@app.command("resume")
-def resume_command(
-    run_id: str,
-    live: bool = typer.Option(False, "--live"),
-    plain: bool = typer.Option(False, "--plain"),
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    workspace_id: str | None = typer.Option(None, "--workspace"),
+    review: bool = typer.Option(False, "--review"),
 ):
-    """恢复暂停或失败任务；已完成步骤按输入哈希复用。"""
-    try:
-        store, runner = runtime()
-        record = store.get_run(run_id)
-        if live or record.request.mode == "live":
-            runner.attach_model(run_id, model(True))
-        record = execute_with_display(runner, run_id, plain=plain)
-        finish(record)
-        if record.status in ("waiting_review", "failed"):
-            raise typer.Exit(1)
-    except KeyError:
-        friendly_error(ValueError("任务不存在。"))
-    except (ValueError, OSError, LlmError) as exc:
-        friendly_error(exc)
-
-
-@app.command("review")
-def review_command(
-    run_id: str,
-    patch_file: Path = typer.Argument(..., exists=True),
-    plain: bool = typer.Option(False, "--plain"),
-):
-    """用 reason + changes JSON 更正输入，保留旧版本并继续。"""
-    try:
-        store, runner = runtime()
-        record = store.get_run(run_id)
-        if record.request.mode == "live":
-            runner.attach_model(run_id, model(True))
-        revision = RevisionInput.model_validate_json(
-            patch_file.read_text(encoding="utf-8-sig")
-        )
-        child = runner.revise(run_id, revision, execute=False)
-        record = execute_with_display(runner, child.run_id, plain=plain)
-        finish(record)
-        if record.status in ("waiting_review", "failed"):
-            raise typer.Exit(1)
-    except KeyError:
-        friendly_error(ValueError("任务不存在。"))
-    except (ValueError, OSError, LlmError) as exc:
-        friendly_error(exc)
+    """不带子命令直接进入 Agent；模型和搜索可以在终端内配置。"""
+    if ctx.invoked_subcommand is None:
+        launch(workspace_id, review)
 
 
 @app.command()
-def history():
-    """查看本地任务和版本。"""
-    from rich.table import Table
-
-    store, _ = runtime()
-    table = Table("企业", "版本", "状态", "任务 ID", box=None)
-    for r in store.list_runs():
-        table.add_row(
-            Text(r.request.company.name or r.request.company.ticker or "未命名"),
-            str(r.revision),
-            r.status,
-            r.run_id,
-        )
-    console.print(panel(table, "任务历史"))
-
-
-@app.command()
-def inspect(run_id: str, tools: bool = typer.Option(False, "--tools")):
-    """查看已有结果，或展开工具日志。"""
-    store, _ = runtime()
-    try:
-        if tools:
-            show_events(store, run_id)
-        else:
-            console.print(result_view(store.get_run(run_id)))
-    except KeyError:
-        friendly_error(ValueError("任务不存在。"))
-
-
-@app.command()
-def export(run_id: str, destination: Path = typer.Option(..., "--output", "-o")):
-    """按文件扩展名导出 JSON 复算包、Excel 工作簿或 PDF 正式报告。"""
-    store, _ = runtime()
-    try:
-        record = store.get_run(run_id)
-        if record.result is None:
-            raise ValueError("该任务尚未形成结果，请先复核或恢复。")
-        if destination.exists():
-            raise ValueError("目标文件已存在，请指定新文件名。")
-        extension = destination.suffix.lower().lstrip(".") or "json"
-        content, _, _ = ValuationReportExporter().export(record, extension, store=store)
-        destination.write_bytes(content)
-        console.print(Text(f"已导出：{destination.resolve()}", style="good"))
-    except KeyError:
-        friendly_error(ValueError("任务不存在。"))
-    except (ValueError, OSError) as exc:
-        friendly_error(exc)
+def chat(
+    workspace_id: str | None = typer.Option(None, "--workspace"),
+    review: bool = typer.Option(False, "--review"),
+):
+    """Create or continue a workspace conversation."""
+    launch(workspace_id, review)
 
 
 @app.command()
 def replay(package: Path):
-    """离线复算 JSON 包；不调用模型或联网服务，不修改原任务。"""
-    from valuationagent.application.reproducibility import replay_bundle
+    """Replay frozen calculations without model or network access."""
     try:
         result = replay_bundle(json.loads(package.read_text(encoding="utf-8-sig")))
         console.print_json(data=result)
         if not result["passed"]:
             raise typer.Exit(1)
     except (ValueError, OSError) as exc:
-        friendly_error(exc)
+        show_error(exc)
         raise typer.Exit(1) from None
 
 
 @app.command()
-def serve(host: str = "127.0.0.1", port: int = 8000, reload: bool = False):
-    """启动 Web API 服务。"""
+def serve(host: str = "127.0.0.1", port: int = 8000):
+    """Start the workspace API and built web client on one origin."""
     import uvicorn
+    from valuationagent.api.access import validate_bind
 
-    uvicorn.run("valuationagent.api.main:app", host=host, port=port, reload=reload)
+    try:
+        validate_bind(host)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+    uvicorn.run("valuationagent.api.main:app", host=host, port=port)
 
 
 if __name__ == "__main__":

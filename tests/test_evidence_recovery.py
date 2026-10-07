@@ -452,6 +452,10 @@ class RepeatingRetrievalModel:
         self.calls = 0
 
     def chat(self, messages, **kwargs):
+        from control_fixtures import control_reply
+
+        if reply := control_reply(kwargs):
+            return reply
         self.calls += 1
         return {"tool_calls": [{
             "id": str(self.calls),

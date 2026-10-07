@@ -12,10 +12,15 @@ from pathlib import Path
 from decimal import Decimal
 
 from valuationagent.application.research_valuation import METRIC_LABELS, _period
+from valuationagent.application.result_views import input_source_label
+from valuationagent.application.input_derivations import DERIVATIONS
+from valuationagent.application.input_balances import balance_change_rows
+from valuationagent.application.result_delivery import method_completion
 from valuationagent.application.valuation_plan import preview_session, _build_for_methods
 from valuationagent.schemas.models import required_financial_metrics
 
 METHODS = {"dcf": "DCF 现金流折现", "pe": "P/E 市盈率", "ps": "P/S 市销率", "ev_ebitda": "EV/EBITDA 企业价值倍数"}
+REPORT_SCHEMA = "valuation-outcome-v14"
 STATUS = {
     "insufficient_data": "数据不足，已形成说明报告",
     "awaiting_review": "方案待确认，已形成阶段报告",
@@ -23,6 +28,7 @@ STATUS = {
     "calculating": "正式计算进行中",
     "review_required": "计算需复核，已保留诊断",
     "valued": "估值已完成",
+    "partially_valued": "部分方法已完成，整体估值尚未完成",
 }
 FORMULAS = {
     "dcf": "FCFF = EBIT × (1 - 税率) + 折旧摊销 - 资本开支 - 营运资本增加额；逐期折现并加入终值，再调整净债务。",
@@ -34,6 +40,36 @@ FORMULAS = {
 
 def _digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def frozen_input_calculations(record):
+    if record is None:
+        return []
+    snapshots = {str(row.period_end) if row.period_end else None: row
+        for row in [*record.request.historical_financials, record.request.financials] if row is not None}
+    inputs = {row["input_id"]: row for row in record.request.input_records}
+    result = []
+    for calculation in record.request.input_calculations:
+        if calculation.get("entity_ticker"):
+            peer = next((item for item in record.request.peers if item.ticker == calculation["entity_ticker"]), None)
+            if peer is None:
+                continue
+            value = sum((Decimal(inputs[term["input_id"]]["value"]) * (1 if term["operation"] == "add" else -1)
+                for term in calculation["terms"]), Decimal(0))
+            result.append({**calculation, "value": str(value),
+                "policy": peer.calculation_methods.get("declared_calculation_policy", ""),
+                "terms": [{**term, "label": inputs[term["input_id"]].get("label") or inputs[term["input_id"]]["metric"]}
+                    for term in calculation["terms"]]})
+            continue
+        snapshot = snapshots.get(calculation["period_end"])
+        if snapshot is None:
+            continue
+        value = snapshot.statement_items.get(calculation["metric"], getattr(snapshot, calculation["metric"], None))
+        result.append({**calculation, "value": str(value) if value is not None else None,
+            "policy": snapshot.calculation_methods.get("declared_calculation_policy", ""),
+            "terms": [{**term, "label": inputs.get(term["input_id"], {}).get("label") or inputs.get(term["input_id"], {}).get("metric", term["input_id"])}
+                for term in calculation["terms"]]})
+    return result
 
 
 def build_result_document(service, session):
@@ -62,10 +98,19 @@ def build_result_document(service, session):
         except KeyError:
             pass
     result = record.result if record and str(record.status) in {"completed", "completed_with_warnings"} else None
-    numeric = bool(result and (result.dcf or any(r.status == "success" for r in result.relative)))
+    numeric = bool(result and (result.dcf and result.dcf.status == "success" or any(r.status == "success" for r in result.relative)))
+    completion = method_completion(record) if record else None
     if numeric:
-        status = "valued"
+        status = "valued" if completion["all_requested_methods_completed"] else "partially_valued"
         conclusion = result.executive_summary
+        if status == "partially_valued":
+            conclusion = "部分方法已完成；尚未完成：" + " / ".join(METHODS[method] for method in completion["remaining_methods"]) + "。\n" + conclusion
+        completed = {item.method for item in result.relative if item.status == "success"}
+        if result.dcf and result.dcf.status == "success":
+            completed.add("dcf")
+        for method in methods:
+            if method["method"] in completed:
+                method.update(status="calculated", reason="已使用该计算版本冻结的输入完成确定性计算；来源与假设性质见本报告。")
     elif record and str(record.status) in {"created", "running"}:
         status = "calculating"
         conclusion = "正式估值任务已提交，计算尚未完成；本报告不含未完成的数值结论。"
@@ -79,31 +124,47 @@ def build_result_document(service, session):
     else:
         status = "insufficient_data"
         conclusion = "目前没有足够的可核验输入支持数值估值。已交付方法适用性、资料缺口与执行记录；价格区间及数值敏感性标记为未计算，不以零值或模型猜测代替。"
+    scenario = bool(record and record.request.analysis_basis == "user_scenario" or not record and session.input_dataset and session.input_dataset.analysis_basis == "user_scenario")
+    frozen_sources = service.store.run_sources(record.run_id) if record else None
+    forecast_proposal = (frozen_sources["research"].get("forecast_proposal") if frozen_sources else None) if record else (
+        session.forecast_proposal.model_dump(mode="json") if session.forecast_proposal else None)
+    input_records = record.request.input_records if record else [row.model_dump(mode="json") for row in session.input_dataset.active_records()] if session.input_dataset else []
+    selected_path = bool(input_records)
+    selected_files = {row["source"].get("file_id") for row in input_records if row["source"]["kind"] != "user"}
+    report_facts = [] if selected_path else session.facts
+    report_sources = [doc for doc in session.documents if doc.file_id in selected_files] if selected_path else session.documents
+    report_searches = [] if selected_path else session.search_history
     counts = {
-        "verified": sum(f.status == "confirmed" and not f.warnings for f in session.facts),
-        "staged": sum(f.status == "proposed" and not f.warnings for f in session.facts),
-        "needs_repair": sum(f.status != "rejected" and bool(f.warnings) for f in session.facts),
-        "sources": len(session.documents),
-        "searches": len(session.search_history),
+        "verified": sum(f.status == "confirmed" and not f.warnings for f in report_facts),
+        "staged": sum(f.status == "proposed" and not f.warnings for f in report_facts),
+        "needs_repair": sum(f.status != "rejected" and bool(f.warnings) for f in report_facts),
+        "sources": len(report_sources),
+        "searches": len(report_searches),
     }
     facts = [{"metric": f.metric, "label": METRIC_LABELS.get(f.metric, f.metric), "value": f.normalized_value,
               "period": f.period, "unit": f.unit, "raw_value": f.raw_value, "scope": f.scope,
               "source_id": f.block_id, "source_url": f.source_url, "sha256": f.source_sha256}
-             for f in session.facts if f.status == "confirmed" and not f.warnings and f.role == "historical"]
+             for f in report_facts if f.status == "confirmed" and not f.warnings and f.role == "historical"]
+    if selected_path:
+        facts = [{"metric": row["metric"], "label": METRIC_LABELS.get(row["metric"], row["metric"]), "value": row["value"],
+                  "period": row.get("period_end") or row.get("as_of"), "unit": row["unit"], "raw_value": row["original_amount"],
+                  "scope": row["scope"], "source_id": row["source"]["source_id"], "source_url": row["source"].get("source_url", ""),
+                  "sha256": row["source"]["sha256"]} for row in input_records if row["assertion"] == "reported" and row.get("role", "historical") == "historical"]
+        counts["verified"] = len(facts)
     sources = []
-    for doc in session.documents:
+    for doc in report_sources:
         # Only the source manifest is copied; large raw blocks stay in the audit package.
         location = service.store.research_source_location(session.session_id, doc.file_id)
         sources.append({**doc.model_dump(mode="json"), "source_url": location.get("source_url") or location.get("url") or "",
                         "published_at": location.get("published_at")})
-    gaps = list(dict.fromkeys([m["reason"] for m in methods if m["selected"] and m["status"] == "missing"] + session.gaps))
+    gaps = list(dict.fromkeys([m["reason"] for m in methods if m["selected"] and m["status"] == "missing"] + ([] if selected_path else session.gaps)))
     steps = (["确认页面上的估值方案，系统将继续计算区间、敏感性并生成完整报告。"] if executable else
              ["可直接下载本说明报告；已有资料和检索记录会保留。", "补齐方法表中列出的关键缺项后继续；只需补缺失项，无需重新上传全部资料。"])
-    if not session.draft.company and not session.draft.ticker:
+    if not scenario and not session.draft.company and not session.draft.ticker:
         steps.insert(0, "提供公司名称或代码，系统才能定位对应的正式披露。")
     if not service._clients.get(session.session_id) and not numeric:
         steps.append("连接推理模型后，可自动理解需求、定位公开资料并提取字段；报告下载本身不依赖模型服务。")
-    if session.data_source_preference == "upload" and not session.documents:
+    if not scenario and session.data_source_preference == "upload" and not session.documents:
         steps.append("当前选择了上传模式；若不提供文件，可切换为公开资料检索。")
     limitations = [
         "结论只覆盖所列公司、估值日和方法；资料缺失不等于相应指标为零。",
@@ -113,23 +174,47 @@ def build_result_document(service, session):
     ]
     if result:
         limitations.extend(result.warnings)
+    explicit_multiples = record.request.assumptions.model_dump(mode="json")["relative_multiples"] if record else {row["metric"].removesuffix("_multiple"): row["value"] for row in input_records if row["metric"].endswith("_multiple")}
+    if scenario:
+        limitations[1] = "本报告按用户提供的数据和假设进行情景计算，未将其核验为官方披露，不要求联网证明用户假设。"
+        for method in methods:
+            if method["method"] != "dcf":
+                method["formula"] = method["formula"].replace("同期 FY 可比市盈率", "指定市盈率").replace("同期 FY 可比市销率", "指定市销率").replace("可比倍数", "指定倍数")
     issue = session.last_issue
     # A source-risk inventory is a diagnostic, not a promoted financial fact.
     # Before a final baseline exists, use the latest eligible candidate year
     # solely to locate risk-bearing rows and disclose that selection explicitly.
-    periods = [_period(f.period) for f in session.facts if f.role == "historical" and f.status != "rejected"]
+    periods = [_period(f.period) for f in report_facts if f.role == "historical" and f.status != "rejected"]
     periods = [period for period in periods if period and period.month == 12 and period.day == 31
                and (not session.draft.valuation_date or period <= session.draft.valuation_date)]
     source_risks = service.valuation_assembler.source_risks(session, max(periods)) if periods else None
     if source_risks:
         source_risks["baseline_selection"] = "最新候选年度，仅用于原文风险定位；不表示已确认财务基期或已完成估值。"
     document = {
-        "schema": "valuation-outcome-v1", "source_revision": session.revision,
+        "schema": REPORT_SCHEMA, "source_revision": session.revision,
         "session_id": session.session_id, "generated_at": str(session.updated_at),
-        "company": session.draft.company or session.draft.ticker or "研究对象待确定",
-        "ticker": session.draft.ticker, "valuation_date": str(session.draft.valuation_date or "待确定"),
+        "company": (record.request.company.name or record.request.company.ticker) if record else session.draft.company or session.draft.ticker or "研究对象待确定",
+        "ticker": record.request.company.ticker if record else session.draft.ticker, "valuation_date": str(record.request.valuation_date if record else session.draft.valuation_date or "待确定"),
         "status": status, "status_label": STATUS[status], "conclusion": conclusion,
         "numeric_result_available": numeric, "counts": counts, "methods": methods,
+        "method_completion": completion,
+        "analysis_basis": "user_scenario" if scenario else "research", "input_records": input_records, "explicit_multiples": explicit_multiples,
+        "baseline_selection": record.request.baseline_selection if record else (session.input_dataset.baseline_selection if session.input_dataset else {}),
+        "input_derivations": ([{"period_end": str(snapshot.period_end or "未指定"),
+            "policy": snapshot.calculation_methods["derivation_policy"], "metric": metric,
+            "value": str(getattr(snapshot, metric)), "formula": formula,
+            "evidence_ids": [reference.evidence_id for reference in snapshot.evidence.get(metric, [])]}
+            for snapshot in [*record.request.historical_financials, record.request.financials]
+            if snapshot is not None and "derivation_policy" in snapshot.calculation_methods
+            for metric, formula in snapshot.calculation_methods.items()
+            if metric in DERIVATIONS and formula == DERIVATIONS[metric][2]] if record else []) + balance_change_rows(record),
+        "input_calculations": frozen_input_calculations(record),
+        "peer_screening": record.request.peer_screening if record else [],
+        "peer_capital_bridges": [{"ticker": peer.ticker, "name": peer.name,
+            "market_cap": str(peer.market_cap), "enterprise_value": str(peer.enterprise_value),
+            "financial_period_end": str(peer.financial_period_end), "pricing_date": str(peer.as_of_date),
+            "ev_ebitda": str(peer.ev_ebitda), **peer.capital_bridge}
+            for peer in record.request.peers if peer.capital_bridge and peer.ev_ebitda is not None] if record else [],
         "valuation_run_id": session.valuation_run_id,
         "valuation_run_updated_at": str(record.updated_at) if record else None,
         "valuation_result": result.model_dump(mode="json") if numeric else None,
@@ -137,11 +222,12 @@ def build_result_document(service, session):
         "unconfirmed_candidates": [{"metric": f.metric, "period": f.period, "raw_value": f.raw_value, "unit": f.unit,
                                     "source_id": f.block_id, "warnings": f.warnings,
                                     "state": "待补证，不可计算" if f.warnings else "通过来源校验，尚待最终方案确认"}
-                                   for f in session.facts if f.status == "proposed"],
-        "research_summary": session.summary,
-        "forecast_assumptions": session.forecast_proposal.model_dump(mode="json") if session.forecast_proposal else None,
-        "gaps": gaps, "next_steps": steps if not numeric else ["使用完整估值任务导出 Excel 底稿、PDF 报告和 JSON 离线复算包。"],
-        "limitations": list(dict.fromkeys(limitations)), "searches": session.search_history,
+                                   for f in report_facts if f.status == "proposed"],
+        "research_summary": "本报告仅使用冻结快照中逐项列明的来源与假设；工作区其他资料不自动成为本次计算依据。" if selected_path else session.summary,
+        "forecast_assumptions": forecast_proposal if "dcf" in (record.request.methods if record else selected) else None,
+        "gaps": gaps, "next_steps": ([completion["instruction"]] if status == "partially_valued" else
+            steps if not numeric else ["使用完整估值任务导出 Excel 底稿、PDF 报告和 JSON 离线复算包。"]),
+        "limitations": list(dict.fromkeys(limitations)), "searches": report_searches,
         "latest_issue": {"code": issue.code, "message": issue.message, "status": issue.status} if issue else None,
         "source_risk_review": source_risks,
         "model": {"provider": session.model_provider, "name": session.model_name, "prompt_version": session.prompt_version},
@@ -162,7 +248,7 @@ def ensure_result_document(service, session=None):
             run_stamp = str(service.store.get_run(session.valuation_run_id).updated_at)
         except KeyError:
             pass
-    if previous and previous["source_revision"] == session.revision and previous.get("valuation_run_updated_at") == run_stamp:
+    if previous and previous.get("schema") == REPORT_SCHEMA and previous["source_revision"] == session.revision and previous.get("valuation_run_updated_at") == run_stamp:
         if _digest({key: value for key, value in previous.items() if key != "report_id"}) != previous["report_id"]:
             raise ValueError("已保存报告的完整性校验失败，请管理员检查存储；未交付可能损坏的报告。")
         return previous
@@ -180,38 +266,96 @@ def _forecast_lines(proposal):
         return ["暂无已提出的预测假设。未擅自填入增长、利润率或折现率。"]
     inputs = proposal["inputs"]
     labels = {"pessimistic": "审慎", "base": "基准", "optimistic": "乐观"}
-    lines = [f"状态：{'已确认' if proposal['status'] == 'confirmed' else '待集中确认'}。以下均为估计或观点，不是历史事实。",
+    lines = [f"方案状态：{'已确认' if proposal['status'] == 'confirmed' else '待集中确认'}；自动模式的confirmed不代表用户逐项批准。以下为预测假设，不是历史事实。",
              proposal["rationale"]]
     for key, title in (("revenue_growth_scenarios", "收入增长率"),
                        ("ebit_margin_scenarios", "EBIT利润率")):
         for scenario, label in labels.items():
-            path = (inputs.get(key) or {}).get(scenario)
+            path = (inputs.get(key) or {}).get(scenario) or inputs.get(key.removesuffix("_scenarios"))
             if path:
                 values = "、".join(f"{Decimal(str(value)) * 100}%" for value in path)
                 lines.append(f"{title}·{label}（第1至{len(path)}年）：{values}")
     lines.append(f"WACC：{Decimal(str(inputs['wacc'])) * 100}%；永续增长率：{Decimal(str(inputs['terminal_growth'])) * 100}%")
+    for key, label in (("stable_roic", "稳定期ROIC"), ("terminal_tax_rate", "稳定期税率")):
+        if inputs.get(key) is not None:
+            lines.append(f"{label}：{Decimal(str(inputs[key])) * 100}%")
+    if inputs.get("revenue_growth") is not None:
+        lines.append("三情景共享给定的单一收入路径；没有自动添加上下行情景。")
     lines.extend("风险：" + risk for risk in proposal["risks"])
     return lines
+
+
+def input_amount(row):
+    amount = row["original_amount"].strip()
+    unit = "倍" if row["metric"].endswith("_multiple") else "（比率）" if row["unit"] == "ratio" else row["unit"]
+    return amount if amount.endswith(unit) else amount + " " + unit
 
 
 def document_sections(doc):
     """One content model for HTML and PDF so their conclusions cannot drift."""
     sections = [
         ("结论与适用范围", [doc["conclusion"], f"公司：{doc['company']}　代码：{doc['ticker'] or '待确定'}　估值日：{doc['valuation_date']}"]),
-        ("已核验事实", [f"{f['period']} · {f['label']}：{f['raw_value']} {f['unit']}；来源 {f['source_id']}" for f in doc["verified_facts"]] or ["暂无已确认的历史财务事实。暂存候选及搜索摘要不作为事实列入。"]),
-        ("方法适用性与最小输入", [f"{m['label']}（{'已选' if m['selected'] else '仅供评估'}）：{m['reason']}\n必需输入：{'、'.join(m['required_inputs'])}\n{m['formula']}" + ("\n相对估值还需至少3家同日、FY口径可比公司倍数；优先5家。" if m['method'] != 'dcf' else "\n自动预测需连续历史；历史不足时可提出有依据的十年三情景假设。") for m in doc["methods"]]),
+        ("已采用的目标公司数据", [f"{f['period']} · {f['label']}：{f['raw_value']} {f['unit']}；来源 {f['source_id']}" for f in doc["verified_facts"]] or ["暂无已采用的来源财务数据。暂存候选及搜索摘要不作为事实列入。"]),
+        ("方法适用性与最小输入", [f"{m['label']}（{'已选' if m['selected'] else '仅供评估'}）：{m['reason']}\n必需输入：{'、'.join(m['required_inputs'])}\n{m['formula']}" + ("\n用户指定倍数，不使用可比样本统计。" if m["method"] in doc.get("explicit_multiples", {}) else "\n相对估值还需至少3家同日、FY口径可比公司倍数；优先5家。" if m['method'] != 'dcf' else "\n自动预测需连续历史；历史不足时可提出有依据的十年三情景假设。") for m in doc["methods"]]),
     ]
+    if doc.get("input_records"):
+        sections.insert(1, ("模型输入与来源性质", [f"{row['entity']} · {'可比公司' if row.get('role') == 'comparable' else '目标公司'} · {row['metric']}：{input_amount(row)}；期间/时点：{row.get('period_end') or row.get('as_of') or '未指定'}；性质：{input_source_label(row['source'])}；依据：{row['source']['source_id']} · {row['source']['quote']}" for row in doc["input_records"]]))
+    if selection := doc.get("baseline_selection"):
+        sections.insert(1, ("财务基期选择", [f"基期：{selection.get('period_end') or '用户未指定年度'}；政策："
+            + ("用户明确指定历史年度，不声称最新可得。" if selection.get("policy") == "user_selected" else "当前已有合格输入/来源中的最新可得完整年度，不保证全市场所有资料均已取得。"),
+            "已观察到的可得完整年度：" + "、".join(selection.get("observed_available_target_periods", [])),
+            *( [f"用户依据：{selection['user_quote']}；消息：{selection.get('message_id')}；哈希：{selection.get('message_sha256')}"] if selection.get("user_quote") else [])]))
+    if doc.get("input_derivations"):
+        sections.append(("确定性输入推导", ["以下数值由冻结原始输入计算，不是新增原始披露；金额为本币元，比率为小数。"
+            + "历史有效税率不自动等于未来法定税率；营运资本现金流代理不等于已核验的资产负债表差额。",
+            *[f"{row['period_end']} · {row['metric']} = {row['value']}；公式：{row['formula']}；依赖输入：{', '.join(row['evidence_ids'])}；版本：{row['policy']}"
+              + (f"；期初年度：{row['previous_period_end']}；限制：{row['limitation']}" if row.get('previous_period_end') else '')
+              for row in doc['input_derivations']]]))
+    if doc.get("input_calculations"):
+        sections.append(("声明的建模计算与口径判断", ["以下加减由程序执行，科目选取及完整性属于建模判断，未经独立审计；不是新增披露值。",
+            *[f"{row.get('entity_ticker') or '目标公司'} · {row['period_end'] or '未注明年度的用户情景'} · {row['metric']} = {row['value']}；公式："
+              + " ".join(("+ " if term['operation'] == 'add' else '- ') + term['label'] + f" [{term['input_id']}]" for term in row['terms'])
+              + f"；说明：{row['rationale']}；限制：{'；'.join(row['limitations'])}；版本：{row['policy']}"
+              + (f"；有息债务是否已含租赁：{row['debt_includes_leases']}" if row['metric'] == 'interest_bearing_debt' else '')
+              for row in doc['input_calculations']]]))
+    if doc.get("peer_capital_bridges"):
+        sections.append(("可比企业价值资本桥接", [
+            f"{row['name']}（{row['ticker']}）：行情日{row['pricing_date']}；余额日{row['balance_date']}；年度分母{row['financial_period_end']}。"
+            + f"\n总市值{row['market_cap']}；EV={row['enterprise_value']}；EV/EBITDA={row['ev_ebitda']}。金额为{doc['valuation_result']['currency']}元。"
+            + "\n对市值的带符号调整：" + "；".join(f"{key}={value}" for key, value in row['adjustments'].items())
+            + f"\n债务已含租赁：{row['debt_includes_leases']}；现金已含非经营投资：{row['cash_includes_associates']}。已含项不重复加减，不代表原始余额为零。"
+            + f"\n口径判断：{row['rationale']}；限制：" + "；".join([*row['limitations'], *row['warnings']])
+            for row in doc['peer_capital_bridges']]))
+    if doc.get("peer_screening"):
+        sections.append(("可比选择与剔除", [f"{item['name']}（{item['ticker']}）：{'采用' if item['status'] == 'included' else '未采用'}；"
+            f"方法：{', '.join(item['methods']) or '无'}；定价日：{item['pricing_date']}；财务年度：{item['financial_period_end']}。"
+            f"\nAgent选样判断（未独立核验业务可比性）：{item['rationale']}。"
+            + ("\nA股价格等值市值口径，不代表多类别股份各市场市值之和。" if item.get('pricing_basis') == 'a_share_equivalent' else '')
+            + ("\n限制：" + '；'.join(item['reasons']) if item['reasons'] else '') for item in doc['peer_screening']]))
     if doc["valuation_result"]:
         result = doc["valuation_result"]
         values = []
         if result.get("dcf"):
             dcf = result["dcf"]
             values.append(f"DCF：每股基准 {dcf['per_share_value']}；区间 {dcf['range_low']} - {dcf['range_high']} {result['currency']}/股。")
-        values += [f"{r['method'].upper()}：每股基准 {r['per_share_value']}；区间 {r['range_low']} - {r['range_high']} {result['currency']}/股。" for r in result["relative"] if r["status"] == "success"]
+        for item in result["relative"]:
+            if item["status"] != "success":
+                continue
+            detail = f"指定倍数 {item['selected_multiple']}；股权价值 {item['equity_value']} {result['currency']}；未构造统计区间。" if item.get("valuation_basis") == "explicit_multiple" else f"区间 {item['range_low']} - {item['range_high']} {result['currency']}/股。"
+            values.append(f"{item['method'].upper()}：每股基准 {item['per_share_value']} {result['currency']}/股；{detail}")
         sections.append(("估值计算结果", values))
     if doc.get("unconfirmed_candidates"):
         sections.append(("已提取候选（未确认为事实）", [f"{f['period']} · {f['metric']}：{f['raw_value']} {f['unit']} · {f['state']}\n来源 {f['source_id']}" + ("\n待核验：" + "；".join(f['warnings']) if f['warnings'] else "") for f in doc["unconfirmed_candidates"]]))
     assumptions = doc["forecast_assumptions"]
+    assumption_lines = _forecast_lines(assumptions)
+    if not assumptions and doc.get("analysis_basis") == "user_scenario":
+        assumption_lines = ["本情景使用上列用户输入与指定倍数，不将其视为外部核验结论；未使用的方法参数不补填。"]
+    sensitivity_lines = [doc["sensitivity_status"]]
+    if doc.get("valuation_result"):
+        studies = doc["valuation_result"].get("sensitivity_studies", [])
+        sensitivity_lines = [f"{item['parameter']}：基准输入 {item['baseline_input']}，每股 {item['baseline_per_share']}；"
+            f"低情景输入 {item['low_input']}，每股 {item['low_per_share']}；高情景输入 {item['high_input']}，每股 {item['high_per_share']}。"
+            for item in studies if item["status"] == "completed"] or ["该计算版本没有可用的敏感性结果；不能由估值完成推断敏感性也已计算。"]
     source_risks = doc.get("source_risk_review")
     if source_risks:
         sections.append(("原文风险科目检查", [source_risks["baseline_selection"], *source_risks["limitations"],
@@ -219,17 +363,17 @@ def document_sections(doc):
               + ("已绑定财务字段，仍需评估估值调整" if r['resolved'] else "尚未绑定当前基期，不可忽略")
               for r in source_risks["matches"]]]))
     sections += [
-        ("假设与观点", _forecast_lines(assumptions)),
-        ("敏感性分析", [doc["sensitivity_status"]]),
+        ("假设与观点", assumption_lines),
+        ("敏感性分析", sensitivity_lines),
         ("缺口与下一步", doc["gaps"] + doc["next_steps"]),
         ("来源清单", [
             f"{s['name']} · {s['role']} · {s['block_count']} 原文块\n"
-            f"可信等级 {s.get('authority_tier', 'D')} · 来源置信度 {round(float(s.get('source_confidence', 0.5)) * 100)}%"
+            f"来源等级 {s.get('authority_tier', 'D')}（分类标签，不代表统计准确率）"
             f" · {s.get('provenance_type', 'unknown')} · {s.get('provider') or '未标明提供方'}\n"
             f"{s.get('source_url') or '本地资料'}\nSHA-256: {s['sha256'] or '未记录'}"
             + ("\n读取限制：" + "；".join(s['warnings']) if s.get('warnings') else "")
             for s in doc["sources"]
-        ] or ["暂无取得的原始资料。用户无需先上传文件；公开资料仍须实际检索、下载并核验。"]),
+        ] or ["本次仅使用已列明的用户消息与假设，无外部披露来源；不要求为了情景试算另行联网。" if doc.get("analysis_basis") == "user_scenario" else "暂无取得的原始资料。用户无需先上传文件；公开资料仍须实际检索、下载并核验。"]),
         ("检索与异常记录", [f"{s.get('query', '')} · {s.get('purpose', '')} · {s.get('status', 'attempted')} · {s.get('provider', '')}\n{s.get('attempted_at', '')}" for s in doc["searches"]] or ["尚无已记录的网络检索请求；不宣称已经查遍公开来源。"]),
         ("风险与边界", doc["limitations"]),
         ("复核信息", [f"报告标识 SHA-256: {doc['report_id']}", f"研究版本：v{doc['source_revision']}；生成时间：{doc['generated_at']}", "模型：" + "/".join([doc["model"]["provider"] or "未连接", doc["model"]["name"] or "未连接"]), "原始资料、工具调用和更完整审计见 JSON 复核包。"]),

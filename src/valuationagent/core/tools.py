@@ -18,6 +18,7 @@ class ToolSpec:
     description: str
     arguments: type[BaseModel]
     handler: Callable[[Any], Any]
+    effects: tuple[str, ...] | None = None
 
     def schema(self) -> dict:
         return {

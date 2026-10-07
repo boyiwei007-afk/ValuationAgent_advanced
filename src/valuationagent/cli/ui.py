@@ -11,6 +11,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
+from valuationagent.application.result_views import input_source_label
 
 console = Console(highlight=False, theme=Theme({
     "accent": "#5EEAD4", "muted": "#94A3B8", "good": "#6EE7B7",
@@ -100,6 +101,14 @@ def workbench(snapshot, elapsed=0):
         heading.append(f"  ·  {int(elapsed)}s", style="#94A3B8")
     bound = snapshot.get("research_plan", {}).get("evidence_counts", {}).get("observations_verified", 0)
     rows = [heading, Text(f"{len(docs) - leads} 份原文 / {leads} 条线索  ·  {bound} 原文已绑定 / {verified} 通过字段准入 / {pending} 候选待处理", style="#CBD5E1")]
+    if dataset := session.get("input_dataset"):
+        superseded = {key for item in dataset["records"] for key in item.get("supersedes", [])}
+        active = [item for item in dataset["records"] if item["input_id"] not in superseded]
+        label = "模型输入工作区 · 来源数据与用户假设分别保留" if any(item["source"]["kind"] != "user" for item in active) else "用户输入情景 · 未经外部事实核验，无需先搜索年报"
+        rows.append(Text(f"{label} · {len(active)} 项有效输入", style="#5EEAD4"))
+        rows.extend(Text(f"{item.get('entity_ticker') or item['entity']} · {item['metric']}：{item['original_amount']} · {item.get('period_end') or item.get('as_of') or '期间未指定'} · {input_source_label(item['source'])}", style="#CBD5E1") for item in active[:8])
+        for peer in dataset.get("comparables", {}).values():
+            rows.append(Text(f"可比 {peer['name']}（{peer['ticker']}） · {'候选' if peer['enabled'] else '已剔除'} · Agent判断待独立复核：{peer['rationale']}", style="#94A3B8"))
     counts = snapshot.get("research_plan", {}).get("evidence_counts", {})
     if counts.get("semantic_review_pending") or counts.get("semantic_review_supported"):
         rows.append(Text(f"LLM语义复核：{counts.get('semantic_review_pending', 0)} 待复核 / {counts.get('semantic_review_supported', 0)} 已支持；原文定位不等于语义正确或独立审计。", style="#FBBF24"))

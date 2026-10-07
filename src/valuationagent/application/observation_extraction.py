@@ -63,17 +63,17 @@ class ReadingBasis(ApiModel):
 
 class Observation(ApiModel):
     metric: str = Field(min_length=1, max_length=120, description="原文科目名称，和standard_metric分开；修正映射不需要改写原文名称。")
-    standard_metric: str = Field(min_length=1, max_length=120, description="使用inspect_requirements.metric_catalog的字段ID，例如营业收入=revenue，归母净利润=net_income_parent，发行人普通股数=common_shares。未知字段可以记录但不入模，不自行创造英文别名。")
+    standard_metric: str = Field(min_length=1, max_length=120, description="标准模型字段使用inspect_requirements.metric_catalog的ID。无法直接映射但需保留的原始金额可用raw.前缀及英文小写标识，例如raw.operating_cost；不是最终模型字段，需原文复核后as_raw选择并由声明计算引用。不得把原始利润直接改名EBIT。")
     raw_value: str = Field(min_length=1, max_length=100, description="原文选定列的完整数值，保留负号/小数/百分号，不换算。可保留与basis.unit一致的明确单位后缀，如7.71亿元且unit=亿元；单位仍须原文依据及复核。不填整句、区间、约数推算或缺失占位符。")
     value_ref: str = Field(min_length=1, max_length=80, description="anchors字典中一个键名，例如rev_row；绝不是数值或引文正文。该键对应的原文可以是整行，工具从行内定位raw_value。")
     value_occurrence: int | None = Field(default=None, ge=0, le=100, description="仅当同一片段中有多个相同数值时，指定匹配数值的0起始序号；否则缩小引文范围。")
     value_segments: list[str] = Field(default_factory=list, max_length=8, description="仅文本层数字粘连时：列出同一原文行范围内完整连续数串的所有分段anchor ID（含value_ref），不能省略字符；分列语义仍须LLM复核。")
     label_refs: list[str] = Field(min_length=1, max_length=4)
     period_kind: Literal["annual", "instant", "interim", "ttm"] = Field(description="按字段经济含义选择，不按文件标题选择。股数/资产/负债/市值为instant并省略period_start，即使来自年报也不是annual；年度收入/利润是annual。期末日期仍须原文证据。")
-    period_start: date | None = Field(default=None, description="annual必填对应年份的01-01；interim/ttm填真实开始日；instant不填。")
+    period_start: date | None = Field(default=None, description="annual且period_end为12-31时可省略，完整日历年定义规范为同年01-01，不补造其他年度。interim/ttm必须填真实开始日；instant不填。")
     period_end: date
     period_refs: list[str] = Field(min_length=1, max_length=4)
-    basis: ReadingBasis | None = None
+    basis: ReadingBasis | None = Field(default=None, description="通常省略并使用顶层共享basis。仅该行口径不同才提供完整ReadingBasis，含独立entity_refs/scope_refs/unit_refs；不重复填写缺引用的半份basis。")
     revision: Literal["reported", "restated", "unknown"] = "reported"
     revision_refs: list[str] = Field(default_factory=list, max_length=4)
     semantic_role: Literal["operating", "financing", "financial_subsidiary", "investing", "tax", "equity", "non_operating", "unknown"] = "unknown"
@@ -90,6 +90,8 @@ class Observation(ApiModel):
 
     @model_validator(mode="after")
     def period_shape(self):
+        if self.period_kind == "annual" and self.period_start is None and (self.period_end.month, self.period_end.day) == (12, 31):
+            self.period_start = date(self.period_end.year, 1, 1)
         if self.period_kind == "instant":
             if self.period_start is not None:
                 raise ValueError("时点字段不填写period_start")
@@ -317,6 +319,7 @@ def same_observation(previous, current, proof):
 def model_issues(fact, row, basis):
     issues = []
     target = fact.standard_metric
+    raw_metric = re.fullmatch(r"raw\.[a-z][a-z0-9_]{0,79}", target) is not None
     if fact.unit in {"元", "千元", "万元", "百万元", "亿元"} and basis.currency != "CNY":
         issues.append("MODEL_CURRENCY: 金额须有原文币种依据；当前计算器仅接收CNY，不能默认为人民币或自动换汇")
     if fact.role == "comparable":
@@ -337,10 +340,13 @@ def model_issues(fact, row, basis):
                     issues.append("MODEL_MARKET_CAP: 使用发行人全部普通股总市值及确切定价日，不使用流通市值或单一股份类别市值")
             elif row.period_kind != "annual" or basis.scope != "consolidated":
                 issues.append("MODEL_PEER_ANNUAL: 可比分母使用完整年度合并收入/归母净利润，不使用季度、TTM、母公司利润或预测值")
-        else:
-            issues.append("MODEL_MULTIPLE: 可比字段仅支持pe/ps/ev_ebitda或推导用market_cap/revenue/net_income_parent")
-        return issues
-    if target not in METRIC_ALIASES:
+        if target in {"pe", "ps", "ev_ebitda", "market_cap", "revenue", "net_income_parent"}:
+            return issues
+        if basis.scope != "consolidated":
+            issues.append("MODEL_SCOPE: 可比经营分母与资本桥接必须保持合并口径")
+        if row.period_kind not in {"annual", "instant"}:
+            issues.append("MODEL_PEER_ANNUAL: 可比流量使用完整年度，桥接余额使用独立时点，不使用季度或TTM替代年度")
+    if target not in METRIC_ALIASES and not raw_metric:
         issues.append("MODEL_METRIC_UNKNOWN: 原文观察已保存，但此科目不在当前计算器字段字典内")
         return issues
     expected_units = ({"股", "千股", "万股", "百万股", "亿股"} if target in {"common_shares", "diluted_shares"}
@@ -348,19 +354,22 @@ def model_issues(fact, row, basis):
                       else {"元", "千元", "万元", "百万元", "亿元"})
     if fact.unit not in expected_units:
         issues.append("MODEL_DIMENSION: 股数、金额、比率维度不能互换")
-    if target in STOCK_METRICS and row.period_kind != "instant" or target not in STOCK_METRICS and row.period_kind == "instant":
+    if not raw_metric and (target in STOCK_METRICS and row.period_kind != "instant" or target not in STOCK_METRICS and row.period_kind == "instant"):
         issues.append("MODEL_PERIOD_KIND: " + (
             f"{target}为时点存量；用period_kind=instant，省略period_start，period_end填写原文真实截止日并引用依据；年报标题不能把股数/余额变成annual。用replaces更正，复核不能修复字段类型。"
             if target in STOCK_METRICS else
             f"{target}为期间流量；按原文填写annual/interim/ttm及真实起止日，不使用instant。用replaces更正，不扩大季度为全年。"))
+    if raw_metric and row.period_kind not in {"annual", "instant"}:
+        issues.append("MODEL_PERIOD_KIND: 原始计算科目须明确完整年度流量或时点存量，季度或TTM不拼入年度模型。")
     if target in {"common_shares", "diluted_shares"} and fact.scope != "issuer":
         issues.append("MODEL_SHARE_SCOPE: 股数需发行人口径和独立截止日，不以面值金额代替；若原文确为发行人股份总数，用basis.scope=issuer及真实scope_refs重新提交并replaces，不能用corroborate_facts清除此口径错误")
     elif fact.scope == "issuer" and target not in {"common_shares", "diluted_shares"}:
         issues.append("MODEL_SCOPE: 非股数财务字段不能使用issuer口径")
     if fact.semantic_role == "unknown" and target not in ROLE_INDEPENDENT_METRICS:
         issues.append("MODEL_ROLE: 尚未明确科目的经济角色")
-    if financial_mapping_issue(fact):
-        issues.append(financial_mapping_issue(fact))
+    mapping_issue = financial_mapping_issue(fact.model_copy(update={"role": "historical"}))
+    if mapping_issue:
+        issues.append("MODEL_MAPPING: " + mapping_issue)
     treatments = (fact.ebit_treatment, fact.fcff_treatment, fact.equity_bridge_treatment)
     if target in DEBT_COMPONENTS and treatments != ("exclude", "exclude", "include"):
         issues.append("MODEL_DEBT: 债务只进入权益桥接，不直接作为EBIT/FCFF")

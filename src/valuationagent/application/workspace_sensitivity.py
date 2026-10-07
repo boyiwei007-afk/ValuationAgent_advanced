@@ -55,10 +55,13 @@ def analyze_sensitivity(runtime, args):
         financials = result.effective_financials.model_copy(deep=True)
         assumptions = result.assumptions.model_copy(deep=True)
         peers = [peer.model_copy(deep=True) for peer in result.effective_peers]
+        trial_request = request.model_copy(deep=True)
         if args.parameter in {"wacc", "terminal_growth"}:
             assumptions = type(assumptions).model_validate({**assumptions.model_dump(), args.parameter: value})
         elif args.parameter == "multiple":
             peers = [peer.model_copy(update={args.method: value}) for peer in peers]
+            if args.method in trial_request.assumptions.relative_multiples:
+                trial_request.assumptions.relative_multiples[args.method] = value
         else:
             field = fields[args.parameter]
             original = getattr(financials, field)
@@ -76,7 +79,7 @@ def analyze_sensitivity(runtime, args):
             forecast = finance.forecast(request, financials, assumptions)
             computed = finance.dcf(request, financials, assumptions, forecast)
         else:
-            candidates = finance.relative(request, financials, peers)
+            candidates = finance.relative(trial_request, financials, peers)
             computed = next((row for row in candidates if row.method == args.method and row.status == "success"), None)
             if computed is None:
                 rows.append({"input": str(value), "status": "invalid", "reason": "情景不满足该方法计算条件。", "per_share_value": None})
@@ -88,7 +91,12 @@ def analyze_sensitivity(runtime, args):
               "model_version": result.model_version, "method": args.method, "parameter": args.parameter,
               "baseline_per_share": str(base.per_share_value), "scenarios": rows,
               "currency": result.currency, "baseline_unchanged": True,
-              "notice": "单因素假设试算，不是新的事实或正式估值版本，不是概率区间；其余输入固定，未联网、未改变原模型。multiple表示全部可比样本统一使用假设倍数，EV/EBITDA保持权益桥接不变。"}
+              "notice": "单因素假设试算，不是新的事实或正式估值版本，不是概率区间；其余输入固定，未联网、未改变原模型。multiple替换指定倍数或统一替换可比样本的倍数，EV/EBITDA保持权益桥接不变。"}
+    from valuationagent.application.turn_control import artifact_output_allowed
+
+    runtime.service._check_execution()
+    if not artifact_output_allowed(runtime.session):
+        return {**output, "artifact": None, "artifact_status": "disabled_by_user"}
     replay = {"request": request.model_dump(mode="json"), "financials": result.effective_financials.model_dump(mode="json"),
               "assumptions": result.assumptions.model_dump(mode="json"), "peers": [peer.model_dump(mode="json") for peer in result.effective_peers]}
     runtime.service._check_execution()

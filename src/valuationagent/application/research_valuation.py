@@ -265,6 +265,9 @@ def _normalized_metric(value: str, aliases: dict[str, set[str]]) -> str | None:
     paired = re.fullmatch(r"\s*(.+?)[（(]([^（）()]+)[）)]\s*", value)
     if paired:
         primary = _normalized_metric(paired[1], aliases)
+        display_unit = re.sub(r"\s+", "", paired[2]).removeprefix("人民币")
+        if display_unit in {"元", "千元", "万元", "百万元", "亿元", "股", "千股", "万股", "百万股", "亿股", "元/股", "元／股", "%", "％"}:
+            return primary
         alternate = _normalized_metric(paired[2], aliases)
         if primary is not None and primary == alternate:
             return primary
@@ -300,7 +303,7 @@ def financial_mapping_issue(fact) -> str:
         return "利润口径越级：营业利润、利润总额或净利润不能直接映射为EBIT/EBITDA/EBIT利润率；保留原始科目，补齐利润总额及核验融资利息后由程序推导。"
     revenue_metrics = {"revenue", "total_revenue", "main_business_revenue"}
     if source_metric in revenue_metrics and target in revenue_metrics and source_metric != target:
-        return "收入口径冲突：营业收入、营业总收入、主营业务收入须保留各自原始指标，不能用语义映射互换。"
+        return f"收入口径冲突：原文标签对应{source_metric}，却提交为{target}；营业收入、营业总收入、主营业务收入须保留各自原始指标，不能用语义映射互换。"
     return ""
 
 
@@ -713,7 +716,7 @@ class ResearchValuationAssembler:
     def _manual_forecast(session):
         proposal = session.forecast_proposal
         return bool(proposal and proposal.status == "confirmed"
-                    and proposal.inputs.revenue_growth_scenarios)
+                    and (proposal.inputs.revenue_growth_scenarios or proposal.inputs.revenue_growth))
 
     @staticmethod
     def pending_blockers(session):
@@ -1541,11 +1544,13 @@ class ResearchValuationAssembler:
             )[:500]
         proposal = session.forecast_proposal
         if proposal is not None:
+            from valuationagent.application.forecast_inputs import forecast_input_evidence
             from valuationagent.application.valuation_plan import scope_key
             if proposal.scope_key != scope_key(session):
                 raise ValueError("估值范围已改变，原预测方案已失效；请重新提出并确认预测假设")
             if proposal.status != "confirmed":
                 raise ValueError("预测方案尚未确认，请集中复核估值方案后再计算")
+            input_refs = forecast_input_evidence(session, proposal.evidence_ids)
             for metric, value in proposal.inputs.model_dump(
                 exclude_none=True, exclude_defaults=True
             ).items():
@@ -1553,14 +1558,29 @@ class ResearchValuationAssembler:
                     raise ValueError(f"预测方案与已确认假设 {metric} 冲突；请更正旧假设，不能静默覆盖")
                 values[metric] = value
                 evidence[metric] = [EvidenceRef(
-                    evidence_id=proposal.proposal_id, source="user_reviewed_model_assumption",
-                    note="模型推断，经用户确认；不是历史事实。依据：" + proposal.rationale
+                    evidence_id=proposal.proposal_id, source="forecast_assumption",
+                    note="预测假设，不是历史事实；自动预览及自动计算不代表用户逐项批准。依据：" + proposal.rationale
                          + "；关联证据：" + ", ".join(proposal.evidence_ids)
                          + "；风险：" + "；".join(proposal.risks),
-                )]
+                ), *input_refs]
         return AssumptionInputs.model_validate(values), evidence
 
     def build(self, session) -> ValuationRequest:
+        if session.input_dataset is not None:
+            from valuationagent.application.input_workspace import prepare_dataset
+
+            records = session.input_dataset.active_records()
+            has_sources = any(row.source.kind != "user" and row.role == "historical" for row in records)
+            if has_sources and (scope_issue := self.model_scope_issue(session)):
+                raise ValueError(scope_issue)
+            assumptions, evidence = {}, {}
+            if session.forecast_proposal:
+                forecast_session = session.model_copy(deep=True)
+                forecast_session.facts = []
+                proposal, evidence = self._assumptions(forecast_session)
+                assumptions = proposal.model_dump(exclude_none=True, exclude_defaults=True)
+            return prepare_dataset(session, self._selected_methods(session),
+                                   assumptions=assumptions, assumption_evidence=evidence)
         if not (session.draft.company or session.draft.ticker):
             raise ValueError("请先确认公司名称或A股代码。")
         if session.draft.valuation_date is None:

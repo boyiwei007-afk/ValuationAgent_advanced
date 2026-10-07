@@ -1,28 +1,45 @@
 """Research can start with incomplete material; confirmed valuation inputs stay strict."""
 
 from datetime import date, datetime, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from pydantic import Field, model_validator
 from valuationagent.schemas.models import ApiModel, AssumptionInputs, JsonDecimal, Language
+from valuationagent.schemas.control import SavedPermission, TurnControl
+from valuationagent.schemas.inputs import InputDataset
+
+
+ForecastPath = Annotated[list[JsonDecimal], Field(min_length=10, max_length=10)]
 
 
 class ForecastInputs(ApiModel):
     """Explicit opinions, never historical facts or silently filled defaults."""
 
-    revenue_growth_scenarios: dict[Literal["pessimistic", "base", "optimistic"], list[JsonDecimal]]
-    ebit_margin_scenarios: dict[Literal["pessimistic", "base", "optimistic"], list[JsonDecimal]] | None = None
+    revenue_growth: ForecastPath | None = Field(default=None, description="仅给定一个预测路径时填十年增长率；原样用于三情景，不自动制造上下行情景。与revenue_growth_scenarios二选一。")
+    ebit_margin: ForecastPath | None = Field(default=None, description="十年EBIT利润率；单路径原样用于三情景。与ebit_margin_scenarios二选一。")
+    revenue_growth_scenarios: dict[Literal["pessimistic", "base", "optimistic"], ForecastPath] | None = None
+    ebit_margin_scenarios: dict[Literal["pessimistic", "base", "optimistic"], ForecastPath] | None = None
     wacc: JsonDecimal
     terminal_growth: JsonDecimal
+    stable_roic: JsonDecimal | None = Field(default=None, gt=0, le=1)
+    terminal_tax_rate: JsonDecimal | None = Field(default=None, ge=0, le=1)
+    tax_transition_years: int | None = Field(default=None, ge=0, le=10)
 
     @model_validator(mode="after")
     def validate_projection(self):
+        if (self.revenue_growth is None) == (self.revenue_growth_scenarios is None):
+            raise ValueError("必须且只能提交一种十年收入增长路径：revenue_growth或revenue_growth_scenarios")
+        if self.ebit_margin is not None and self.ebit_margin_scenarios is not None:
+            raise ValueError("EBIT利润率只能选择单路径或三情景，不得重复提交")
         AssumptionInputs.model_validate(self.model_dump(exclude_none=True))
         if self.wacc <= self.terminal_growth:
             raise ValueError("WACC必须高于永续增长率")
         for key in ("revenue_growth_scenarios", "ebit_margin_scenarios"):
             paths = getattr(self, key)
             if paths is None:
-                continue
+                base = getattr(self, key.removesuffix("_scenarios"))
+                if base is None:
+                    continue
+                paths = {scenario: base for scenario in ("pessimistic", "base", "optimistic")}
             for path in paths.values():
                 if len(path) != 10:
                     raise ValueError(f"{key}必须明确给出每个情景的10年路径，不能自动延长")
@@ -154,7 +171,7 @@ class DocumentSummary(ApiModel):
     sha256: str = Field(default="", max_length=64)
     size_bytes: int = Field(default=0, ge=0)
     warnings: list[str] = Field(default_factory=list)
-    parse_status: Literal["parsed", "partial", "unreadable"] = "parsed"
+    parse_status: Literal["pending", "parsed", "partial", "unreadable"] = "parsed"
     provenance_type: Literal[
         "user_upload", "official_index", "official_filing",
         "public_web", "search_snippet", "structured_provider", "unknown",
@@ -164,6 +181,7 @@ class DocumentSummary(ApiModel):
     provider: str = Field(default="", max_length=120)
     source_url: str = Field(default="", max_length=2000)
     acquisition_ref: str = Field(default="", max_length=100)
+    issuer_identity: dict[str, Any] = Field(default_factory=dict)
 
 
 class DecisionOption(ApiModel):
@@ -177,6 +195,9 @@ class DecisionPrompt(ApiModel):
 
 
 class ResearchSession(ApiModel):
+    input_dataset: InputDataset | None = None
+    turn_control: TurnControl | None = None
+    execution_permissions: dict[str, SavedPermission] = Field(default_factory=dict)
     session_id: str
     revision: int = 1
     language: Language = Language.ZH_CN
@@ -194,6 +215,7 @@ class ResearchSession(ApiModel):
     plan: list[dict[str, str]] = Field(default_factory=list, max_length=12)
     pending_decision: DecisionPrompt | None = None
     resume_context: dict[str, Any] = Field(default_factory=dict)
+    input_acquisition: dict[str, Any] = Field(default_factory=dict)
     search_retry_epoch: int = Field(default=0, ge=0)
     # Empty until the user accepts the controller-owned combined plan.  A
     # reviewed subset lets one data-starved method be excluded without silently

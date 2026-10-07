@@ -176,6 +176,7 @@ class ValuationReportExporter:
         assumption_rows += [[f"行业参数 · {key}", str(value), ""] for key, value in result.assumptions.industry_parameters.items()]
         assumption_rows += [[f"经营驱动 · {key}", value, ""] for key, value in result.assumptions.operating_drivers.items()]
         assumption_rows += [[f"计算方法 · {key}", value, ""] for key, value in result.assumptions.calculation_methods.items()]
+        assumption_rows += [[f"指定倍数 · {key}", value, "显式假设，不是可比样本统计"] for key, value in record.request.assumptions.relative_multiples.items()]
         assumption_rows += [["模型决定", item, ""] for item in result.assumptions.model_decisions]
         rows(assumptions, assumption_rows)
         header(assumptions)
@@ -449,7 +450,7 @@ class ValuationReportExporter:
             rows(relative, [["代码", "公司", "P/E", "P/S", "EV/EBITDA", "层级", "筛选得分", "收入增长", "EBIT率", "筛选依据"]] + [
                 [peer.ticker, peer.name, peer.pe, peer.ps, peer.ev_ebitda,
                  peer.peer_tier, peer.selection_score, peer.revenue_growth,
-                 peer.ebit_margin, peer.rationale]
+                 peer.ebit_margin, peer.rationale + f"；选样依据={peer.selection_basis}；市值口径={peer.pricing_basis}"]
                 for peer in result.effective_peers
             ])
             header(relative)
@@ -602,7 +603,7 @@ class ValuationReportExporter:
                     f"{ref.sheet}!{ref.cell or ''}" if ref.sheet else ref.cell,
                 ] if part)
                 source_rows.append([
-                    "事实", field, ref.source, location,
+                    "用户输入（未经外部核验）" if ref.source == "user_input" else "事实", field, ref.source, location,
                     str(ref.published_at) if ref.published_at else "", _source_note(ref),
                 ])
         for field, refs in result.assumption_evidence.items():
@@ -1026,6 +1027,13 @@ class ValuationReportExporter:
         requested_relative = any(str(method) != "dcf" for method in record.request.methods)
         if requested_relative or result.effective_peers or result.relative:
             story += [PageBreak(), p("10. 相对估值", h2)]
+            if record.request.peer_screening:
+                story.append(p("可比选样为Agent判断，未独立核验业务、规模与盈利质量可比性。"))
+                for entry in record.request.peer_screening:
+                    story.append(p(f"{entry['name']}（{entry['ticker']}）：{entry['status']}；{entry['rationale']}；"
+                        + "；".join(entry['reasons'])))
+            if any(peer.pricing_basis == "a_share_equivalent" for peer in result.effective_peers):
+                story.append(p("部分可比使用总股本乘A股价格的等值市值，多类别股份时不等于各市场实际市值之和；估值须按此条件解读。"))
             if result.effective_peers:
                 story.append(table([["代码", "公司", "P/E", "P/S", "EV/EBITDA", "层级/得分"]] + [
                     [peer.ticker, peer.name, peer.pe or "-", peer.ps or "-", peer.ev_ebitda or "-",
@@ -1039,7 +1047,8 @@ class ValuationReportExporter:
                         f"{item.per_share_value:.2f}" if item.per_share_value is not None else "-",
                         (
                             f"{item.range_low:.2f} - {item.range_high:.2f}"
-                            if item.status == "success" else item.reason
+                            if item.range_low is not None and item.range_high is not None else
+                            f"指定倍数 {item.selected_multiple}；股权价值 {item.equity_value}；非统计区间" if item.valuation_basis == "explicit_multiple" else item.reason
                         ),
                     ]
                     for item in result.relative
@@ -1218,7 +1227,7 @@ class ValuationReportExporter:
                         f"{ref.sheet}!{ref.cell or ''}" if ref.sheet else ref.cell,
                     ] if part)
                     evidence_rows.append([
-                        "事实", field, ref.source,
+                        "用户输入（未经外部核验）" if ref.source == "user_input" else "事实", field, ref.source,
                         "；".join(part for part in [location, _source_note(ref)] if part),
                     ])
         for field, refs in result.assumption_evidence.items():

@@ -1,121 +1,92 @@
-"""Provider records as immutable research evidence, not ready-made valuations."""
-import json
+import hashlib
 from datetime import date
-from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from pydantic import Field
 
-from valuationagent.market.tushare import TushareDataProvider, normalize_a_share_ticker
+from valuationagent.market.tushare import normalize_a_share_ticker
 from valuationagent.schemas.models import ApiModel
 from valuationagent.schemas.research import DocumentSummary
 
-FIELDS = {
-    "income": ("合并利润表", "33", {
-        "revenue": "营业收入", "total_revenue": "营业总收入", "oper_cost": "营业成本",
-        "operate_profit": "营业利润", "total_profit": "利润总额", "income_tax": "所得税费用",
-        "n_income": "净利润", "n_income_attr_p": "归属于母公司股东的净利润",
-        "minority_gain": "少数股东损益", "int_exp": "利息费用", "fin_exp": "财务费用",
-    }),
-    "balancesheet": ("合并资产负债表", "36", {
-        "money_cap": "货币资金", "trad_asset": "交易性金融资产", "st_borr": "短期借款",
-        "lt_borr": "长期借款", "bond_payable": "应付债券", "lease_liab": "租赁负债",
-        "non_cur_liab_due_1y": "一年内到期的非流动负债", "minority_int": "少数股东权益",
-        "inventories": "存货", "accounts_receiv": "应收账款", "acct_payable": "应付账款",
-        "total_assets": "资产总计", "total_liab": "负债合计",
-    }),
-    "cashflow": ("合并现金流量表", "44", {
-        "n_cashflow_act": "经营活动产生的现金流量净额",
-        "c_pay_acq_const_fiolta": "购建固定资产、无形资产和其他长期资产支付的现金",
-        "depr_fa_coga_dpba": "固定资产折旧、油气资产折耗、生产性生物资产折旧",
-        "amort_intang_assets": "无形资产摊销", "lt_amort_deferred_exp": "长期待摊费用摊销",
-    }),
-}
-
 
 class FinancialHistoryRequest(ApiModel):
-    years: list[int] = Field(min_length=1, max_length=10)
-    statements: list[Literal["income", "balancesheet", "cashflow"]] = Field(
-        default_factory=lambda: list(FIELDS), min_length=1, max_length=3)
-
-
-def _date(value):
-    try:
-        return date.fromisoformat(str(value))
-    except ValueError:
-        return None
+    years: list[int] = Field(default_factory=list, max_length=10,
+        description="完整财务年度，例如[2025,2024]。仅请求按行情日期取数的statistics时省略；它使用任务截止日，不是当前年度财务快照。年度型供应商统计仍须提供完整年度。")
+    statements: list[Literal["income", "balancesheet", "cashflow", "statistics"]] = Field(
+        default_factory=lambda: ["income", "balancesheet", "cashflow"], min_length=1, max_length=4,
+        description="财务报表按years取完整年度。statistics为供应商统计：Tushare返回截止日前30天的每日股数/市值，有独立行情日期，不按years伪造年度快照。")
+    ticker: str = Field(default="", max_length=24, description="默认当前任务主体；取可比公司时显式填写其真实证券代码。")
 
 
 def fetch_history(runtime, args):
+    from valuationagent.application.file_workspace import source_bytes
+    from valuationagent.application.provider_inputs import provider_candidates
+
     session, service = runtime.session, runtime.service
     if session.data_source_preference == "upload":
         raise ValueError("NETWORK_OUT_OF_SCOPE: 当前任务仅允许上传数据")
     cutoff = session.information_cutoff_date or session.draft.valuation_date or date.today()
     years = sorted(set(args.years))
-    if any(year < 1990 or year >= cutoff.year for year in years):
-        raise ValueError("years须为截止日之前已结束的完整年度，不得将季度当全年")
-    ticker = normalize_a_share_ticker(session.draft.ticker)
+    ticker = normalize_a_share_ticker(args.ticker or session.draft.ticker)
+    default = getattr(getattr(runtime, "workspaces", None), "runner", None)
     with service._data_client_lock:
-        provider = service._market_clients.get(session.session_id)
-    if not isinstance(provider, TushareDataProvider):
+        provider = service._market_clients.get(session.session_id, service.history_provider or getattr(default, "data", None))
+    if not callable(getattr(provider, "fetch_history", None)):
         return {"status": "not_configured", "instruction": "没有已连接的结构化财务数据服务。继续用search_sources(source_route=web)查财务网页/表格或官方披露，不必等待用户配置。"}
-    documents, failures = [], []
+    date_only = set(getattr(provider, "history_date_only_statements", ()))
+    if set(args.statements) - date_only and (not years or any(year < 1990 or year >= cutoff.year for year in years)):
+        raise ValueError("ANNUAL_PERIOD_REQUIRED: years须为截止日之前已结束的完整年度，不得将季度当全年；仅按行情日期取数的statistics不受年度门槛限制。")
+    from valuationagent.application.issuer_identity import ensure_identity
+
+    identity, failures = None, []
+    try:
+        identity = ensure_identity(runtime, provider, ticker)
+    except ValueError as exc:
+        if str(exc).startswith(("SOURCE_CHANGED", "ISSUER_IDENTITY_CHANGED")):
+            raise
+        failures.append({"statement": "issuer_identity", "error": str(exc)[:800],
+            "instruction": "原始财务仍可读取，但身份未核对的API字段不得直接入模；换可核验来源，不猜名称/代码，不重复相同失败接口。"})
+    documents = []
     for statement in dict.fromkeys(args.statements):
         service._check_execution()
-        key = f"tushare:{ticker}:{statement}:{','.join(map(str, years))}:{cutoff}"
+        if statement not in provider.history_statements:
+            failures.append({"statement": statement, "error": "PROVIDER_CAPABILITY: 当前供应商不支持该报表", "supported": list(provider.history_statements)})
+            continue
+        statement_years = [] if statement in date_only else years
+        selection = hashlib.sha256(f"{provider.version}:{statement_years}:{cutoff}".encode()).hexdigest()[:16]
+        key = f"{provider.provider_id}:{ticker}:{statement}:{selection}"
         cached = next((doc for doc in session.documents if doc.provider == key), None)
         if cached:
-            documents.append({"file_id": cached.file_id, "cached": True})
+            _, raw = source_bytes(service.store, session, cached.file_id)
+            documents.append({"file_id": cached.file_id, "cached": True, "block_count": cached.block_count,
+                "warnings": cached.warnings, "input_candidates": provider_candidates(session, cached, raw)})
             continue
         if key in runtime.data_signatures:
             failures.append({"statement": statement, "error": "本轮已尝试该接口；换来源，不重复消耗供应商配额"})
             continue
         runtime.data_signatures.add(key)
-        title, doc_id, labels = FIELDS[statement]
-        fields = ["ts_code", "ann_date", "f_ann_date", "end_date", "report_type", *labels]
         try:
-            rows = provider.client.query(statement, params={"ts_code": ticker,
-                "start_date": f"{min(years) + 1}0101", "end_date": cutoff.strftime("%Y%m%d"), "report_type": "1"}, fields=fields)
+            snapshot = provider.fetch_history(ticker, statement, statement_years, cutoff, service._check_execution)
         except ValueError as exc:
             failures.append({"statement": statement, "error": str(exc)[:600]})
             continue
-        accepted = []
-        for record_index, record in enumerate(rows):
-            period = _date(record.get("end_date"))
-            published = _date(record.get("f_ann_date") or record.get("ann_date"))
-            if (str(record.get("ts_code", "")).upper() != ticker or str(record.get("report_type")) != "1"
-                    or not period or period.year not in years or (period.month, period.day) != (12, 31)
-                    or not published or not period <= published <= cutoff):
-                continue
-            accepted.append((record_index, record, period, published))
-        raw = json.dumps({"provider": "tushare", "statement": statement, "rows": rows}, ensure_ascii=False, default=str).encode()
-        meta = service.store.save_upload(f"{ticker}-{statement}.json", "evidence", "application/json", raw)
-        blocks = []
-        for record_index, record, period, published in accepted:
-            prefix = f"证券代码 {ticker}\n{title}\n单位：元\n项目 {period.year}年度\n"
-            for field, label in labels.items():
-                if record.get(field) is None or str(record[field]).strip() == "":
-                    continue
-                try:
-                    value = Decimal(str(record[field]))
-                    if not value.is_finite():
-                        continue
-                except InvalidOperation:
-                    continue
-                blocks.append({"block_id": f"{meta['file_id']}:{len(blocks) + 1}", "file_id": meta["file_id"],
-                    "text": prefix + f"{label} {format(value, 'f')}",
-                    "location": {"source_type": "structured_provider", "source_url": "https://api.tushare.pro",
-                        "published_at": published.isoformat(), "period_end": period.isoformat(),
-                        "provider_field": field, "record_index": record_index, "statement": statement,
-                        "schema_reference": f"https://tushare.pro/document/2?doc_id={doc_id}"}})
+        meta = service.store.save_upload(f"{ticker}-{statement}.json", "evidence", "application/json", snapshot.raw)
+        blocks = [{**block, "block_id": f"{meta['file_id']}:{index + 1}", "file_id": meta["file_id"]} for index, block in enumerate(snapshot.blocks)]
         service.store.save_research_blocks(session.session_id, meta["file_id"], blocks)
-        document = DocumentSummary(file_id=meta["file_id"], name=meta["original_name"], role="historical_financials",
+        target = normalize_a_share_ticker(session.draft.ticker) if session.draft.ticker else ticker
+        document = DocumentSummary(file_id=meta["file_id"], name=meta["original_name"], role="historical_financials" if ticker == target else "comparable_financials",
             block_count=len(blocks), sha256=meta["sha256"], size_bytes=meta["size_bytes"],
             provenance_type="structured_provider", authority_tier="B", source_confidence=.8,
-            provider=key, source_url="https://api.tushare.pro", parse_status="parsed" if blocks else "unreadable",
-            warnings=["供应商结构化转录，不是发行人原件；缺失、未来披露及不匹配主体未采纳，冲突记录不静默覆盖。"])
+            provider=key, source_url=snapshot.source_url, parse_status="parsed" if blocks else "unreadable",
+            warnings=snapshot.warnings)
         session.documents.append(document)
-        documents.append({"file_id": document.file_id, "block_count": len(blocks), "accepted_records": len(accepted),
-                          "excluded_records": len(rows) - len(accepted)})
-    return {"status": "sources_saved" if documents else "unavailable", "documents": documents, "failures": failures,
-            "instruction": "JSON响应快照已保存；read_file读取后由LLM解释语义，再用extract_observations提交并复核。没有直接写入财务事实，不补零、不默认现金可全部进入权益桥。"}
+        documents.append({"file_id": document.file_id, "block_count": len(blocks), "accepted_records": snapshot.accepted_records,
+            "excluded_records": snapshot.excluded_records, "warnings": snapshot.warnings, "catalog": snapshot.catalog,
+            "input_candidates": provider_candidates(session, document, snapshot.raw)})
+    instruction = "供应商原始响应已保存，input_candidates已展示有字段契约的原值、单位、主体及期间。按任务选择candidate_id交record_inputs(provider_values)，不必再次read_file或手填映射。其他科目用catalog定位原始记录供LLM解释复核，不直接改名入模。缺失只定向补证，不重复取数、不补零、不把抓取日当披露日。"
+    if not session.draft.ticker:
+        instruction = "原始响应已保存，请求代码有效；当前任务尚未保存目标代码，因此暂不生成目标/可比输入候选。先update_task(draft={ticker:已核对的研究目标代码})，再list_input_candidates读取已有文件，不重新调用取数或反复手抄原始JSON。"
+    return {"status": "sources_saved" if documents else "unavailable", "provider": provider.provider_id,
+            "documents": documents, "failures": failures, "issuer_identity": identity,
+            "date_only_statements": sorted(set(args.statements) & date_only), "information_cutoff": cutoff.isoformat(),
+            "target_registration_required": not bool(session.draft.ticker), "instruction": instruction}

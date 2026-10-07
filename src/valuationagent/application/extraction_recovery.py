@@ -64,7 +64,7 @@ def recovery_plan(session, image_enabled=False, *, file_ids=None):
         suffix = Path(document.name).suffix.lower()
         if suffix == ".pdf":
             strategies.extend({"tool": "read_file", "arguments": {"file_id": document.file_id, "view": view},
-                "instruction": "结合原文位置填写page；pdf_geometry按字形坐标解码，可分开文本层粘连列，不解释财务语义。不重复下载整份报告。"} for view in ("pdf_geometry", "pdf_plain", "pdf_layout") if view not in tried_views)
+                "instruction": "结合原文位置填写page；pdf_tables保留行列和单元格位置，pdf_geometry按字形坐标解码。不解释财务语义，不重复下载整份报告。"} for view in ("pdf_tables", "pdf_geometry", "pdf_plain", "pdf_layout") if view not in tried_views)
             if image_enabled and not any(attempt["tool"] == "view_pdf_page" for attempt in attempts):
                 strategies.append({"tool": "view_pdf_page", "arguments": {"file_id": document.file_id}, "instruction": "填写目标page；看图识别布局，不把视觉猜测当作确定性核验。"})
         elif suffix == ".xlsx" and "sheet" not in tried_views:
@@ -101,8 +101,19 @@ def recovery_plan(session, image_enabled=False, *, file_ids=None):
         elif any("PAGE_NOT_FOUND" in issue for issue in latest_issues):
             strategies = [{"tool": "inspect_file", "arguments": {"file_id": document.file_id},
                            "instruction": "核对当前文件真实页数；block_id后缀不是页码。需要正文位置时用search_file查关键词再按返回的location.page读取，不反复加减猜页码。"}]
-        if session.data_source_preference != "upload" and not format_failure:
-            strategies.append({"tool": "search_sources", "instruction": "若上述视图仍不能消歧，定向查该字段/期间的其他来源，不重搜当前文件；保留来源等级。"})
+        json_contract_failure = suffix == ".json" and any("JSON_" in issue or "VIEW_MISMATCH" in issue for issue in latest_issues)
+        if json_contract_failure:
+            strategies = [{"tool": "inspect_file", "arguments": {"file_id": document.file_id},
+                "instruction": "查看真实数组目录与字段示例，再用records视图读取一条记录。列式数组需record_columns_path；按实际字段名与原始日期字符串筛选，不用其他供应商字段，不退回整份单行raw_text。"}]
+        web_allowed = session.turn_control is None or {"network", "web"} <= set(session.turn_control.effects)
+        if any("SOURCE_NOT_DOWNLOADED" in issue for issue in latest_issues):
+            strategies = ([{"tool": "fetch_search_source", "arguments": {"file_id": document.file_id},
+                "instruction": "这是尚未下载的已有搜索线索，先获取原文；不是已下载文件解析失败，不重复搜索或直接提取摘要。"}]
+                if session.data_source_preference != "upload" and web_allowed else [{"tool": "finish_response",
+                    "instruction": "只有搜索线索，当前权限不允许下载；说明权限限制或请求用户提供原件，不擅自联网。"}])
+        if session.data_source_preference != "upload" and not format_failure and not json_contract_failure and web_allowed:
+            if not any("SOURCE_NOT_DOWNLOADED" in issue for issue in latest_issues):
+                strategies.append({"tool": "search_sources", "instruction": "若上述视图仍不能消歧，定向查该字段/期间的其他来源，不重搜当前文件；保留来源等级。"})
         files.append({"file_id": document.file_id, "failure_count": len(failed), "historical_failure_count": len(historical_failures), "latest_issues": latest_issues,
                       "repeated_identical_failures": sum(attempt["signature"] == failed[-1]["signature"] for attempt in failed),
                       "next_choices": strategies})

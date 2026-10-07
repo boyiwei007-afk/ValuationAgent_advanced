@@ -10,6 +10,40 @@ from test_observation_extraction import example
 from observation_fixtures import ObservationModel, extraction_steps
 
 
+def test_extraction_schema_exposes_the_actual_metric_catalog_and_currency(tmp_path):
+    from valuationagent.application.observation_extraction import ExtractObservations
+    from valuationagent.core.tools import ToolSpec
+    from valuationagent.llm.context import DOCUMENT_PROMPT
+
+    runtime = runtime_at(tmp_path)
+    example(runtime)
+    schema = ToolSpec("extract_observations", "extract", ExtractObservations, lambda args: args).schema()
+    _, projected = runtime.adapt_request([{"role": "system", "content": "policy"}, {"role": "user", "content": "{}"}], [schema])
+    definitions = projected[0]["function"]["parameters"]["$defs"]
+    choices = definitions["Observation"]["properties"]["standard_metric"]["anyOf"]
+    assert {"revenue", "total_revenue", "net_income_parent", "common_shares"} <= set(choices[0]["enum"])
+    assert "net_profit" not in choices[0]["enum"]
+    assert choices[1]["pattern"] == r"^raw\.[a-z][a-z0-9_]*$"
+    assert "currency" in definitions["ReadingBasis"]["required"]
+    assert "currency" not in schema["function"]["parameters"]["$defs"]["ReadingBasis"]["required"]
+    assert len(DOCUMENT_PROMPT) < 3000
+
+
+def test_historical_focus_requires_an_explicit_target_but_reference_does_not(tmp_path):
+    runtime = runtime_at(tmp_path)
+    args = example(runtime)
+    runtime.session.draft.company = ""
+    runtime.session.draft.ticker = ""
+    task = FileTask(file_id=args["file_id"], entity_ticker="", role="historical",
+        objective="先读取文件并识别真实主体与相关财务数据", metrics=["revenue"])
+    with pytest.raises(ValueError, match="FILE_TASK_TARGET_MISSING"):
+        runtime.document_focus.begin(task)
+    assert runtime.document_focus.task is None
+    runtime.document_focus.begin(task.model_copy(update={"role": "reference"}))
+    assert runtime.document_focus.task.role == "reference"
+    assert runtime.session.draft.company == ""
+
+
 def test_same_loop_focus_extracts_reviews_and_returns_to_main_tools(tmp_path):
     runtime = runtime_at(tmp_path)
     args = example(runtime)
@@ -26,7 +60,7 @@ def test_same_loop_focus_extracts_reviews_and_returns_to_main_tools(tmp_path):
     assert state.facts[0].status == "confirmed"
     assert {tool["function"]["name"] for tool in model.kwargs[1]["tools"]} == READING_TOOLS
     assert {tool["function"]["name"] for tool in model.kwargs[4]["tools"]} == {"review_observations"}
-    assert "search_sources" in {tool["function"]["name"] for tool in model.kwargs[-1]["tools"]}
+    assert "search_sources" not in {tool["function"]["name"] for tool in model.kwargs[-1]["tools"]}
     assert "不联网" in canonical(model.calls[1])
     assert state.valuation_run_id is None
 
@@ -136,3 +170,63 @@ def test_reference_focus_reads_unknown_or_multiple_entities_without_assigning_ta
     with pytest.raises(ValueError, match="FILE_TASK_SCOPE"):
         runtime.document_focus.guard("extract_observations", args)
     assert runtime.session.draft.ticker == "600123" and not runtime.session.facts
+
+
+def test_phase_mismatch_returns_to_parent_without_executing_rejected_arguments(tmp_path):
+    from valuationagent.core.tools import NoArguments, ToolRegistry, ToolSpec
+    from valuationagent.llm.agent import run_tool_loop
+    from valuationagent.llm.client import ToolPhaseError
+
+    runtime = runtime_at(tmp_path)
+    args = example(runtime)
+    task = FileTask(file_id=args["file_id"], entity_ticker="", role="reference",
+        objective="只读原始文件并识别主体后保存观察，不联网不估值", metrics=["revenue"])
+    runtime.document_focus.begin(task)
+    executed = []
+
+    class Model:
+        def __init__(self):
+            self.offered = []
+
+        def chat(self, messages, **kwargs):
+            self.offered.append({tool["function"]["name"] for tool in kwargs["tools"]})
+            if len(self.offered) == 1:
+                raise ToolPhaseError("TOOL_PHASE_MISMATCH: rejected outside file phase")
+            return {"tool_calls": [{"id": "new_decision", "function": {"name": "finish", "arguments": "{}"}}]}
+
+    model = Model()
+    registry = ToolRegistry([ToolSpec("end_file_task", "end", NoArguments, lambda _: executed.append("unexpected")),
+        ToolSpec("finish", "finish", NoArguments, lambda _: executed.append("finish") or {"_terminal": True})])
+    result = run_tool_loop(model, [{"role": "system", "content": "policy"}, {"role": "user", "content": "{}"}],
+        registry, lambda name, arguments, invoke: invoke(), request_adapter=runtime.document_focus.adapt,
+        phase_recovery=runtime.document_focus.recover_phase)
+    assert executed == ["finish"] and result["_agent_trace"]["phase_returns"] == [args["file_id"]]
+    assert model.offered == [{"end_file_task"}, {"end_file_task", "finish"}]
+    assert runtime.document_focus.task is None and not runtime.session.facts
+    events = runtime.service.store.list_events(runtime.session.session_id)
+    assert any(event.type == "agent.file_phase_return" for event in events)
+    runtime.document_focus.begin(task)
+    assert runtime.document_focus.recover_phase() is None
+    assert runtime.document_focus.task is not None
+
+
+def test_non_phase_protocol_error_does_not_change_file_scope(tmp_path):
+    from valuationagent.core.tools import NoArguments, ToolRegistry, ToolSpec
+    from valuationagent.llm.agent import run_tool_loop
+    from valuationagent.llm.client import ToolProtocolError
+
+    runtime = runtime_at(tmp_path)
+    args = example(runtime)
+    runtime.document_focus.begin(FileTask(file_id=args["file_id"], entity_ticker="", role="reference",
+        objective="只读取已有原始文件，不联网不估值", metrics=["revenue"]))
+
+    class Model:
+        def chat(self, *args, **kwargs):
+            raise ToolProtocolError("TOOL_JSON_TRUNCATED: fixture")
+
+    registry = ToolRegistry([ToolSpec("end_file_task", "end", NoArguments, lambda _: {"_terminal": True})])
+    with pytest.raises(ToolProtocolError):
+        run_tool_loop(Model(), [], registry, lambda name, arguments, invoke: invoke(),
+            phase_recovery=runtime.document_focus.recover_phase)
+    assert runtime.document_focus.task is not None
+    assert not runtime.document_focus.phase_returns

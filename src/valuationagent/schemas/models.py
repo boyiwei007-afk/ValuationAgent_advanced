@@ -100,7 +100,7 @@ class EvidenceRef(ApiModel):
 
 
 class FinancialSnapshot(ApiModel):
-    period_end: date
+    period_end: date | None = None
     # Missing means unknown, never zero. Required fields depend on the selected
     # method and are checked before any financial calculations.
     revenue: JsonDecimal | None = Field(default=None, gt=0)
@@ -113,6 +113,8 @@ class FinancialSnapshot(ApiModel):
     interest_bearing_debt: JsonDecimal | None = Field(default=None, ge=0)
     common_shares: JsonDecimal | None = Field(default=None, gt=0)
     diluted_shares: JsonDecimal | None = Field(default=None, gt=0)
+    market_price: JsonDecimal | None = Field(default=None, gt=0, description="仅市场比较参考，不用于倒推DCF假设。")
+    market_cap: JsonDecimal | None = Field(default=None, gt=0, description="显式提供的参考市值，不自动替换估值结果或WACC假设。")
     # Per-share denominator can be disclosed after the fiscal baseline.
     # This date is explicit so a later issuer total is not disguised as the
     # year-end balance-sheet share count.
@@ -165,6 +167,8 @@ class PeerCompany(ApiModel):
     ps: JsonDecimal | None = Field(default=None, gt=0)
     ev_ebitda: JsonDecimal | None = Field(default=None, gt=0)
     market_cap: JsonDecimal | None = Field(default=None, gt=0)
+    enterprise_value: JsonDecimal | None = Field(default=None, gt=0)
+    capital_bridge: dict = Field(default_factory=dict)
     revenue_growth: JsonDecimal | None = None
     ebit_margin: JsonDecimal | None = None
     selection_score: JsonDecimal | None = Field(default=None, ge=0)
@@ -175,6 +179,8 @@ class PeerCompany(ApiModel):
     multiple_basis: Literal["FY", "TTM", "forward", "unknown"] = "unknown"
     evidence: dict[str, list[EvidenceRef]] = Field(default_factory=dict)
     calculation_methods: dict[str, str] = Field(default_factory=dict)
+    selection_basis: Literal["unspecified", "agent_judgment"] = "unspecified"
+    pricing_basis: Literal["unspecified", "issuer_market_value", "a_share_equivalent"] = "unspecified"
 
 
 def required_financial_metrics(methods):
@@ -191,6 +197,7 @@ def required_financial_metrics(methods):
 
 
 class AssumptionInputs(ApiModel):
+    relative_multiples: dict[Literal["pe", "ps", "ev_ebitda"], JsonDecimal] = Field(default_factory=dict)
     revenue_growth: list[JsonDecimal] | None = None
     ebit_margin: list[JsonDecimal] | None = None
     revenue_growth_scenarios: dict[
@@ -217,9 +224,9 @@ class AssumptionInputs(ApiModel):
     capex_kappa: JsonDecimal | None = Field(
         default=None, ge=Decimal("-5"), le=Decimal("5")
     )
-    dso_days: JsonDecimal | None = Field(default=None, ge=0, le=Decimal("730"))
-    dio_days: JsonDecimal | None = Field(default=None, ge=0, le=Decimal("730"))
-    dpo_days: JsonDecimal | None = Field(default=None, ge=0, le=Decimal("730"))
+    dso_days: JsonDecimal | None = Field(default=None, ge=0, le=Decimal("730"), description="期末应收/年收入×365的等价天数，不是平均应收周转天数。")
+    dio_days: JsonDecimal | None = Field(default=None, ge=0, le=Decimal("730"), description="期末存货/年成本×365的等价天数，不是平均存货周转天数。")
+    dpo_days: JsonDecimal | None = Field(default=None, ge=0, le=Decimal("730"), description="期末应付/年成本×365的等价天数，不是平均应付周转天数。")
     operating_cost_ratio: JsonDecimal | None = Field(
         default=None, ge=0, le=Decimal("2")
     )
@@ -250,6 +257,8 @@ class AssumptionInputs(ApiModel):
 
     @model_validator(mode="after")
     def require_complete_scenario_sets(self) -> "AssumptionInputs":
+        if any(not value.is_finite() or not 0 < value <= 1000 for value in self.relative_multiples.values()):
+            raise ValueError("explicit relative multiples must be finite and in (0, 1000]")
         required = {"pessimistic", "base", "optimistic"}
         for field_name in (
             "revenue_growth_scenarios",
@@ -290,6 +299,7 @@ class ValuationRequest(ApiModel):
     historical_financials: list[FinancialSnapshot] = Field(default_factory=list)
     assumptions: AssumptionInputs = Field(default_factory=AssumptionInputs)
     peers: list[PeerCompany] = Field(default_factory=list)
+    peer_screening: list[dict] = Field(default_factory=list)
     file_ids: list[str] = Field(default_factory=list)
     assumption_file_ids: list[str] = Field(default_factory=list)
     assumption_evidence: dict[str, list[EvidenceRef]] = Field(default_factory=dict)
@@ -297,6 +307,10 @@ class ValuationRequest(ApiModel):
         "annual_midyear_remaining"
     )
     user_goal: str = "完成可追溯的企业估值并解释关键假设"
+    analysis_basis: Literal["research", "user_scenario"] = "research"
+    input_records: list[dict[str, Any]] = Field(default_factory=list)
+    input_calculations: list[dict[str, Any]] = Field(default_factory=list)
+    baseline_selection: dict[str, Any] = Field(default_factory=dict)
 
     def agent_parameters(self) -> dict[str, Any]:
         """Stable, JSON-safe task choices shared by CLI, API and Agent tools.
@@ -321,6 +335,7 @@ class ValuationRequest(ApiModel):
                 "assumptions",
                 "file_ids",
                 "assumption_file_ids",
+                "analysis_basis",
             },
         )
 
@@ -336,12 +351,16 @@ class ValuationRequest(ApiModel):
     @model_validator(mode="after")
     def source_inputs_are_present(self) -> "ValuationRequest":
         for snapshot in [*self.historical_financials, *([self.financials] if self.financials else [])]:
+            if snapshot.period_end is None and (self.analysis_basis != "user_scenario" or "dcf" in self.methods):
+                raise ValueError("research and DCF inputs require an explicit financial period end")
             if snapshot.common_shares_as_of and not (
-                snapshot.period_end <= snapshot.common_shares_as_of <= self.valuation_date
+                (snapshot.period_end is None or snapshot.period_end <= snapshot.common_shares_as_of)
+                and snapshot.common_shares_as_of <= self.valuation_date
             ):
                 raise ValueError("issuer share-count date must fall between the financial period end and valuation date")
             if snapshot.diluted_shares_as_of and not (
-                snapshot.period_end <= snapshot.diluted_shares_as_of <= self.valuation_date
+                (snapshot.period_end is None or snapshot.period_end <= snapshot.diluted_shares_as_of)
+                and snapshot.diluted_shares_as_of <= self.valuation_date
             ):
                 raise ValueError("diluted share-count date must fall between the financial period end and valuation date")
         if (
@@ -372,12 +391,23 @@ class ModelConnectionInput(ApiModel):
     base_url: str = "https://api.openai.com/v1"
     model: str = Field(min_length=1)
     api_key: SecretStr = Field(min_length=1)
-    timeout_seconds: float = Field(default=90.0, gt=1, le=180)
+    timeout_seconds: float = Field(default=180.0, gt=1, le=600)
+    output_token_budget: int = Field(default=8192, ge=512, le=131072)
+    max_output_tokens: int = Field(default=16384, ge=512, le=131072)
     thinking: Literal["auto", "enabled", "disabled"] = "auto"
     reasoning_protocol: Literal["auto", "chat_template"] = "auto"
     temperature: float | None = Field(default=0, ge=0, le=2)
-    tool_call_format: Literal["native", "json_content"] = "native"
+    top_p: float | None = Field(default=None, gt=0, le=1)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    top_k: int | None = Field(default=None, ge=1, le=1000)
+    tool_call_format: Literal["native", "json_content", "native_json", "qwen3_coder"] = "native"
     supports_images: bool = False
+
+    @model_validator(mode="after")
+    def validate_output_budget(self):
+        if self.output_token_budget > self.max_output_tokens:
+            raise ValueError("初始输出预算不得超过自动扩展上限")
+        return self
 
     @field_validator("base_url")
     @classmethod
@@ -404,10 +434,16 @@ class ModelSessionPublic(ApiModel):
     model: str
     created_at: datetime
     supports_images: bool = False
-    tool_call_format: Literal["native", "json_content"] = "native"
+    tool_call_format: Literal["native", "json_content", "native_json", "qwen3_coder"] = "native"
     reasoning_protocol: Literal["auto", "chat_template"] = "auto"
     thinking: Literal["auto", "enabled", "disabled"] = "auto"
     temperature: float | None = Field(default=0, ge=0, le=2)
+    top_p: float | None = Field(default=None, gt=0, le=1)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    top_k: int | None = Field(default=None, ge=1, le=1000)
+    output_token_budget: int = 8192
+    max_output_tokens: int = 16384
+    timeout_seconds: float = 180.0
 
 
 class ForecastYear(ApiModel):
@@ -480,7 +516,10 @@ class MultipleResult(ApiModel):
     sample_size: int = 0
     original_sample_size: int = 0
     outlier_count: int = 0
-    sample_quality: Literal["adequate", "limited", "insufficient"] = "insufficient"
+    sample_quality: Literal["adequate", "limited", "insufficient", "not_applicable"] = "insufficient"
+    valuation_basis: Literal["peer_sample", "explicit_multiple"] = "peer_sample"
+    selected_multiple: JsonDecimal | None = None
+    equity_value: JsonDecimal | None = None
     statistic: str = "P25/P50/P75"
     peer_tickers: list[str] = Field(default_factory=list)
     reason: str | None = None
@@ -536,6 +575,7 @@ class DataQualityAssessment(ApiModel):
 
 
 class ValuationOutput(ApiModel):
+    analysis_basis: Literal["research", "user_scenario"] = "research"
     run_id: str = ""
     revision: int = 1
     company: CompanyInput | None = None

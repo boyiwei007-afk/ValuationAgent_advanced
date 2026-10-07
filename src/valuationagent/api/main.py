@@ -22,6 +22,7 @@ from valuationagent.api.access import register_access
 from valuationagent.finance.factory import create_financial_model
 from valuationagent.finance.tools import FinanceResearchToolProvider
 from valuationagent.market import create_data_provider
+from valuationagent.market.factory import create_history_provider
 from valuationagent.search.providers import UnavailableSearchProvider, create_search_provider
 from valuationagent.llm.client import (
     LlmError,
@@ -91,6 +92,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     app.state.research = ResearchService(
         store,
         search_provider=search_provider,
+        history_provider=create_history_provider(),
         tool_providers=(FinanceResearchToolProvider(),),
     )
     app.state.workspaces = ValuationWorkspaceService(

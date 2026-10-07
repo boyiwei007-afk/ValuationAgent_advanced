@@ -32,6 +32,13 @@ const snapshot = {
   versions: [], checkpoints: [], plan: [{ title: '读取原文', status: 'completed' }],
 }
 const review = { executable_methods: ['dcf'], unresolved_items: [], assumptions: { revenue_growth_scenarios: { base: ['0.05', '0.04'] } }, inputs: {}, state_hash: 'a'.repeat(64), research_revision: 1, fact_ids: [], evidence_ids: [] }
+snapshot.research.session.input_dataset = { entity: '用户情景', analysis_basis: 'user_scenario', records: [
+  { input_id: 'input_first', metric: 'net_income_parent', original_amount: '10亿元', period_end: null, as_of: null, supersedes: [], source: { kind: 'user', source_id: 'msg_user', quote: '归母净利润10亿元' } },
+] }
+snapshot.active_run = { run_id: 'run_example', result: { currency: 'CNY', executive_summary: '用户输入情景，非官方核验', dcf: null,
+  relative: [{ method: 'pe', status: 'success', per_share_value: '40', range_low: null, range_high: null, selected_multiple: '20', valuation_basis: 'explicit_multiple', sample_size: 0 }],
+  data_quality: { result_grade: 'C', confidence: 'low', evidence_coverage: 0 }, assumptions: { wacc: '0', terminal_growth: '0' },
+} }
 const requests = []
 globalThis.fetch = async (url, options = {}) => {
   requests.push({ url, method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : null })
@@ -64,6 +71,27 @@ try {
   await act(async () => { root.render(createElement(WorkspaceApp)) })
   await flush()
   assert.match(host.textContent, /统一消息历史/)
+  assert.match(host.querySelector('[aria-label="用户输入情景"]').textContent, /10亿元.*未指定/)
+  await act(async () => { root.render(null) })
+  snapshot.research.session.input_dataset.records.push({ input_id: 'input_source', metric: 'common_shares', original_amount: '500000000', unit: '股', as_of: '2026-09-30', supersedes: [], source: { kind: 'document', source_id: 'fact_shares', quote: '发行人总股数500000000股' } })
+  await act(async () => { root.render(createElement(WorkspaceApp)) })
+  await flush()
+  assert.match(host.querySelector('[aria-label="模型输入工作区"]').textContent, /来源数据与用户假设分别保留/)
+  assert.match(host.querySelector('[aria-label="模型输入工作区"]').textContent, /来源解释已复核：fact_shares/)
+  await act(async () => { root.render(null) })
+  snapshot.research.session.input_dataset.records[1].source.provider_binding = { contract_version: 'test-version' }
+  snapshot.research.session.input_dataset.records[1].source.kind = 'provider'
+  await act(async () => { root.render(createElement(WorkspaceApp)) })
+  await flush()
+  assert.match(host.querySelector('[aria-label="模型输入工作区"]').textContent, /供应商字段契约校验：fact_shares/)
+  assert.doesNotMatch(host.querySelector('[aria-label="模型输入工作区"]').textContent, /来源解释已复核：fact_shares/)
+  await act(async () => { root.render(null) })
+  snapshot.research.session.input_dataset.records.pop()
+  await act(async () => { root.render(createElement(WorkspaceApp)) })
+  await flush()
+  assert.match(host.querySelector('.ws-value-cards').textContent, /40.00.*指定倍数 20.*非统计区间/)
+  assert.doesNotMatch(host.querySelector('.ws-value-cards').textContent, /0.00 – 0.00|0 家样本/)
+  assert.match(host.querySelector('.ws-summary-grid').textContent, /不使用 WACC/)
   assert.match(host.querySelector('.ws-access-session').textContent, /登录者共享全部资料/)
   assert.ok(button('退出访问'))
   assert.doesNotMatch(host.textContent, /旧分流不应显示/)
@@ -110,6 +138,15 @@ try {
   assert.match(host.querySelector('dialog').textContent, /0.05/)
   await act(async () => { host.querySelector('dialog .icon-button').click() })
   const deletionButton = title => host.querySelector(`button[aria-label="删除对话：${title}"]`)
+  await act(async () => { button('数据服务').click() })
+  await flush()
+  assert.match(host.querySelector('dialog').textContent, /Infoway API Key/)
+  const dataProvider = host.querySelector('dialog select')
+  assert.equal(dataProvider.value, 'infoway')
+  await act(async () => { dataProvider.value = 'tushare'; dataProvider.dispatchEvent(new window.Event('change', { bubbles: true })) })
+  assert.match(host.querySelector('dialog').textContent, /Tushare Token/)
+  assert.equal(host.querySelectorAll('dialog input[type="password"]').length, 2)
+  await act(async () => { host.querySelector('dialog .icon-button').click() })
   await act(async () => { deletionButton(otherWorkspace.title).click() })
   assert.match(host.querySelector('dialog').textContent, /无法撤销/)
   assert.ok(!requests.some(request => request.method === 'DELETE'))

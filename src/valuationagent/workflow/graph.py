@@ -212,6 +212,8 @@ def build_workflow(services: WorkflowServices):
             f"{method.upper()}因可靠数据不足未进入本次计算：{reason}"
             for method, reason in req.excluded_methods.items()
         ]
+        if req.analysis_basis == "user_scenario":
+            method_warnings.append("用户输入情景计算，未联网或核验为官方事实；未知期间/股数时点不补造，指定倍数不代表市场可比统计。")
         return {
             "bundle": bundle,
             "request": effective,
@@ -279,7 +281,7 @@ def build_workflow(services: WorkflowServices):
         )
         services.say(s["run_id"],
             translator(req.language)("假设已固定：WACC {wacc:.2%}，永续增长率 {growth:.2%}。").format(wacc=result.wacc, growth=result.terminal_growth)
-            if "dcf" in req.methods else "相对估值：使用已确认可比样本，不构建DCF预测或折现率假设。",
+            if "dcf" in req.methods else "相对估值：冻结指定倍数或可比样本，不构建DCF预测或折现率假设。",
             "assumption_resolution")
         return {"assumptions": result}
 
@@ -483,6 +485,11 @@ def build_workflow(services: WorkflowServices):
         summary += reconciliation.conclusion + " " + model_note.format(
             mode=req.mode, version=model_version
         )
+        for item in s["relative"]:
+            if item.status == "success":
+                summary += f" {item.method.upper()}：{item.per_share_value:.2f}/股。"
+        if req.analysis_basis == "user_scenario":
+            summary = "【用户输入情景，非官方事实核验】" + summary
         quality = (
             finance.assess_quality(
                 req,
@@ -509,6 +516,7 @@ def build_workflow(services: WorkflowServices):
             "assumptions": s["assumptions"],
         }
         result = ValuationOutput(
+            analysis_basis=req.analysis_basis,
             run_id=s["run_id"],
             revision=record.revision,
             company=req.company,

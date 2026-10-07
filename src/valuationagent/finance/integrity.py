@@ -134,13 +134,19 @@ def validate_peer_inputs(request, peers):
     target_period = request.financials.period_end if request.financials else None
     for peer in peers:
         # Ignore a row that has no multiple used by this request.
-        if not any(getattr(peer, method, None) is not None for method in request.methods if method != "dcf"):
+        if not any(getattr(peer, method, None) is not None for method in request.methods if method != "dcf" and method not in request.assumptions.relative_multiples):
             continue
         ticker = peer.ticker.strip().upper().split(".")[0]
         if not ticker or ticker in seen:
             findings.append(ValidationFinding(rule_id="PEER_DUPLICATE", severity="blocking",
                 message="可比公司代码为空或重复，不能重复计入样本数。请核对：" + peer.ticker))
         seen.add(ticker)
+        if peer.selection_basis == "agent_judgment":
+            findings.append(ValidationFinding(rule_id="PEER_SELECTION_JUDGMENT", severity="warning",
+                message=f"可比公司 {peer.ticker} 的选样理由由Agent提出，尚未独立核验业务、规模与盈利质量可比性：{peer.rationale}"))
+        if peer.pricing_basis == "a_share_equivalent":
+            findings.append(ValidationFinding(rule_id="PEER_A_SHARE_EQUIVALENT", severity="warning",
+                message=f"可比公司 {peer.ticker} 使用供应商总股本乘A股价格的等值市值；多类别股份时不等于各类别实际市值之和，倍数和结果须按此条件解读。"))
         if peer.as_of_date:
             pricing_dates.add(peer.as_of_date)
         if peer.as_of_date and (
@@ -213,6 +219,21 @@ def verify_calculations(request, financials, assumptions, forecast, dcf, relativ
         checks.append("DCF_RANGE")
     for result in relative:
         if result.status != "success":
+            continue
+        explicit = request.assumptions.relative_multiples.get(result.method)
+        if explicit is not None or result.valuation_basis == "explicit_multiple":
+            if explicit is None or result.valuation_basis != "explicit_multiple" or result.selected_multiple != explicit:
+                raise ValueError("计算复核未通过：指定倍数结果与冻结假设不一致。")
+            if result.range_low is not None or result.range_high is not None or result.sample_size or result.peer_tickers:
+                raise ValueError("计算复核未通过：指定倍数不能伪造样本数或统计区间。")
+            metric = {"pe": "net_income_parent", "ps": "revenue", "ev_ebitda": "ebitda"}[result.method]
+            expected = getattr(financials, metric) * explicit
+            shares = financials.diluted_shares or financials.common_shares
+            if result.method == "ev_ebitda":
+                bridge = resolve_equity_bridge(financials, policy=request.assumptions.equity_bridge_policy)
+                expected, shares = bridge.equity_value(expected), bridge.share_count
+            check(result.method.upper() + "_EXPLICIT_EQUITY", result.equity_value, expected)
+            check(result.method.upper() + "_EXPLICIT_PER_SHARE", result.per_share_value, expected / shares)
             continue
         if any(v is None or not v.is_finite() for v in (result.range_low, result.per_share_value, result.range_high)) or not result.range_low <= result.per_share_value <= result.range_high:
             raise ValueError(f"计算复核未通过：{result.method} 缺少有限结果或区间顺序错误。")

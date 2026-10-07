@@ -63,6 +63,15 @@ def test_reasoning_only_exhaustion_is_not_retried_as_a_json_syntax_problem(monke
     assert model.last_response_metadata["content_chars"] == 0
 
 
+def test_empty_stopped_response_is_not_misreported_as_budget_exhaustion(monkeypatch):
+    model = gateway(monkeypatch, {"content": None, "reasoning_content": "PRIVATE"}, tool_format="qwen3_coder")
+    with pytest.raises(ToolProtocolError, match="TOOL_NO_DECISION") as error:
+        model.chat([], tools=TOOLS, tool_choice="required")
+    assert "PRIVATE" not in str(error.value)
+    assert model.last_response_metadata["finish_reason"] == "stop"
+    assert model.last_response_metadata.get("parsed_tool_call_count", 0) == 0
+
+
 def test_native_default_and_free_chat_do_not_interpret_json_content(monkeypatch):
     message = {"content": '[{"name":"connection_check","parameters":{}}]', "tool_calls": None}
     model = gateway(monkeypatch, message, tool_format="native")
@@ -70,6 +79,47 @@ def test_native_default_and_free_chat_do_not_interpret_json_content(monkeypatch)
     model.config.tool_call_format = "json_content"
     assert model.chat([]) == message
     assert model.chat([], tools=TOOLS, tool_choice="auto") == message
+
+
+def test_explicit_native_json_sends_native_tools_and_retains_no_reasoning_history(monkeypatch):
+    original = httpx.Client
+    requests = []
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
+            "content": '[{"name":"connection_check","parameters":{}}]', "reasoning_content": "private trace"}}]})
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    model = OpenAICompatibleClient(ModelConnectionInput(model="fixture", api_key="EMPTY", tool_call_format="native_json"))
+    response = model.chat([{"role": "user", "content": "Probe only"}], tools=TOOLS, tool_choice="required")
+    assert requests[0]["tools"] == TOOLS and "response_format" not in requests[0]
+    assert requests[0]["messages"] == [{"role": "user", "content": "Probe only"}]
+    assert response["tool_calls"][0]["function"]["name"] == "connection_check"
+    assert "reasoning_content" not in response
+    assert model.last_response_metadata["tool_transport"] == "native_request_json_response"
+
+
+@pytest.mark.parametrize("content,finish", [('Call connection_check', 'stop'),
+    ('[{"name":"unknown","parameters":{}}]', 'stop'), ('[{"name":"connection_check","parameters":{}}]', 'length')])
+def test_native_json_does_not_execute_unregistered_narrative_or_truncated_calls(monkeypatch, content, finish):
+    model = gateway(monkeypatch, {"content": content}, tool_format="native_json", finish_reason=finish)
+    with pytest.raises(ToolProtocolError):
+        model.chat([], tools=TOOLS, tool_choice="required")
+
+
+def test_native_json_free_conversation_is_not_interpreted(monkeypatch):
+    message = {"content": '[{"name":"connection_check","parameters":{}}]'}
+    model = gateway(monkeypatch, message, tool_format="native_json")
+    assert model.chat([]) == message
+    assert model.chat([], tools=TOOLS, tool_choice="auto") == message
+
+
+def test_native_json_grammar_projection_does_not_change_backend_schema():
+    schema = {"type": "object", "properties": {"amount": {"pattern": r"^(?!0)\d+$"},
+        "code": {"pattern": r"^[A-Z]+$"}}}
+    projected = OpenAICompatibleClient._grammar_compatible_schema(schema)
+    assert "pattern" not in projected["properties"]["amount"]
+    assert projected["properties"]["code"] == schema["properties"]["code"]
+    assert schema["properties"]["amount"]["pattern"] == r"^(?!0)\d+$"
 
 
 def test_native_calls_take_precedence_and_still_use_schema_validation(monkeypatch):
@@ -125,21 +175,85 @@ def test_gateway_keeps_full_parameter_contract_and_local_validation():
     assert not executed
 
 
-def test_wire_grammar_only_constrains_envelope_without_forcing_parameter_order():
+def test_wire_grammar_binds_each_tool_name_to_its_actual_parameters():
     from valuationagent.application.observation_extraction import ExtractObservations
 
     registry = ToolRegistry([ToolSpec("extract_observations", "extract", ExtractObservations, lambda _: None),
                              ToolSpec("finish", "finish", NoArguments, lambda _: None)])
     schema = OpenAICompatibleClient._action_schema(registry.schemas())
     assert schema["minItems"] == schema["maxItems"] == 1
-    envelope = schema["items"]
-    assert envelope["properties"]["name"]["enum"] == ["extract_observations", "finish"]
-    assert envelope["properties"]["parameters"] == {"type": "object", "additionalProperties": True}
+    envelope, finish = schema["items"]["anyOf"]
+    assert envelope["properties"]["name"]["const"] == "extract_observations"
+    parameters = envelope["properties"]["parameters"]
+    assert {"file_id", "anchors", "basis", "rows"} <= set(parameters["required"])
+    assert parameters["properties"]["basis"]["$ref"] == "#/$defs/tool_0__ReadingBasis"
+    assert {"entity_refs", "scope_refs", "unit_refs"} <= set(schema["$defs"]["tool_0__ReadingBasis"]["required"])
+    assert finish["properties"]["name"]["const"] == "finish"
+    assert finish["properties"]["parameters"]["additionalProperties"] is False
     assert envelope["required"] == ["name", "parameters"] and envelope["additionalProperties"] is False
     with pytest.raises(ValidationError):
         registry.invoke("extract_observations", '{}')
     with pytest.raises(ValidationError):
         registry.invoke("finish", '{"injected": "not allowed"}')
+
+
+def test_single_focused_tool_grammar_requires_actual_fields_and_preserves_refs():
+    from valuationagent.application.observation_extraction import ReviewObservations
+
+    tools = ToolRegistry([ToolSpec("review_observations", "review", ReviewObservations, lambda _: None)]).schemas()
+    original = json.dumps(tools)
+    schema = OpenAICompatibleClient._action_schema(tools)
+    assert schema["items"]["properties"]["name"]["const"] == "review_observations"
+    parameters = schema["items"]["properties"]["parameters"]
+    assert parameters["required"] == ["reviews"]
+    assert parameters["properties"]["reviews"]["items"]["$ref"] == "#/$defs/tool_0__ObservationReview"
+    assert "checks" in schema["$defs"]["tool_0__ObservationReview"]["required"]
+    checks = schema["$defs"]["tool_0__ReviewChecks"]["properties"]
+    assert checks["amount"]["enum"] == ["supported", "ambiguous", "contradicted"]
+    assert json.dumps(tools) == original
+
+
+def test_multitool_definitions_remain_isolated_after_focused_constraints():
+    from valuationagent.application.observation_extraction import ExtractObservations
+
+    tools = ToolRegistry([ToolSpec("first", "first", ExtractObservations, lambda _: None),
+        ToolSpec("second", "second", ExtractObservations, lambda _: None)]).schemas()
+    tools[0]["function"]["parameters"]["$defs"]["ReadingBasis"]["properties"]["entity_ticker"]["const"] = "600123"
+    original = json.dumps(tools)
+    schema = OpenAICompatibleClient._action_schema(tools)
+    definitions = schema["$defs"]
+    assert definitions["tool_0__ReadingBasis"]["properties"]["entity_ticker"]["const"] == "600123"
+    assert "const" not in definitions["tool_1__ReadingBasis"]["properties"]["entity_ticker"]
+    assert definitions["tool_1__Observation"]["properties"]["basis"]["anyOf"][0]["$ref"] == "#/$defs/tool_1__ReadingBasis"
+    assert json.dumps(tools) == original
+
+
+def test_wire_schema_omits_unsupported_lookaround_without_mutating_tool_contract():
+    tools = [{"type": "function", "function": {"name": "decimal", "parameters": {"type": "object",
+        "properties": {"amount": {"type": "string", "pattern": r"^(?!^[-+.]*$)[+-]?\d*\.?\d*$"},
+            "ticker": {"type": "string", "pattern": r"^[0-9]{6}$"}}, "required": ["amount", "ticker"]}}}]
+    original = json.dumps(tools)
+    schema = OpenAICompatibleClient._action_schema(tools)
+    properties = schema["items"]["properties"]["parameters"]["properties"]
+    assert "pattern" not in properties["amount"]
+    assert properties["ticker"]["pattern"] == r"^[0-9]{6}$"
+    assert json.dumps(tools) == original
+
+
+def test_wire_property_order_matches_catalog_for_late_optional_corrections():
+    from valuationagent.application.agent_runtime import AgentResponse, TaskUpdate
+
+    tools = ToolRegistry([ToolSpec("finish_response", "reply", AgentResponse, lambda _: None),
+        ToolSpec("update_task", "task", TaskUpdate, lambda _: None)]).schemas()
+    original = json.dumps(tools)
+    schema = OpenAICompatibleClient._action_schema(tools)
+    reply = schema["items"]["anyOf"][0]["properties"]["parameters"]["properties"]
+    assert list(reply) == sorted(reply)
+    assert list(reply).index("decision") < list(reply).index("outcome")
+    draft = schema["$defs"]["tool_1__ResearchDraft"]["properties"]
+    assert list(draft) == sorted(draft)
+    assert list(draft).index("information_cutoff_date") < list(draft).index("valuation_date")
+    assert json.dumps(tools) == original
 
 
 def test_json_envelope_preserves_out_of_schema_order_without_dropping_fields(monkeypatch):
@@ -239,5 +353,8 @@ def test_truncated_native_call_is_not_executed(monkeypatch):
 def test_response_telemetry_contains_counts_not_reasoning_or_source_content(monkeypatch):
     model = gateway(monkeypatch, {"content": "private answer", "reasoning_content": "private reasoning"}, tool_format="native")
     model.chat([])
-    assert model.last_response_metadata == {"finish_reason": "stop", "content_chars": 14, "reasoning_chars": 17, "usage": {}}
+    assert model.last_response_metadata == {"output_token_budget": 8192, "finish_reason": "stop", "content_chars": 14,
+        "content_whitespace_chars": 1, "reasoning_chars": 17, "usage": {}, "request_message_chars": 2,
+        "request_schema_chars": 2, "offered_tool_count": 0, "tool_call_format": "native", "thinking": "auto",
+        "response_received": True, "native_tool_call_count": 0, "parsed_tool_call_count": 0, "sampling": {"temperature": 0.0}}
     assert "private" not in json.dumps(model.last_response_metadata)

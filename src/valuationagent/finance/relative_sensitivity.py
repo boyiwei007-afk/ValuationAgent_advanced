@@ -21,11 +21,14 @@ def relative_sensitivity(finance, request, financials, peers):
             for factor in (D("0.9"), D("1.1")):
                 fin = financials.model_copy(update={field: getattr(financials, field) * factor}) if axis == "metric" else financials
                 sample = [p.model_copy(update={method: getattr(p, method) * factor if getattr(p, method) is not None else None}) for p in peers] if axis == "multiple" else peers
-                value = finance.relative(scoped, fin, sample)[0]
+                trial = scoped.model_copy(deep=True)
+                if axis == "multiple" and method in trial.assumptions.relative_multiples:
+                    trial.assumptions.relative_multiples[method] *= factor
+                value = finance.relative(trial, fin, sample)[0]
                 prices.append(value.per_share_value)
             change = max(abs(p - base.per_share_value) for p in prices) / abs(base.per_share_value) if base.per_share_value else None
-            studies.append(SensitivityStudy(study_id=f"R-{method}-{axis}", parameter=f"{method.upper()} · {field if axis == 'metric' else '可比倍数'}",
-                baseline_input=str(getattr(financials, field)) if axis == "metric" else "原始可比样本",
+            studies.append(SensitivityStudy(study_id=f"R-{method}-{axis}", parameter=f"{method.upper()} · {field if axis == 'metric' else '指定倍数' if method in scoped.assumptions.relative_multiples else '可比倍数'}",
+                baseline_input=str(getattr(financials, field)) if axis == "metric" else str(scoped.assumptions.relative_multiples.get(method, "原始可比样本")),
                 low_input="基准 × 90%", high_input="基准 × 110%", baseline_per_share=base.per_share_value,
                 low_per_share=prices[0], high_per_share=prices[1], max_relative_change=change,
                 classification="not_available" if change is None else "high" if change >= D("0.2") else "medium" if change >= D("0.1") else "low",

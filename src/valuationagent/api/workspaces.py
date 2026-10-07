@@ -5,12 +5,13 @@ from __future__ import annotations
 from fastapi import BackgroundTasks, HTTPException, Query
 from fastapi.responses import Response
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from valuationagent.schemas.models import ApiModel
 from valuationagent.application.workspace_artifacts import ReportWrite, write_report
 from valuationagent.application.file_workspace import FileList, FileReference, PageView, list_files, inspect_file, render_page
 from valuationagent.llm.client import LlmError
 from valuationagent.market import TushareApiClient, TushareDataProvider
+from valuationagent.market.infoway import InfowayApiClient, InfowayDataProvider
 from valuationagent.search.providers import TavilySearchProvider
 from valuationagent.schemas.agent import SearchQuery
 from valuationagent.schemas.models import ResumeInput
@@ -22,11 +23,20 @@ class DataServicesInput(ApiModel):
     verify_search: bool = False
     tavily_api_key: SecretStr | None = Field(default=None)
     tushare_token: SecretStr | None = Field(default=None)
+    infoway_api_key: SecretStr | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def one_market_provider(self):
+        if (self.tushare_token and self.tushare_token.get_secret_value().strip()
+                and self.infoway_api_key and self.infoway_api_key.get_secret_value().strip()):
+            raise ValueError("一次只连接一个结构化供应商，避免静默覆盖；网页搜索可同时配置。")
+        return self
 
     def has_values(self):
         return bool(
             (self.tavily_api_key and self.tavily_api_key.get_secret_value().strip())
             or (self.tushare_token and self.tushare_token.get_secret_value().strip())
+            or (self.infoway_api_key and self.infoway_api_key.get_secret_value().strip())
         )
 
 
@@ -164,7 +174,7 @@ def register_workspace_routes(
     def attach_data_services(workspace_id: str, body: DataServicesInput):
         workspace = get_workspace(workspace_id)
         if not body.has_values():
-            raise HTTPException(422, "至少填写一个 Tavily Key 或 Tushare Token。")
+            raise HTTPException(422, "至少填写一个 Tavily Key、Infoway Key 或 Tushare Token。")
         try:
             if body.tavily_api_key and body.tavily_api_key.get_secret_value().strip():
                 provider = TavilySearchProvider(body.tavily_api_key.get_secret_value())
@@ -182,6 +192,11 @@ def register_workspace_routes(
                 workspaces.research.attach_market(
                     workspace.research_session_id,
                     TushareDataProvider(TushareApiClient(body.tushare_token.get_secret_value())),
+                )
+            if body.infoway_api_key and body.infoway_api_key.get_secret_value().strip():
+                workspaces.research.attach_market(
+                    workspace.research_session_id,
+                    InfowayDataProvider(InfowayApiClient(body.infoway_api_key.get_secret_value())),
                 )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None

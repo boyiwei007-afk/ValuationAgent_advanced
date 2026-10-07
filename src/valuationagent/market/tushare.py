@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar
@@ -23,6 +24,13 @@ from valuationagent.schemas.models import (
 
 D = Decimal
 TUSHARE_DOC = "https://tushare.pro/document/2"
+
+
+@dataclass
+class TushareSnapshot:
+    raw: bytes
+    fields: list[str]
+    records: list[dict[str, Any]]
 
 
 class TushareApiError(ValueError):
@@ -133,6 +141,11 @@ class TushareApiClient:
     def query(
         self, api_name: str, *, params: dict[str, Any] | None = None, fields: list[str] | None = None
     ) -> list[dict[str, Any]]:
+        return self.query_snapshot(api_name, params=params, fields=fields).records
+
+    def query_snapshot(
+        self, api_name: str, *, params: dict[str, Any] | None = None, fields: list[str] | None = None
+    ) -> TushareSnapshot:
         payload = {
             "api_name": api_name,
             "token": self._token,
@@ -147,12 +160,17 @@ class TushareApiClient:
             ) as client:
                 response = client.post(self.endpoint, json=payload)
                 response.raise_for_status()
-                body = response.json()
+                raw = response.content
+                if len(raw) > 50 * 1024 * 1024 or self._token.encode() in raw:
+                    raise ValueError("unsafe response")
+                body = response.json(parse_float=str)
         except (httpx.HTTPError, ValueError) as exc:
             code = getattr(getattr(exc, "response", None), "status_code", None)
             suffix = f"（HTTP {code}）" if code else ""
             raise ValueError(f"Tushare数据请求失败{suffix}，请检查网络与数据源配置。") from None
-        if int(body.get("code", -1)) != 0:
+        if not isinstance(body, dict):
+            raise TushareApiError(api_name, "返回结构不是对象")
+        if body.get("code") != 0:
             raw = str(body.get("msg") or "").lower()
             if "token" in raw:
                 raise TushareApiError(api_name, "Token无效或权限不足")
@@ -160,14 +178,30 @@ class TushareApiClient:
                 raise TusharePermissionError(api_name, "接口权限不足")
             raise TushareApiError(api_name, f"供应商错误代码 {body.get('code')}")
         data = body.get("data") or {}
+        if not isinstance(data, dict):
+            raise TushareApiError(api_name, "返回数据结构不符合接口契约")
         names = data.get("fields") or []
-        return [dict(zip(names, row)) for row in data.get("items") or []]
+        items = data.get("items") or []
+        if (not isinstance(names, list) or not all(isinstance(name, str) and name for name in names)
+                or len(names) != len(set(names)) or not isinstance(items, list)
+                or any(not isinstance(row, list) or len(row) != len(names) for row in items)):
+            raise TushareApiError(api_name, "列名或行宽无效；不截断、不补空值")
+        self.connection_verified = True
+        return TushareSnapshot(raw=raw, fields=names, records=[dict(zip(names, row)) for row in items])
 
 
 class TushareDataProvider:
     """A-share facts and comparable companies with point-in-time controls."""
 
-    version = "tushare-a-share-2026-09"
+    version = "tushare-a-share-2026-10-07-raw-v3"
+    provider_id = "tushare"
+    history_statements = ("income", "balancesheet", "cashflow", "statistics")
+    history_date_only_statements = ("statistics",)
+
+    def fetch_history(self, ticker, statement, years, cutoff, check_cancel=lambda: None):
+        from valuationagent.market.tushare_history import fetch_history
+
+        return fetch_history(self, ticker, statement, years, cutoff, check_cancel)
 
     INCOME_FIELDS: ClassVar[list[str]] = [
         "ts_code", "ann_date", "f_ann_date", "end_date", "report_type", "comp_type",

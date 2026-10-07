@@ -137,7 +137,7 @@ class ReferenceFinancialModel:
                             expected=expected,
                         )
                     )
-        if financials.period_end > request.valuation_date:
+        if financials.period_end and financials.period_end > request.valuation_date:
             findings.append(
                 ValidationFinding(
                     rule_id="POINT_IN_TIME_001",

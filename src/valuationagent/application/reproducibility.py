@@ -15,8 +15,10 @@ def digest(value):
 
 def model_files():
     root = Path(__file__).parents[1]
-    return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in sorted((root / "finance").rglob("*")) if p.suffix in {".py", ".json"}}
+    paths = [path for path in sorted((root / "finance").rglob("*")) if path.suffix in {".py", ".json"}]
+    paths += [root / "application" / name for name in ("input_calculations.py", "input_derivations.py", "input_balances.py", "input_peers.py", "input_peer_bridge.py", "user_peers.py", "forecast_inputs.py", "provider_inputs.py")]
+    paths.append(root / "market" / "tushare_contracts.py")
+    return {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
 
 
 def build_valuation_bundle(store, record):
@@ -85,6 +87,19 @@ def replay_bundle(package):
         raise ValueError("本地金融源码或参数库与导出时不一致，请使用现场展示版本")
     record = RunRecord.model_validate(package["run"])
     request = ValuationRequest.model_validate(package["effective_request"])
+    from valuationagent.application.input_calculations import verify_frozen_calculations
+    from valuationagent.application.input_derivations import verify_frozen_derivations
+    from valuationagent.application.input_balances import verify_balance_changes
+    from valuationagent.application.user_peers import verify_user_peers
+    from valuationagent.application.input_peer_bridge import verify_source_peers
+    from valuationagent.application.forecast_inputs import verify_frozen_forecast_inputs
+
+    verify_frozen_calculations(request)
+    verify_frozen_derivations(request)
+    verify_balance_changes(request)
+    verify_user_peers(request)
+    verify_source_peers(request)
+    verify_frozen_forecast_inputs(request)
     result = record.result
     finance = create_financial_model()
     actual_version = finance.model_version_for(request) if hasattr(finance, "model_version_for") else finance.version

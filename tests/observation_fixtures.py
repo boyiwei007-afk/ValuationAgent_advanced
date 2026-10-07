@@ -94,15 +94,29 @@ def extraction_steps(args):
 
 
 class ObservationModel:
-    def __init__(self, actions):
+    def __init__(self, actions, *, turn_actions=("ingest", "report")):
+        self.turn_actions = turn_actions
         self.actions = iter([*actions, ("finish_response", {"answer": "测试提取完成，未运行估值。"})])
         self.calls, self.kwargs = [], []
+        self.catalog_calls = []
+        self.pending = None
 
     def chat(self, messages, **kwargs):
+        from control_fixtures import control_reply
+
+        if reply := control_reply(kwargs, self.turn_actions):
+            return reply
+        action = self.pending if self.pending is not None else next(self.actions)
+        name, arguments = action(messages) if callable(action) else action
+        if name not in {tool["function"]["name"] for tool in kwargs["tools"]} and any(
+                tool["function"]["name"] == "load_tools" for tool in kwargs["tools"]):
+            self.pending = (name, arguments)
+            self.catalog_calls.append(name)
+            return {"tool_calls": [{"id": f"load_{len(self.catalog_calls)}", "type": "function",
+                "function": {"name": "load_tools", "arguments": json.dumps({"names": [name]})}}]}
+        self.pending = None
         self.calls.append(json.loads(json.dumps(messages)))
         self.kwargs.append(kwargs)
-        action = next(self.actions)
-        name, arguments = action(messages) if callable(action) else action
         assert name in {tool["function"]["name"] for tool in kwargs["tools"]}
         return {"tool_calls": [{"id": f"call_{len(self.calls)}", "type": "function",
             "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}}],

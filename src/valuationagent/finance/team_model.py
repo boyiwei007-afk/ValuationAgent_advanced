@@ -19,6 +19,7 @@ from valuationagent.finance.production import (
     resolve_equity_bridge,
 )
 from valuationagent.finance.revenue import FinanceTeamRevenueModel
+from valuationagent.finance.working_capital import TURNOVER_METHOD, core_balance, working_capital_drivers
 from valuationagent.schemas.models import (
     AssumptionSet,
     DataQualityAssessment,
@@ -77,7 +78,7 @@ class FinanceTeamModel:
     """Deterministic implementation of the supplied non-financial A-share model."""
 
     plugin_id = "finance_team_nonfinancial_fcff_relative"
-    version = "1.4.0-finance-team-production-20260927"
+    version = "1.6.2-working-capital-scope-20261004"
     supports_incremental_inputs = True
 
     def __init__(self, registry: IndustryParameterRegistry | None = None):
@@ -114,7 +115,7 @@ class FinanceTeamModel:
     ) -> list[FinancialSnapshot]:
         rows = [*request.historical_financials, financials]
         by_year: dict[int, FinancialSnapshot] = {}
-        for row in sorted(rows, key=lambda item: item.period_end):
+        for row in sorted((row for row in rows if row.period_end is not None), key=lambda item: item.period_end):
             if row.period_end <= request.valuation_date and (
                 row.published_at is None or row.published_at <= request.valuation_date
             ) and row.comparability_status != "excluded":
@@ -561,6 +562,10 @@ class FinanceTeamModel:
             "inventory",
             "accounts_payable",
         }
+        if all(value is not None for value in days) and items.get("operating_nwc") is not None and not direct_keys <= set(items):
+            findings.append(ValidationFinding(rule_id="NWC_SCOPE_BASELINE", severity="blocking",
+                message="指定周转天数时，须有基期三项余额以分离完整营运资本中的其他项目。",
+                recommended_action="补齐基期应收、存货、应付，或取消周转天数，使用已知完整营运资本余额比例。"))
         if direct_keys <= set(items) and items.get("operating_nwc") is not None:
             direct_ratio = (
                 items["accounts_receivable"]
@@ -577,7 +582,7 @@ class FinanceTeamModel:
                         message="应收+存货-应付与报表经营营运资本口径相差超过5个百分点。",
                         actual=f"{gap:.2%}",
                         expected="<=5.00%",
-                        recommended_action="确认其他经营流动资产/负债是否应纳入口径。",
+                        recommended_action="当前预测保留完整余额或其他经营项目差额；仍需核对构成，不把差异自动判作财务错误。",
                     )
                 )
         return findings
@@ -840,7 +845,10 @@ class FinanceTeamModel:
                 stable_roic = lifecycle_roic.get(industry.lifecycle, D("0.10"))
                 stable_roic_note = "缺少投入资本，稳定期ROIC使用按生命周期披露的低置信政策值"
                 stable_roic_policy_fallback = True
-        stable_roic = max(stable_roic, terminal_growth + D("0.01"))
+        if request.assumptions.stable_roic is None and stable_roic < terminal_growth + D("0.01"):
+            stable_roic = terminal_growth + D("0.01")
+            stable_roic_policy_fallback = True
+            stable_roic_note += "；自动估计按政策上调至g+1个百分点，不是公司披露值"
         decisions.append(
             stable_roic_note
             + f"；稳定期再投资率=g/ROIC={terminal_growth / stable_roic:.2%}。"
@@ -1071,116 +1079,7 @@ class FinanceTeamModel:
         request: ValuationRequest,
         history: list[FinancialSnapshot],
     ) -> tuple[dict[str, Decimal], str, str]:
-        supplied = request.assumptions
-        cost_ratios = [
-            row.statement_items["operating_cost"] / row.revenue
-            for row in history[-5:]
-            if row.statement_items.get("operating_cost") is not None
-        ]
-        manual_days = (supplied.dso_days, supplied.dio_days, supplied.dpo_days)
-        if all(value is not None for value in manual_days):
-            cost_ratio = supplied.operating_cost_ratio
-            if cost_ratio is None and len(cost_ratios) >= 4:
-                cost_ratio = D(str(median(cost_ratios)))
-            if cost_ratio is not None:
-                return (
-                    {
-                        "dso_days": supplied.dso_days,
-                        "dio_days": supplied.dio_days,
-                        "dpo_days": supplied.dpo_days,
-                        "operating_cost_ratio": cost_ratio,
-                    },
-                    "dso_dio_dpo",
-                    "营运资本采用用户指定DSO/DIO/DPO；营业成本率取用户值或最近4–5年中位数。",
-                )
-
-        day_rows: list[tuple[Decimal, Decimal, Decimal, Decimal]] = []
-        for row in history[-5:]:
-            items = row.statement_items
-            cost = items.get("operating_cost")
-            receivable = items.get("accounts_receivable")
-            inventory = items.get("inventory")
-            payable = items.get("accounts_payable")
-            if (
-                cost is None
-                or cost <= 0
-                or receivable is None
-                or inventory is None
-                or payable is None
-            ):
-                continue
-            day_rows.append(
-                (
-                    receivable / row.revenue * D(365),
-                    inventory / cost * D(365),
-                    payable / cost * D(365),
-                    cost / row.revenue,
-                )
-            )
-        if len(day_rows) >= 4:
-            return (
-                {
-                    "dso_days": D(str(median(row[0] for row in day_rows))),
-                    "dio_days": D(str(median(row[1] for row in day_rows))),
-                    "dpo_days": D(str(median(row[2] for row in day_rows))),
-                    "operating_cost_ratio": D(str(median(row[3] for row in day_rows))),
-                },
-                "dso_dio_dpo",
-                f"营运资本采用最近{len(day_rows)}个完整年度DSO/DIO/DPO及营业成本率中位数。",
-            )
-
-        nwc_ratios = [
-            row.statement_items["operating_nwc"] / row.revenue
-            for row in history[-5:]
-            if row.statement_items.get("operating_nwc") is not None
-        ]
-        if len(nwc_ratios) >= 3:
-            ratio = D(str(median(nwc_ratios)))
-            return (
-                {"operating_nwc_ratio": ratio},
-                "operating_nwc_revenue_ratio",
-                f"周转科目不足4年，按最近{len(nwc_ratios)}年经营营运资本/收入中位数{ratio:.2%}降级；应对该比例做±1个百分点敏感性。",
-            )
-        latest = history[-1]
-        if latest.statement_items.get("operating_nwc") is not None:
-            ratio = latest.statement_items["operating_nwc"] / latest.revenue
-            return (
-                {"operating_nwc_ratio": ratio},
-                "latest_operating_nwc_revenue_ratio",
-                "周转科目与历史等价比例均不足，暂用最近一期经营营运资本/收入；该低样本降级必须复核。",
-            )
-        latest_change_rows = [
-            row for row in history if row.change_operating_nwc is not None
-        ]
-        if (
-            len(history) >= 2
-            and history[-1].revenue != history[-2].revenue
-            and history[-1].change_operating_nwc is not None
-        ):
-            factor = history[-1].change_operating_nwc / (
-                history[-1].revenue - history[-2].revenue
-            )
-            return (
-                {"nwc_delta_revenue_factor": factor},
-                "implied_from_latest_delta",
-                "经营营运资本余额不可得，暂按最近一期ΔNWC/Δ收入降级；不得将其误称为周转天数模型。",
-            )
-        if latest_change_rows:
-            ratio = D(str(median(
-                row.change_operating_nwc / row.revenue
-                for row in latest_change_rows[-5:]
-            )))
-            return (
-                {"nwc_delta_revenue_factor": ratio},
-                "historical_delta_nwc_revenue_fallback",
-                "经营营运资本余额不可得，按可得历史ΔNWC/收入中位数低质量降级并要求人工复核。",
-            )
-        ratio = D("0.10")
-        return (
-            {"nwc_delta_revenue_factor": ratio},
-            "policy_delta_revenue_fallback",
-            "营运资本余额及变动均不可得，按Δ收入的10%政策值低置信降级；不得把缺失值填零。",
-        )
+        return working_capital_drivers(request, history)
 
     @staticmethod
     def _ebit_drivers(
@@ -1336,25 +1235,23 @@ class FinanceTeamModel:
         nwc_method = assumptions.calculation_methods.get(
             "change_operating_nwc", "delta_revenue_ratio_fallback"
         )
-        if nwc_method == "dso_dio_dpo":
+        if nwc_method == TURNOVER_METHOD:
             dso = drivers["dso_days"]
             dio = drivers["dio_days"]
             dpo = drivers["dpo_days"]
             cost_ratio = drivers["operating_cost_ratio"]
             previous_nwc = financials.statement_items.get("operating_nwc")
             if previous_nwc is None:
-                previous_nwc = financials.revenue * (
-                    dso + dio * cost_ratio - dpo * cost_ratio
-                ) / D(365)
+                previous_nwc = core_balance(financials)
+            if previous_nwc is None:
+                previous_nwc = financials.revenue * (dso + dio * cost_ratio - dpo * cost_ratio) / D(365)
         elif "operating_nwc_ratio" in drivers:
             nwc_ratio = drivers["operating_nwc_ratio"]
             previous_nwc = financials.statement_items.get(
                 "operating_nwc", financials.revenue * nwc_ratio
             )
         else:
-            nwc_factor = max(
-                D("-2"), min(D("2"), drivers.get("nwc_delta_revenue_factor", D(0)))
-            )
+            nwc_factor = drivers.get("nwc_delta_revenue_factor", D(0))
             previous_nwc = None
         ebit_method = assumptions.calculation_methods.get(
             "ebit", "margin_path_fallback"
@@ -1505,16 +1402,18 @@ class FinanceTeamModel:
                     )
 
             operating_nwc = None
-            if nwc_method == "dso_dio_dpo":
+            if nwc_method == TURNOVER_METHOD:
                 operating_nwc = revenue * (
                     dso + dio * cost_ratio - dpo * cost_ratio
-                ) / D(365)
+                ) / D(365) + revenue * drivers.get("other_operating_nwc_ratio", D(0))
                 change_nwc = operating_nwc - previous_nwc
                 previous_nwc = operating_nwc
             elif "operating_nwc_ratio" in drivers:
                 operating_nwc = revenue * nwc_ratio
                 change_nwc = operating_nwc - previous_nwc
                 previous_nwc = operating_nwc
+            elif "nwc_change_revenue_ratio" in drivers:
+                change_nwc = revenue * drivers["nwc_change_revenue_ratio"]
             else:
                 change_nwc = (revenue - previous_revenue) * nwc_factor
             fcff = nopat + da - change_nwc - capex
@@ -1535,6 +1434,8 @@ class FinanceTeamModel:
                         )
             if operating_nwc is not None:
                 operating_items["operating_nwc"] = _q(operating_nwc)
+            if "other_operating_nwc_ratio" in drivers:
+                operating_items["other_operating_nwc"] = _q(revenue * drivers["other_operating_nwc_ratio"])
             operating_items["capex_alpha"] = _q(effective_alpha)
             operating_items["capex_kappa"] = _q(effective_kappa)
             operating_items["depreciation_right_of_use"] = _q(right_of_use_da)
@@ -1840,6 +1741,20 @@ class FinanceTeamModel:
                     sample_quality="insufficient",
                     peer_tickers=[peer.ticker for peer, _ in rows],
                     reason=f"目标公司的{metric.upper()}对应财务指标非正。",
+                )
+            selected_multiple = request.assumptions.relative_multiples.get(metric)
+            if selected_multiple is not None:
+                bridge = resolve_equity_bridge(financials, policy=request.assumptions.equity_bridge_policy) if enterprise_multiple else None
+                equity = selected_multiple * target_value
+                if bridge is not None:
+                    equity = bridge.equity_value(equity)
+                shares = bridge.share_count if bridge else financials.diluted_shares or financials.common_shares
+                return MultipleResult(
+                    method=method.value, status="success", per_share_value=_q(equity / shares),
+                    equity_value=_q(equity), selected_multiple=selected_multiple,
+                    valuation_basis="explicit_multiple", sample_quality="not_applicable",
+                    statistic="explicit_assumption", reason="指定倍数情景计算，不是可比样本统计或概率区间。"
+                    + ("；".join(bridge.warnings) if bridge else ""),
                 )
             if original_size < 3:
                 return MultipleResult(
@@ -2635,6 +2550,11 @@ class FinanceTeamModel:
     ) -> DataQualityAssessment:
         """Summarize data and model support without changing valuation numbers."""
 
+        if request.analysis_basis == "user_scenario":
+            return DataQualityAssessment(evidence_coverage=D(0), peer_sample_quality="not_applicable",
+                market_input_quality="not_applicable", confidence="low", result_grade="C",
+                notes=["用户提供数据的情景计算：保留消息依据，但没有外部事实核验，不表示公司真实价值或统计置信度。",
+                       "未提供的财务期间、股数时点保持未知；指定倍数不是可比公司统计。"])
         history = self._history(request, financials)
         raw_history = [*request.historical_financials, financials]
         adjusted_years = sorted(
@@ -2686,7 +2606,8 @@ class FinanceTeamModel:
                 degraded_fields.append("capital_expenditure")
             if (
                 assumptions.calculation_methods.get("change_operating_nwc")
-                == "policy_delta_revenue_fallback"
+                in {"policy_delta_revenue_fallback", "latest_operating_nwc_revenue_ratio"}
+                or assumptions.operating_drivers.get("nwc_scope_partial", D(0))
             ):
                 degraded_fields.append("change_operating_nwc")
             if assumptions.operating_drivers.get("stable_roic_policy_fallback", D(0)):
@@ -2723,6 +2644,12 @@ class FinanceTeamModel:
         if requested_relative and peers:
             notes.append(f"相对估值候选池共{len(peers)}家公司，质量结论按各倍数有效样本计算。")
         peer_provenance_missing = requested_relative and any(not p.evidence or p.as_of_date is None or p.multiple_basis == "unknown" for p in peers)
+        peer_selection_unreviewed = requested_relative and any(p.selection_basis == "agent_judgment" for p in peers)
+        provider_contract_inputs = any(row.get("source", {}).get("provider_binding") for row in request.input_records)
+        if peer_selection_unreviewed:
+            notes.append("Agent提供了选样理由，但业务、规模和盈利质量的可比性尚未独立核验，数据质量等级为C，不等于计算公式错误。")
+        if provider_contract_inputs:
+            notes.append("部分输入来自供应商字段契约，未独立核验发行人原件，数据质量等级最高为B。")
         if peer_provenance_missing:
             notes.append("部分可比公司缺少定价日、分母口径或原文证据，须人工核验，不能视为已核验同业。")
         bridge_book_proxy = any(
@@ -2763,6 +2690,9 @@ class FinanceTeamModel:
         elif not successful_quality:
             peer_quality = "insufficient"
             notes.append("相对估值没有形成满足最小样本要求的有效方法。")
+        elif all(quality == "not_applicable" for quality in successful_quality):
+            peer_quality = "not_applicable"
+            notes.append("指定倍数为显式假设，不存在可比样本质量评价。")
         elif "limited" in successful_quality:
             peer_quality = "limited"
             notes.append("至少一种相对估值方法仅有3至4家有效可比公司。")
@@ -2803,6 +2733,8 @@ class FinanceTeamModel:
             or industry_quality == "C"
             or peer_quality == "insufficient"
             or peer_provenance_missing
+            or peer_selection_unreviewed
+            or request.analysis_basis == "user_scenario"
             or bool(degraded_fields)
             or (has_dcf and market_input_quality == "unverified")
             or bridge_unmeasured
@@ -2817,6 +2749,8 @@ class FinanceTeamModel:
             or bool(adjusted_years or excluded_years)
             or (has_dcf and market_input_quality == "verified_stale")
             or bridge_book_proxy
+            or provider_contract_inputs
+            or bool(request.assumptions.relative_multiples)
         )
         confidence = "low" if low else "medium" if medium else "high"
         result_grade = "C" if confidence == "low" else "B" if confidence == "medium" else "A"
@@ -2840,7 +2774,7 @@ class FinanceTeamModel:
         self, dcf: DcfResult | None, relative: list[MultipleResult]
     ) -> ReconciliationResult:
         dcf_range = (dcf.range_low, dcf.range_high) if dcf else None
-        successful = [item for item in relative if item.status == "success"]
+        successful = [item for item in relative if item.status == "success" and item.range_low is not None and item.range_high is not None]
         relative_range = None
         if successful:
             relative_range = (
@@ -2848,28 +2782,49 @@ class FinanceTeamModel:
                 max(item.range_high for item in successful if item.range_high is not None),
             )
         comparison = {
-            "policy": "dcf_primary_relative_cross_check_no_mechanical_average"
+            "policy": "dcf_primary_relative_cross_check_no_mechanical_average",
+            "relative_range_kind": "method_envelope_not_a_composite_or_confidence_interval",
+            "gap_definition": "abs(midpoint_difference)/mean(abs(midpoints)); undefined_if_both_zero",
+            "confidence_policy": "overlap_does_not_establish_independence_or_increase_confidence",
         }
         overlap_range = None
         if dcf_range and relative_range:
             dcf_mid = _mean(list(dcf_range))
-            relative_mid = _mean(list(relative_range))
-            gap = abs(dcf_mid - relative_mid) / max(abs(dcf_mid), D("0.0001"))
-            comparison["midpoint_gap"] = f"{gap:.2%}"
-            overlap_low = max(dcf_range[0], relative_range[0])
-            overlap_high = min(dcf_range[1], relative_range[1])
+            gaps = []
+            overlap_count = 0
+            for item in successful:
+                relative_mid = _mean([item.range_low, item.range_high])
+                scale = _mean([abs(dcf_mid), abs(relative_mid)])
+                gap = abs(dcf_mid - relative_mid) / scale if scale else None
+                comparison[item.method + ".midpoint_gap"] = f"{gap:.2%}" if gap is not None else "undefined_zero_midpoints"
+                comparison[item.method + ".sample_quality"] = item.sample_quality
+                intersects = max(dcf_range[0], item.range_low) <= min(dcf_range[1], item.range_high)
+                comparison[item.method + ".status"] = "overlap" if intersects else "no_overlap"
+                overlap_count += int(intersects)
+                if gap is not None:
+                    gaps.append(gap)
+            if len(successful) == 1:
+                comparison["midpoint_gap"] = comparison[successful[0].method + ".midpoint_gap"]
+            overlap_low = max(dcf_range[0], *(item.range_low for item in successful))
+            overlap_high = min(dcf_range[1], *(item.range_high for item in successful))
             if overlap_low <= overlap_high:
                 overlap_range = (overlap_low, overlap_high)
                 comparison["status"] = "overlap"
                 conclusion = (
-                    "DCF为主估值、相对估值为市场交叉验证；两类区间存在重叠，"
-                    "重叠部分可作为高置信参考区间，但不替代两套独立结果。"
+                    "DCF与各相对估值方法存在共同重叠；只描述数值交集，不代表独立验证、"
+                    "统计置信区间或置信度提升。各方法的假设和样本限制仍然成立。"
                 )
-            elif gap <= D("0.20"):
+            elif overlap_count:
+                comparison["status"] = "mixed_methods_review_required"
+                conclusion = (
+                    "部分方法与DCF重叠，但不存在全部方法的共同交集；逐方法检查差异，"
+                    "不将相对估值外包络中的空档视为有效重叠，不机械合成价格。"
+                )
+            elif gaps and len(gaps) == len(successful) and max(gaps) <= D("0.20"):
                 comparison["status"] = "adjacent_no_overlap"
                 conclusion = (
-                    "DCF与相对估值区间相邻但未重叠；保留两套独立结果，"
-                    "不进行机械平均，并解释增长、利润率与同业定价差异。"
+                    "DCF与各相对估值区间未重叠，中点对称差异均不超过20%的诊断阈值；"
+                    "该阈值不是统计显著性结论。保留各方法结果，不进行机械平均。"
                 )
             else:
                 comparison["status"] = "conflict_review_required"
@@ -2883,9 +2838,14 @@ class FinanceTeamModel:
         elif relative_range:
             comparison["status"] = "relative_only"
             conclusion = "仅相对估值形成有效区间；DCF独立保留为不可用。"
+        elif any(item.status == "success" and item.valuation_basis == "explicit_multiple" for item in relative):
+            comparison["status"] = "explicit_scenario_only"
+            conclusion = "指定倍数情景已计算点值；未构造可比样本区间或概率区间，不进行机械平均。"
         else:
             comparison["status"] = "no_valid_method"
             conclusion = "当前没有有效估值区间。"
+        if len(successful) > 1:
+            conclusion += "相对估值汇总范围仅为各方法端点的外包络，不是合成分位区间；具体结果须逐方法查看。"
         return ReconciliationResult(
             dcf_range=dcf_range,
             relative_range=relative_range,

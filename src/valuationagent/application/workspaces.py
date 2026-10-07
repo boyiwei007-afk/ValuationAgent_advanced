@@ -483,12 +483,27 @@ class ValuationWorkspaceService:
         the checkpoint is approved.
         """
 
+        from valuationagent.application.input_baseline import validate_baseline_source
+
+        validate_baseline_source(self.store, session)
         preview = preview_session(session)
         preview.valuation_methods_override = list(progress.get("methods") or [])
         preview.valuation_method_exclusions = dict(
             progress.get("excluded_methods") or {}
         )
         request = self.research.valuation_assembler.build(preview)
+        if request.input_records:
+            from valuationagent.application.file_workspace import source_bytes
+            from valuationagent.application.provider_inputs import validate_provider_input
+            from valuationagent.application.issuer_identity import audit_request_identities
+            from valuationagent.schemas.inputs import InputRecord
+
+            audit_request_identities(self.store, session, request)
+            for file_id in {row["source"].get("file_id") for row in request.input_records if row["source"]["kind"] != "user"}:
+                _, raw = source_bytes(self.store, session, file_id)
+                for row in request.input_records:
+                    if row["source"].get("file_id") == file_id and row["source"].get("provider_binding"):
+                        validate_provider_input(session, InputRecord.model_validate(row), raw)
         provider_warnings = []
         if str(request.data_source) == "ticker":
             cutoff = session.information_cutoff_date or request.valuation_date
@@ -592,9 +607,11 @@ class ValuationWorkspaceService:
                 and checkpoint.request_snapshot
             ):
                 return checkpoint
+        selected_ids = {row.source.source_id for row in session.input_dataset.active_records() if row.source.kind != "user"} if session.input_dataset else None
         clean_facts = [
             fact for fact in session.facts
             if fact.status in {"confirmed", "proposed"} and not fact.warnings
+            and (selected_ids is None or fact.fact_id in selected_ids)
         ]
         current_ids = {fact.fact_id for fact in clean_facts}
         ledger_facts = [
@@ -1026,6 +1043,9 @@ class ValuationWorkspaceService:
         output = {"run_id": record.run_id, "status": str(record.status),
                   "run_policy": workspace.run_policy,
                   "input_hash": record.input_hash, "error": record.error}
+        from valuationagent.application.result_delivery import method_completion
+
+        output["method_completion"] = method_completion(record)
         if section == "request":
             output["request"] = record.request.model_dump(mode="json")
         elif section == "findings":
@@ -1033,11 +1053,15 @@ class ValuationWorkspaceService:
                 self._records(workspace.workspace_id, "finding", ChallengeFinding)
                 if item.run_id == record.run_id]
         elif record.result:
+            from valuationagent.application.result_views import financial_display
+
+            output["financial_display"] = financial_display(record.result)
             fields = None if section == "result" else {
                 "executive_summary", "dcf", "relative", "assumptions", "warnings",
-                "data_quality", "reconciliation", "currency",
+                "data_quality", "reconciliation", "currency", "analysis_basis",
             }
             output["result"] = record.result.model_dump(mode="json", include=fields)
+            output["delivery_instruction"] = "完成估值/报告时，finish_response的answer只写定性说明，不抄数字、日期、代码或下载链接。系统将从当前冻结结果渲染各方法数值表、真实基期、可比样本和报告链接；未绑定的定量重述不发布，也不重新计算或下载。"
         return output
 
     def execute(self, run_id):
@@ -1202,9 +1226,11 @@ class ValuationWorkspaceService:
         session = self.store.get_research(workspace.research_session_id)
         research = self.research.snapshot(workspace.research_session_id, compact=True)
         active_run = None
+        active_record = None
         if workspace.active_run_id:
             try:
-                active_run = self.store.get_run(workspace.active_run_id).model_dump(mode="json")
+                active_record = self.store.get_run(workspace.active_run_id)
+                active_run = active_record.model_dump(mode="json")
             except KeyError:
                 pass
         requirements = self._records(
@@ -1241,7 +1267,7 @@ class ValuationWorkspaceService:
             "execution": research["execution"],
             "plan": session.plan,
             "artifacts": self.store.list_artifacts(session.session_id),
-            "research_plan": research_plan(session, self.research.valuation_assembler),
+            "research_plan": research_plan(session, self.research.valuation_assembler, active_record),
             "runtime": {"agent_version": AGENT_PROMPT_VERSION, "session_agent_version": session.prompt_version},
             "active_run": active_run,
             "connections": {

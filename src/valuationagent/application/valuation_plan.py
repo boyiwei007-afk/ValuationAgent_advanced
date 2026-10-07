@@ -44,6 +44,9 @@ def valuation_progress(session, assembler):
     preview_facts = {f.fact_id: f for f in preview.facts}
     staged = [f.fact_id for f in session.facts if f.status == "proposed" and not f.warnings
               and preview_facts[f.fact_id].status == "confirmed"]
+    if session.input_dataset is not None:
+        selected_ids = {row.source.source_id for row in session.input_dataset.active_records() if row.source.kind != "user"}
+        staged = [key for key in staged if key in selected_ids]
     candidate_counts = {
         "confirmed": sum(f.status == "confirmed" for f in session.facts),
         "staged_clean": sum(f.status == "proposed" and not f.warnings for f in session.facts),
@@ -92,19 +95,19 @@ def valuation_progress(session, assembler):
                 break
 
     if request is None:
-        timing_issue = assembler.capital_structure_timing_issue(preview)
+        timing_issue = None if session.input_dataset is not None else assembler.capital_structure_timing_issue(preview)
         capital_action_unsupported = bool(
             timing_issue and timing_issue["kind"] == "unsupported_model_scope"
         )
         bridge_scope_unsupported = bool(
-            requested_methods
+            session.input_dataset is None and requested_methods
             and set(requested_methods) <= {"dcf", "ev_ebitda"}
             and assembler.model_scope_issue(preview)
         )
         scope_unsupported = capital_action_unsupported or bridge_scope_unsupported
         from valuationagent.application.observation_extraction import observation_next_action
 
-        evidence_issues = [{"fact_id": f.fact_id, "metric": f.metric, "period": f.period,
+        evidence_issues = [] if session.input_dataset is not None else [{"fact_id": f.fact_id, "metric": f.metric, "period": f.period,
                             "role": f.role, "peer_ticker": f.peer_ticker,
                             "warnings": list(f.warnings), "next_action": observation_next_action(f)}
                            for f in assembler.pending_blockers(preview) if f.warnings]
@@ -132,9 +135,9 @@ def valuation_progress(session, assembler):
                 "staged_fact_ids": staged, "confirmed_fact_count": candidate_counts["confirmed"],
                 "candidate_counts": candidate_counts,
                 "capital_structure": timing_issue,
-                "instruction": ("当前所选方法需要尚未实现的专业调整，继续补普通财务字段也不能解除；立即交付说明报告，不要持续检索或承诺补一项就能计算。用户可另行明确更换方法。"
+                "instruction": ("统一模型输入尚有缺项或冲突；使用record_inputs：用户给数用user_values，API字段引用用provider_values，已复核来源字段用source_values。按来源解释处理缺项，不强制联网证明用户假设，也不把来源解释失败当成资料不存在。" if session.input_dataset is not None else "当前所选方法需要尚未实现的专业调整，继续补普通财务字段也不能解除；立即交付说明报告，不要持续检索或承诺补一项就能计算。用户可另行明确更换方法。"
                                 if scope_unsupported else "按evidence_issues.next_action处理具体候选；主体矛盾的解释撤回后按真实公司重新extract_observations，不改写任务主体。其余解释错误用extract_observations及replaces更正。股数时效缺口定向取得新披露，不以中报利润替换全年利润。没有证据变化时不再轮询本检查，转去读取、补证或结束并交付缺口。review模式等批准，automatic模式可生成草案；历史缺失不可用假设、零值或搜索摘要替代。")}
-    recoverable_repairs = assembler.recoverable_driver_repairs(
+    recoverable_repairs = [] if request.analysis_basis == "user_scenario" else assembler.recoverable_driver_repairs(
         session, request.financials,
     )
     if recoverable_repairs:
@@ -164,14 +167,16 @@ def valuation_progress(session, assembler):
             "degraded": degraded,
             "company": request.company.name or request.company.ticker,
             "valuation_date": str(request.valuation_date),
-            "baseline_period": str(request.financials.period_end) if request.financials else None,
+            "analysis_basis": request.analysis_basis,
+            "input_records": request.input_records,
+            "baseline_period": str(request.financials.period_end) if request.financials and request.financials.period_end else None,
             "historical_periods": [str(f.period_end) for f in request.historical_financials],
             "financials": request.financials.model_dump(mode="json", exclude={"evidence", "statement_items"}) if request.financials else None,
             "assumptions": request.assumptions.model_dump(
                 mode="json", exclude_none=True, exclude_defaults=True
             ),
             "forecast_proposal_id": session.forecast_proposal.proposal_id if session.forecast_proposal else None,
-            "forecast_rationale": session.forecast_proposal.rationale if session.forecast_proposal else "采用确定性模型的历史推导与行业参数；计算时披露假设及风险。",
+            "forecast_rationale": session.forecast_proposal.rationale if session.forecast_proposal else "按用户给定数据及倍数进行情景试算，未建立历史预测或外部核验。" if request.analysis_basis == "user_scenario" else "采用确定性模型的历史推导与行业参数；计算时披露假设及风险。",
             "risks": [
                 *(session.forecast_proposal.risks if session.forecast_proposal else []),
                 *(

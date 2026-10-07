@@ -80,7 +80,7 @@ class ProposeForecast(ApiModel):
     inputs: ForecastInputs
     rationale: str = Field(min_length=20, max_length=2400, description="分清来源事实与预测判断，解释增长、利润率、WACC和永续增长依据；不得声称假设是历史事实。")
     risks: list[str] = Field(min_length=1, max_length=8)
-    evidence_ids: list[str] = Field(min_length=1, max_length=30, description="关联已核验财务候选ID或已读取原文块ID；不能引用搜索摘要。")
+    evidence_ids: list[str] = Field(min_length=1, max_length=30, description="关联已保存且有效的input_id、已核验财务候选ID或已读取原文块ID；用户情景可引用用户输入，不要求联网核验。不能编造ID或引用搜索摘要。")
 
 
 class CandidateInput(ApiModel):
@@ -299,6 +299,7 @@ class ResearchService:
         official_search_provider=None,
         tool_providers=(),
         remote_transport=None,
+        history_provider=None,
     ):
         self.store = store
         self._clients = {}
@@ -311,6 +312,7 @@ class ResearchService:
         self._data_client_lock = threading.RLock()
         self._search_client_epochs = {}
         self._market_clients = {}
+        self.history_provider = history_provider
         self.search_provider = search_provider or UnavailableSearchProvider()
         self.official_search_provider = official_search_provider or CninfoAnnouncementProvider()
         self.tool_providers = tuple(tool_providers)
@@ -444,7 +446,7 @@ class ResearchService:
     def attach_market(self, session_id, provider):
         """Attach a session-only A-share data provider without storing its token."""
         self.store.get_research(session_id)
-        if not callable(getattr(provider, "resolve", None)):
+        if not any(callable(getattr(provider, capability, None)) for capability in ("resolve", "fetch_history")):
             raise TypeError("A股取数服务配置无效。")
         with self._data_client_lock:
             self._market_clients[session_id] = provider
@@ -462,7 +464,7 @@ class ResearchService:
         self.store.get_research(session_id)
         with self._data_client_lock:
             search = self._search_clients.get(session_id, self.search_provider)
-            market = self._market_clients.get(session_id, default_market)
+            market = self._market_clients.get(session_id, self.history_provider or default_market)
         search_id = str(getattr(search, "provider_id", "unavailable") or "unavailable")
         market_version = str(getattr(market, "version", "") or "")
         return {
@@ -481,9 +483,11 @@ class ResearchService:
                 "connection_status": "verified" if getattr(search, "connection_verified", False) else "configured" if search_id != "unavailable" else "unconfigured",
             },
             "market": {
-                "available": bool(market and callable(getattr(market, "resolve", None)))
+                "available": bool(market and any(callable(getattr(market, capability, None)) for capability in ("resolve", "fetch_history")))
                 and not isinstance(market, LocalDataProvider),
                 "provider": market_version or "unavailable",
+                "statements": list(getattr(market, "history_statements", ())),
+                "connection_status": "verified" if getattr(getattr(market, "client", None), "connection_verified", False) else "configured" if market and not isinstance(market, LocalDataProvider) else "unconfigured",
             },
         }
 
@@ -817,7 +821,7 @@ class ResearchService:
             try:
                 record = runner.store.get_run(session.valuation_run_id)
                 if record.request == request:
-                    if session_id in self._market_clients:
+                    if request.data_source == "ticker" and callable(getattr(self._market_clients.get(session_id), "resolve", None)):
                         runner.attach_data(record.run_id, self._market_clients[session_id])
                     session.pending_action = ""
                     session.status = "submitted"
@@ -833,7 +837,7 @@ class ResearchService:
             parent_id=parent_id,
             reason="研究会话输入更新后重新提交" if parent_id else None,
         )
-        if session_id in self._market_clients:
+        if request.data_source == "ticker" and callable(getattr(self._market_clients.get(session_id), "resolve", None)):
             runner.attach_data(record.run_id, self._market_clients[session_id])
         session.valuation_run_id = record.run_id
         session.pending_action = ""
@@ -961,12 +965,12 @@ class ResearchService:
 
     @staticmethod
     def _contains_secret(text):
-        return bool(re.search(r"(?i)\b(?:sk|key)-[a-z0-9_-]{12,}\b|\bbearer\s+[a-z0-9._-]{12,}", text))
+        return bool(re.search(r"(?i)\b(?:sk|key|tvly)-[a-z0-9_-]{12,}\b|\bbearer\s+[a-z0-9._-]{12,}|\b[a-z0-9_-]{16,}-infoway\b", text))
 
     @staticmethod
     def _redact_text(text):
         return re.sub(
-            r"(?i)\b(?:sk|key)-[a-z0-9_-]{12,}\b|\bbearer\s+[a-z0-9._-]{12,}",
+            r"(?i)\b(?:sk|key|tvly)-[a-z0-9_-]{12,}\b|\bbearer\s+[a-z0-9._-]{12,}|\b[a-z0-9_-]{16,}-infoway\b",
             "[REDACTED_CREDENTIAL]",
             text,
         )
@@ -1067,7 +1071,7 @@ class ResearchService:
                 type="scope.auto_confirmed",
                 stage="scope",
                 status="completed",
-                summary="公司代码、估值日和方法均由用户明确给出，已跳过无意义的范围确认",
+                summary="自动模式采用当前任务范围；其中模型选择不等于用户明确指定或独立核验",
                 payload={
                     "ticker": session.draft.ticker,
                     "valuation_date": str(session.draft.valuation_date or ""),
@@ -1504,11 +1508,16 @@ class ResearchService:
                 fact.peer_ticker or fact.peer_name, fact.multiple_basis, fact.unit)
 
     def _propose_forecast(self, session, args):
+        from valuationagent.application.forecast_inputs import forecast_input_evidence
+
         if session.pending_action != "valuation" or "dcf" not in session.draft.methods:
             raise ValueError("只有已请求DCF估值时才能提出预测方案；不能自动改变估值方法")
         blocks = self._blocks(session)
         facts = {f.fact_id: f for f in session.facts if f.status != "rejected" and not f.warnings}
+        input_ids = {ref.evidence_id for ref in forecast_input_evidence(session, args.evidence_ids)}
         for key in args.evidence_ids:
+            if key in input_ids:
+                continue
             if key in facts:
                 cutoff = _information_cutoff(session)
                 if facts[key].published_at and cutoff and facts[key].published_at > cutoff:
@@ -1526,11 +1535,31 @@ class ResearchService:
             risks=[self._redact_text(risk) for risk in args.risks], evidence_ids=args.evidence_ids)
         session.status = "collecting"
         self.store.append_event(session.session_id, type="valuation.forecast_proposed", stage="planning",
-            status="completed", summary="模型提出十年三情景预测，等待整套方案确认；未修改历史事实",
+            status="completed", summary="已保存十年预测方案；自动模式可按已授权流程生成草案，审阅模式需用户批准；未修改历史事实",
             payload=session.forecast_proposal.model_dump(mode="json"))
         progress = valuation_progress(session, self.valuation_assembler)
         session.gaps = [progress["blocking_reason"]] if progress["blocking_reason"] else []
         return {"status": "forecast_staged", "progress": progress, "instruction": progress["instruction"]}
+
+    def _register_attachments(self, session, file_ids):
+        for file_id in dict.fromkeys(file_ids):
+            if any(doc.file_id == file_id for doc in session.documents):
+                continue
+            try:
+                meta = self.store.get_file(file_id)
+            except (KeyError, ValueError):
+                message = f"附件 {self._redact_text(file_id)} 的引用已失效或不存在；未读取该文件，已继续处理其他附件。需要时请重新上传。"
+                if message not in session.gaps:
+                    session.gaps.append(message)
+                self.store.append_event(session.session_id, type="document.unavailable", stage="document", status="warning",
+                    summary=message, payload={"file_id": self._redact_text(file_id)})
+                continue
+            self.store.save_research_blocks(session.session_id, meta["file_id"], [])
+            session.documents.append(DocumentSummary(file_id=meta["file_id"], name=meta["original_name"],
+                role=meta["role"], block_count=0, sha256=meta["sha256"], size_bytes=meta["size_bytes"],
+                parse_status="pending", provenance_type="user_upload", authority_tier="B",
+                source_confidence=0, provider="user_upload"))
+        self.store.save_research(session)
 
     def _llm_turn(self, session, llm):
         from valuationagent.application.agent_runtime import WorkspaceAgentRuntime
@@ -1566,7 +1595,6 @@ class ResearchService:
             if turn.language is not None:
                 session.language = turn.language
             content = self._redact_text(turn.content.strip() or "请读取这些附件")
-            session.pending_decision = None
             self.store.add_message(session_id, "user", content, "agent")
             session.last_issue = None
             session.outcome_status = ""
@@ -1576,24 +1604,21 @@ class ResearchService:
             status = "completed"
             try:
                 self._check_execution()
-                for file_id in dict.fromkeys(turn.file_ids):
-                    existing_doc = next((d for d in session.documents if d.file_id == file_id), None)
-                    if existing_doc:
-                        if existing_doc.parse_status != "unreadable":
-                            continue
-                        session.documents.remove(existing_doc)
-                    try:
-                        meta = self.store.get_file(file_id)
-                    except (KeyError, ValueError):
-                        # A stale upload token is a per-file failure, just like
-                        # an unreadable PDF. Never invent metadata for it or let
-                        # it prevent the remaining valid uploads from parsing.
-                        message = f"附件 {self._redact_text(file_id)} 的引用已失效或不存在；未读取该文件，已继续处理其他附件。需要时请重新上传。"
-                        if message not in session.gaps:
-                            session.gaps.append(message)
-                        self.store.append_event(session_id, type="document.unavailable", stage="document", status="warning",
-                            summary=message, payload={"file_id": self._redact_text(file_id)})
-                        continue
+                from valuationagent.application.turn_control import prepare_turn
+
+                self._register_attachments(session, turn.file_ids)
+                llm = self._clients.get(session_id)
+                if llm is not None:
+                    prepare_turn(self, session, llm)
+                else:
+                    session.turn_control = None
+                may_read = bool(session.turn_control and "files" in session.turn_control.effects)
+                pending = [doc for doc in session.documents if may_read and (doc.parse_status == "pending"
+                    or doc.parse_status == "unreadable" and doc.file_id in turn.file_ids)]
+                for existing_doc in pending:
+                    file_id = existing_doc.file_id
+                    meta = self.store.get_file(file_id)
+                    session.documents.remove(existing_doc)
 
                     def parse(meta=meta):
                         blocks, warnings = parse_document(meta, check_cancel=self._check_execution, pdf_page_limit=25)
@@ -1622,7 +1647,6 @@ class ResearchService:
                             source_confidence=0.2, provider="user_upload"))
                         self.store.append_event(session_id, type="document.unreadable", stage="document", status="warning",
                             summary=f"无法读取 {meta['original_name']}；继续处理其他来源", payload={"file_id": file_id, "warning": warning})
-                llm = self._clients.get(session_id)
                 if llm is None:
                     raise LlmError("MODEL_CONNECTION_REQUIRED: 工作区和附件已保存，请连接模型后继续。")
                 result = self._llm_turn(session, llm)
@@ -1645,15 +1669,18 @@ class ResearchService:
                         "request_id": request_id,
                         "last_tools": [{"tool": event.tool, "status": event.status, "summary": event.summary} for event in recent],
                         "next_steps": [step["title"] for step in session.plan if step.get("status") != "completed"][:5],
-                        "instruction": ("模型输出/上下文协议失败，不是资料缺失。检查模型参数，缩小读取和提交批次，先处理已下载文件，不重放已经成功的工具。" if protocol_issue else
+                        "instruction": ("模型思考耗尽了已配置的输出上限，尚未生成有效工具指令。先在模型连接中调大输出预算/上限并重新连接；保留原请求的联网限制，不重复取数，不改模型或思考模式。" if issue_code == "LLM_REASONING_LIMIT" else
+                                        "模型输出/上下文协议失败，不是资料缺失。检查模型参数，缩小读取和提交批次，先处理已下载文件，不重放已经成功的工具。" if protocol_issue else
                                         "模型连接不可用或响应失败。先核对接口健康、真实模型ID和连接配置；恢复后继续已有资料，不把连接问题归为数据缺失，不自动切换模型。" if connection_issue else
-                                        "先inspect_requirements核对真实年度覆盖和repair_candidates；修复已有候选，再转到尚未处理的年度/可比样本。不要重跑上轮重复检索。"),
+                                        "保留原请求与联网/计算约束，先检查最近工具的具体失败原因和已保存输入；动作误判用revise_turn_plan修正，参数错误按原消息引用修复。不把执行停止误当资料缺失，不重复成功录入或下载。"),
                     }
-                    visible = visible + " 已保存当前续做检查点；没有后台任务继续运行。" if connection_issue and not protocol_issue else (
+                    visible = visible + " 已保存当前续做检查点；没有后台任务继续运行。" if connection_issue or protocol_issue else (
                         f"{issue_code}: 本轮已停止并保存续做检查点。"
                         f"已核验{sum(fact.status == 'confirmed' and not fact.warnings for fact in session.facts)}项事实，"
                         f"待修复{sum(fact.status == 'proposed' and bool(fact.warnings) for fact in session.facts)}项。"
-                        "下一轮先核对已有来源与字段修复，再处理其他年度或可比样本；本轮停止不等于所有资料均不可得，也没有后台任务继续运行。"
+                        f"另有{len(session.input_dataset.active_records()) if session.input_dataset else 0}项有效统一输入（用户输入不等于外部核验）。"
+                        f"本次停止原因：{visible} "
+                        "先处理具体失败，不重新搜集已提供数据；没有后台任务继续运行。"
                     )
                 session.last_issue = ResearchIssue(
                     issue_id=_id("issue_"), code=issue_code,

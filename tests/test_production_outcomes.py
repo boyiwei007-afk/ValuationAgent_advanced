@@ -171,6 +171,10 @@ def test_repeated_unchanged_reads_stop_early_and_preserve_non_numeric_report(tmp
     class EndlessInspections:
         calls = 0
         def chat(self, messages, **kwargs):
+            from control_fixtures import control_reply
+
+            if reply := control_reply(kwargs):
+                return reply
             self.calls += 1
             return {"tool_calls": [{"id": str(self.calls), "type": "function",
                 "function": {"name": "inspect_context", "arguments": "{}"}}]}

@@ -33,6 +33,10 @@ class ScriptedModel:
         self.kwargs = []
 
     def chat(self, messages, **kwargs):
+        from control_fixtures import control_reply
+
+        if reply := control_reply(kwargs):
+            return reply
         self.calls.append(json.loads(json.dumps(messages)))
         self.kwargs.append(kwargs)
         name, args = next(self.actions)
@@ -770,6 +774,7 @@ def test_registered_tool_provider_joins_same_audit_loop(tmp_path):
                 "读取未来金融插件的能力契约，不执行估值。",
                 NoArguments,
                 lambda _: {"available": False, "reason": "正式模型待接入"},
+                effects=(),
             )]
 
     model = ScriptedModel([

@@ -7,6 +7,8 @@ import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal
+from urllib.parse import unquote, urlsplit
+from pathlib import PurePosixPath
 
 from pydantic import Field
 
@@ -17,7 +19,7 @@ from valuationagent.application.research import (
     _annotate_untrusted_source, _information_cutoff,
 )
 from valuationagent.application.valuation_plan import valuation_progress
-from valuationagent.application.research_plan import research_plan, metric_catalog
+from valuationagent.application.research_plan import research_plan, metric_catalog, user_input_catalog, user_input_mode
 from valuationagent.application.evidence_status import observation_verified, repair_groups, evidence_references
 from valuationagent.application.research_valuation import _period, financial_mapping_issue, mapped_financial_metric
 from valuationagent.core.documents import parse_document
@@ -29,7 +31,9 @@ from valuationagent.schemas.agent import SearchQuery
 from valuationagent.schemas.models import ApiModel
 from valuationagent.schemas.research import DecisionPrompt, DocumentSummary, ResearchDraft
 
-from valuationagent.llm.context import AGENT_PROMPT, AGENT_PROMPT_VERSION
+from valuationagent.llm.context import AGENT_PROMPT, AGENT_PROMPT_VERSION, USER_INPUT_PROMPT
+from valuationagent.llm.tool_catalog import LoadTools, ToolCatalog
+from valuationagent.application.user_input_table import UserInputTable, record_user_table
 from valuationagent.llm.client import LlmError
 from valuationagent.llm.observation_review import focused_review_request
 from valuationagent.llm.document_focus import DocumentFocus, FileTask, FileTaskEnd
@@ -37,6 +41,10 @@ from valuationagent.application.financial_evidence import (
     EvidenceRequest, FactSelection, read_evidence, corroborate, reject_candidates,
 )
 from valuationagent.market.research_data import FinancialHistoryRequest, fetch_history
+from valuationagent.application.provider_inputs import InputCandidateQuery, list_input_candidates
+from valuationagent.application.input_acquisition import AcquireFinancialInputs, acquire_financial_inputs, acquisition_sources
+from valuationagent.application.input_views import InspectInputs, inspect_inputs, input_overview
+from valuationagent.application.user_message import ReadUserInput, read_user_input
 from valuationagent.application.file_workspace import (
     FileList, FileReference, FileRead, PageView, list_files, inspect_file, read_file, render_page, image_message,
 )
@@ -51,11 +59,20 @@ from valuationagent.application.extraction_recovery import record_attempt, recov
 from valuationagent.application.file_search import FileSearch, search_file
 from valuationagent.application.source_navigation import SourceLinks, FollowSourceLink, list_source_links, follow_source_link
 from valuationagent.application.workspace_sensitivity import SensitivityRequest, analyze_sensitivity
+from valuationagent.application.turn_control import guard_tool, prepare_turn, resolve_control, visible_tools
+from valuationagent.schemas.control import TurnDecision
+from valuationagent.application.record_inputs import record_inputs
+from valuationagent.schemas.inputs import RecordInputs
 
 
 class TaskUpdate(ApiModel):
     draft: ResearchDraft = Field(description="增量任务修改：仅传本次要修改的字段，省略项保留已有值。切换已明确的公司/证券代码时须同时提供company和ticker，不用空字符串清空其他任务信息。")
     valuation_requested: bool = Field(description="顶层必填。用户要求估值时true；仅讨论/读取文件时false。不能放进draft。")
+
+
+class ReviseTurnPlan(ApiModel):
+    request_quote: str = Field(min_length=4, max_length=300, description="当前用户请求中支持修正的逐字原话；不引用助手旧计划或文件指令。")
+    decision: TurnDecision
 
 
 class PlanStep(ApiModel):
@@ -77,7 +94,7 @@ class ReadValuation(ApiModel):
 
 
 class AgentResponse(ApiModel):
-    answer: str = Field(min_length=1, max_length=10000)
+    answer: str = Field(min_length=1, max_length=10000, description="完成估值/报告时只写不含数字、代码、日期或链接的定性说明；结果表、基期、样本与真实下载链接由冻结计算自动渲染，未绑定的定量重述不会发布。其他讨论/文件提取按本轮要求回答。")
     evidence_ids: list[str] = Field(default_factory=list, max_length=30)
     outcome: Literal["answer", "needs_input", "insufficient_data", "checkpoint"] = "answer"
     decision: DecisionPrompt | None = None
@@ -100,10 +117,15 @@ class WorkspaceAgentRuntime:
         self.read_signatures = {}
         self.data_signatures = set()
         self.pending_page_image = None
+        self.calculation_attempt = None
         self.image_enabled = False
         self.image_count = 0
         self.read_streak = 0
+        self.reading_tools = set()
         self.document_focus = DocumentFocus(self)
+        self.tool_effects = {}
+        self.user_input_read = False
+        self.tool_catalog = ToolCatalog()
 
     def view_page(self, args):
         if not self.image_enabled:
@@ -124,11 +146,16 @@ class WorkspaceAgentRuntime:
 
     def call(self, name, arguments, invoke):
         def checked():
+            guard_tool(self.session, name, arguments, self.tool_effects)
             self.document_focus.guard(name, arguments)
-            if name in self.STATUS_TOOLS | {"read_document", "inspect_context", "read_valuation", "read_financial_evidence", "list_files", "inspect_file", "search_file", "list_source_links", "read_file", "view_pdf_page", "read_artifact", "update_task", "update_plan"}:
+            if name in self.STATUS_TOOLS | {"read_user_input", "revise_turn_plan", "read_document", "inspect_context", "inspect_inputs", "read_valuation", "read_financial_evidence", "list_files", "inspect_file", "search_file", "list_source_links", "read_file", "view_pdf_page", "read_artifact", "update_task", "update_plan", "fetch_financial_history", "acquire_financial_inputs", "list_input_candidates"}:
                 signature = self.read_signature(name, arguments)
                 self.read_signatures[signature] = self.read_signatures.get(signature, 0) + 1
                 if self.read_signatures[signature] > 2:
+                    if name == "read_user_input":
+                        raise ValueError("REPEATED_USER_READ: 相同用户原话已读取两次，继续读不会新增数据。按已取得引用录入；若误把用户计算请求路由成讨论，用revise_turn_plan纠正动作理解，不解除用户的联网或计算禁令。")
+                    if name in {"fetch_financial_history", "acquire_financial_inputs"}:
+                        raise ValueError("REPEATED_ACQUISITION: 相同任务和来源已取得，缓存命中不是新进展。查看provider_sources与input_acquisition；已有输入直接check_preparation，缺项用已有文件定向读取，不再次取相同数据。")
                     if name in {"update_task", "update_plan"}:
                         raise ValueError("REPEATED_TASK_UPDATE: 相同任务/计划已经保存，没有新状态变化；不要重复更新。根据已有来源推进提取/复核，或用finish_response说明具体阻断。")
                     raise ValueError("REPEATED_READ: 相同状态和参数已读取两次；请修复候选、读取其他年度/来源或保存具体阻断，不重复轮询。")
@@ -161,29 +188,72 @@ class WorkspaceAgentRuntime:
         return canonical([name, parameters,
                           [(fact.fact_id, fact.status, fact.warnings) for fact in self.session.facts],
                           [(doc.file_id, doc.block_count) for doc in self.session.documents],
+                          self.session.input_dataset,
+                          self.session.input_acquisition if name == "inspect_inputs" else None,
                           self.session.draft, self.session.forecast_proposal, self.session.valuation_run_id,
                           None if name in self.STATUS_TOOLS else self.session.plan, self.session.pending_action])
 
     def exhausted_status_tools(self):
         return sorted(name for name in self.STATUS_TOOLS if self.read_signatures.get(self.read_signature(name, {}), 0) >= 2)
 
+    def input_edit_tools(self):
+        if (self.session.turn_control and "inputs" in self.session.turn_control.effects
+                and self.session.input_dataset and self.session.input_dataset.active_records()):
+            return {"record_inputs"}
+        return set()
+
     def progress_advisory(self, name, output):
-        if name in {"read_document", "read_file", "search_file", "read_financial_evidence", "inspect_file", "inspect_context", "inspect_requirements", "inspect_extraction_progress", "list_files"}:
+        if isinstance(output, dict) and output.get("ok") is not False:
+            following = None
+            if name in {"read_file", "read_document"} and any(block.get("text", "").strip() for block in output.get("blocks", [])):
+                following = {"extract_observations"}
+            elif name == "extract_observations" and output.get("saved_count"):
+                following = {"prepare_observation_review"}
+            elif name == "review_observations" and any(item.get("semantic_review") == "supported" for item in output.get("reviews", [])):
+                following = {"record_inputs"}
+            elif name in {"acquire_financial_inputs", "inspect_inputs"} and self.input_edit_tools():
+                following = self.input_edit_tools()
+            elif name in {"record_inputs", "record_user_inputs"} and (output.get("saved_input_ids") or output.get("saved_calculation_ids")):
+                following = self.input_edit_tools()
+            if following is not None:
+                self.reading_tools = following
+            if following and self.session.turn_control and "inputs" in self.session.turn_control.effects:
+                instruction = ("统一输入已经保存，record_inputs参数定义已直接可用，无需load_tools。用已有input_id声明calculations中的财务口径、组成和限制，或显式更正冲突；不重复提取或录入同一数值，不把raw.*、null或候选直接当最终指标。此交接不执行映射、计算或审批。"
+                    if following == {"record_inputs"} and self.input_edit_tools() else
+                    "后续步骤的工具定义已直接可用，无需反复load_tools或重读文件。由你理解原文后决定提交哪些观察；读取不等于财务准入，失败或缺项不补零。")
+                output = {**output, "reading_handoff": {"tools": sorted(following), "executed": False,
+                    "instruction": instruction}}
+        if name in {"read_document", "read_file", "search_file", "read_financial_evidence", "inspect_file", "inspect_context", "inspect_inputs", "inspect_requirements", "inspect_extraction_progress", "list_files", "list_input_candidates"}:
             self.read_streak += 1
         elif isinstance(output, dict) and (
             name == "extract_observations" and output.get("saved_count")
             or name == "review_observations" and any(not review.get("duplicate") for review in output.get("reviews", []))
+            or name in {"record_inputs", "record_user_inputs"} and (output.get("saved_input_ids") or output.get("saved_calculation_ids"))
+            or name == "acquire_financial_inputs" and output.get("new_input_count")
         ):
             self.read_streak = 0
-        if self.session.pending_action == "valuation" and self.read_streak >= 6 and isinstance(output, dict):
+        if (self.session.pending_action == "valuation" and self.session.turn_control
+                and "inputs" in self.session.turn_control.effects and self.read_streak >= 6 and isinstance(output, dict)):
             pending = [fact.fact_id for fact in self.session.facts if fact.status == "proposed"]
             return {**output, "progress_advisory": {"reads_since_extraction_or_review": self.read_streak,
                 "pending_fact_ids": pending[:12],
-                "instruction": "已连续读取/检查多次而未保存或复核字段。如果已找到核心数值，先extract_observations提交4至6项，再prepare_observation_review/review_observations；已有候选先处理工具指出的具体问题。若确实仍需阅读可继续，此提示不是硬门槛，也不允许猜数。"}}
+                "instruction": "已连续读取/检查多次。已读取API契约字段可直接record_inputs(provider_values)，不重复提取；文档已找到核心数据则extract_observations后复核，已复核事实用record_inputs(source_values)。参数错误先按具体问题修正读取请求，不能靠猜数或重下载解决。若确实仍需阅读可继续，此提示不是硬门槛。"}}
         return output
 
     def requirements(self):
-        return {**research_plan(self.session, self.service.valuation_assembler), "metric_catalog": metric_catalog()}
+        plan = self.research_plan()
+        user_catalog = user_input_mode(self.session) or plan.get("analysis_basis") == "user_scenario"
+        return {**plan, "metric_catalog": user_input_catalog() if user_catalog else metric_catalog(),
+            "raw_metric_policy": "目录外原始科目可保留raw.小写名称；record_user_inputs需明确period_kind=annual或instant，不将其重命名为不等价的标准模型字段。"}
+
+    def research_plan(self):
+        record = None
+        if self.session.valuation_run_id:
+            try:
+                record = self.service.store.get_run(self.session.valuation_run_id)
+            except KeyError:
+                pass
+        return research_plan(self.session, self.service.valuation_assembler, record)
 
     def repair_facts(self, args):
         from valuationagent.application.research import CandidateInput
@@ -238,12 +308,31 @@ class WorkspaceAgentRuntime:
                 or previous.ticker and "ticker" in changes and changes["ticker"] != previous.ticker and "company" not in changes):
             raise ValueError("TASK_ENTITY_UPDATE: 修改已明确的主体时须同时提供company与ticker，不能把另一家公司名称与旧代码拼接；仅补充行业/方法等请省略company和ticker。")
         draft = ResearchDraft.model_validate({**previous.model_dump(), **changes})
+        if self.session.input_dataset and draft.company and draft.company not in {self.session.input_dataset.entity, self.session.draft.ticker}:
+            raise ValueError(f"INPUT_TASK_SCOPE: 已有输入属于{self.session.input_dataset.entity!r}；更正数据时保留主体，record_inputs省略company并使用replaces，不改公司绕过输入校验。")
         if args.valuation_requested and draft.valuation_date is None:
             raise ValueError(f"TASK_DATE_REQUIRED: 自动估值须明确valuation_date，不能无日期开展取证。当前日期为{date.today().isoformat()}；用户没有另指定历史时点时，可明确提交今天作为估值日，并保持信息截止日不晚于估值日。请同时保留本次尚未保存的主体/方法参数；纯文件阅读或讨论使用valuation_requested=false。")
         self.service._apply_task_draft(self.session, draft, automatic=args.valuation_requested)
         self.session.status = "collecting"
         return {"draft": self.session.draft.model_dump(mode="json"),
                 "valuation_requested": self.session.pending_action == "valuation"}
+
+    def revise_turn_plan(self, args):
+        previous = self.session.turn_control
+        message = next((item for item in reversed(self.service.store.list_messages(self.session.session_id)) if item.role == "user"), None)
+        if previous is None or message is None or previous.message_id != message.message_id or args.request_quote not in message.content:
+            raise ValueError("TURN_REVISION_QUOTE: 修正必须引用当前用户原话，不能使用来源内容或旧助手计划。")
+        changes = {item.permission: item for item in previous.decision.permission_changes}
+        changes.update({item.permission: item for item in args.decision.permission_changes})
+        decision = args.decision.model_copy(update={"permission_changes": list(changes.values())})
+        control, saved = resolve_control(self.session, message, decision)
+        control.decision_context = previous.decision_context
+        self.session.turn_control, self.session.execution_permissions = control, saved
+        self.service.store.save_research(self.session)
+        self.service.store.append_event(self.session.session_id, type="turn.reinterpreted", stage="planning", status="completed",
+            summary=decision.summary, payload={"request_quote": args.request_quote, "previous_actions": previous.decision.actions,
+                "control": control.model_dump(mode="json")})
+        return {"control": control.model_dump(mode="json"), "instruction": "已按当前请求修正动作计划；用户权限和界面权限仍然生效，未执行任何取数或计算。下一步选择当前请求所需工具。"}
 
     def update_plan(self, args):
         self.session.plan = [step.model_dump() for step in args.steps]
@@ -345,14 +434,59 @@ class WorkspaceAgentRuntime:
                 "instruction": "verification.observation只表示原文绑定；status=confirmed且无警告才通过字段准入，不等于整套模型可计算或用户批准。proposed是已保存候选，不能称已入模。"}
 
     def finish(self, args):
+        if self.calculation_attempt and self.calculation_attempt.get("status") not in {"completed", "completed_with_warnings"} and args.outcome == "answer":
+            raise ValueError("CALCULATION_NOT_COMPLETED: 本轮最后一次计算没有完成，不能把旧报告或心算结果说成更新后的估值。先修正输入并成功计算，或用needs_input/insufficient_data/checkpoint如实说明未完成，不声称已有新价格。")
+        self.check_delivery(args)
         if args.decision is not None and args.outcome != "needs_input":
             raise ValueError("提供选择时outcome必须是needs_input；用户也可以自由输入，不得把选择当作财务审批。")
         blocks = self.service._blocks(self.session)
         facts = {fact.fact_id: fact for fact in self.session.facts}
-        missing = [key for key in args.evidence_ids if key not in blocks and key not in facts]
+        inputs = {row.input_id: row for row in self.session.input_dataset.records} if self.session.input_dataset else {}
+        artifacts = {row["artifact_id"]: row for row in self.service.store.list_artifacts(self.session.session_id)}
+        workspace = self.service.store.workspace_for_research(self.session.session_id)
+        delivery = None
+        control = self.session.turn_control
+        if (workspace and self.session.valuation_run_id and args.outcome == "answer" and control
+                and {"value", "report"} & set(control.decision.actions)):
+            record = self.service.store.get_run(self.session.valuation_run_id)
+            if (record.result and str(record.status) in {"completed", "completed_with_warnings"}
+                    and (record.result.dcf and record.result.dcf.status == "success"
+                        or any(item.status == "success" for item in record.result.relative))):
+                from valuationagent.application.result_delivery import render_delivery
+
+                args.answer, delivery = render_delivery(self.service.store, self.session, record, workspace, artifacts, args.answer)
+        def actual_download(match):
+            path = unquote(urlsplit(match[2]).path)
+            if path.startswith("/api/workspaces/"):
+                selected = re.fullmatch(r"/api/workspaces/([^/]+)/artifacts/([^/]+)", path)
+                if not selected or not workspace or selected[1] != workspace.workspace_id or selected[2] not in artifacts:
+                    raise ValueError("REPORT_LINK_INVALID: 链接不属于本工作区真实产物；使用返回的download_url，不编造主机或其他工作区路径。")
+                self.service.store.get_artifact(self.session.session_id, selected[2])
+                return f"[{match[1]}]({path})"
+            filename = PurePosixPath(unquote(urlsplit(match[2]).path)).name
+            candidates = [item for item in artifacts.values() if item["filename"] == filename]
+            cited = [item for item in candidates if item["artifact_id"] in args.evidence_ids]
+            current = [item for item in candidates if item.get("valuation_run_id") == self.session.valuation_run_id]
+            candidates = cited or current or candidates
+            if len(candidates) != 1:
+                raise ValueError("REPORT_LINK_INVALID: 下载链接必须对应本工作区唯一真实artifact_id；使用文件卡片，不编造sandbox路径。")
+            item = candidates[0]
+            self.service.store.get_artifact(self.session.session_id, item["artifact_id"])
+            return f"[{match[1]}](/api/workspaces/{workspace.workspace_id}/artifacts/{item['artifact_id']})" if workspace else f"{match[1]}（文件卡片：{item['filename']}）"
+        args.answer = re.sub(r"\[([^\]\n]+)\]\(((?:sandbox:|file:|/mnt/data/)[^)\s]+)\)", actual_download, args.answer)
+        args.answer = re.sub(r"\[([^\]\n]+)\]\(((?:https?://[^/\s)]+)?/api/workspaces/[^)\s]+)\)", actual_download, args.answer)
+        missing = [key for key in args.evidence_ids if key not in blocks and key not in facts and key not in inputs and key not in artifacts]
         if missing:
-            raise ValueError("引用不存在，必须引用已读取的原文或事实 ID：" + ", ".join(missing))
-        references = evidence_references(self.session, blocks, args.evidence_ids)
+            raise ValueError("引用不存在，必须引用本工作区真实的原文、事实、用户输入或输出文件 ID：" + ", ".join(missing))
+        references = evidence_references(self.session, blocks, [key for key in args.evidence_ids if key in blocks or key in facts])
+        for key in dict.fromkeys(args.evidence_ids):
+            if key in inputs:
+                row = inputs[key]
+                label = "用户输入依据（未经外部核验）" if row.source.kind == "user" else "来源输入依据（LLM复核不等于独立审计）"
+                args.answer += f"\n\n{label}：{row.metric} · {row.original_amount} {row.unit} · `{key}`"
+            if key in artifacts:
+                metadata, _ = self.service.store.get_artifact(self.session.session_id, key)
+                args.answer += f"\n\n已生成文件：`{metadata['filename']}` · `{key}`（输出文件不是原始证据）"
         if references:
             labels = []
             for reference in references[:8]:
@@ -378,18 +512,73 @@ class WorkspaceAgentRuntime:
         self.session.pending_decision = args.decision
         self.session.summary = self.service._redact_text(args.answer)
         return {"_terminal": True, "answer": args.answer, "evidence_ids": args.evidence_ids,
-                "outcome": args.outcome, "decision": args.decision.model_dump() if args.decision else None}
+                "outcome": args.outcome, "decision": args.decision.model_dump() if args.decision else None,
+                **({"delivery": delivery} if delivery else {})}
+
+    def check_delivery(self, args):
+        control = self.session.turn_control
+        if not control or not self.workspaces or args.outcome == "checkpoint":
+            return
+        if (args.outcome == "answer" and "ingest" in control.decision.actions and self.session.documents
+                and not any(fact.status != "rejected" for fact in self.session.facts)
+                and not (self.session.input_dataset and self.session.input_dataset.active_records())):
+            raise ValueError("INGESTION_NOT_SAVED: 本轮要求提取/录入，但尚未保存任何候选或统一输入。原文读取和正文表格不等于数据已保存；先begin_file_task及extract_observations。若确实没有所需数据，用insufficient_data说明具体缺项；若要求保存笔记且report动作遗漏，用revise_turn_plan纠正，不开启联网或估值。")
+        if (args.outcome == "answer" and {"ingest", "report"} <= set(control.decision.actions)
+                and "artifacts" in control.effects and self.session.documents and not self.session.valuation_run_id
+                and not self.service.store.list_artifacts(self.session.session_id)):
+            raise ValueError("REPORT_NOT_DELIVERED: 已提取资料但用户要求的文件尚未保存；write_research_note保存引用原文的研究笔记，或write_workspace_report导出真实当前状态。正文不是可下载文件，不为此启动估值。")
+        workspace = self.service.store.workspace_for_research(self.session.session_id)
+        if (args.outcome == "answer" and "value" in control.decision.actions
+                and self.session.valuation_run_id):
+            from valuationagent.application.result_delivery import method_completion
+
+            completion = method_completion(self.service.store.get_run(self.session.valuation_run_id))
+            if not completion["all_requested_methods_completed"]:
+                raise ValueError("VALUATION_METHODS_INCOMPLETE: " + canonical(completion))
+        if (workspace and workspace.run_policy == "automatic" and "value" in control.decision.actions
+                and "calculate" in control.effects and self.session.pending_action == "valuation" and not self.session.valuation_run_id):
+            preparation = valuation_progress(self.session, self.service.valuation_assembler)
+            if preparation.get("ready_for_review"):
+                methods = ",".join(preparation.get("methods", []))
+                raise ValueError(f"VALUATION_READY_NOT_EXECUTED: {methods}已通过确定性输入准备且本轮获准自动估值。先calculate_valuation，再交付报告；其他方法缺项分别披露。不得把现有输入说成缺失、用下一步计划或重复询问代替执行。")
+        if {"value", "report"} & set(control.decision.actions) and "artifacts" in control.effects and self.session.valuation_run_id and args.outcome == "answer":
+            record = self.service.store.get_run(self.session.valuation_run_id)
+            artifacts = self.service.store.list_artifacts(self.session.session_id)
+            numeric = bool(record.result and (record.result.dcf and record.result.dcf.status == "success"
+                or any(item.status == "success" for item in record.result.relative)))
+            if numeric and not any(item.get("numeric_result_available") and item.get("valuation_run_id") == record.run_id for item in artifacts):
+                raise ValueError("REPORT_NOT_DELIVERED: 当前估值或报告请求已有计算结果，但尚无匹配的可下载数值文件；先write_workspace_report，不以正文或中断报告代替文件交付。")
 
     def calculate(self, args):
+        self.calculation_attempt = {"status": "failed", "message": "计算调用尚未返回有效结果"}
         if self.workspaces is None:
             raise ValueError("计算工具必须在工作区中运行。")
         if self.session.pending_action != "valuation" and not args.changes:
             raise ValueError("尚未记录用户估值目标；先使用 update_task 明确任务范围。")
+        if (self.session.turn_control and "network" not in self.session.turn_control.effects
+                and self.session.data_source_preference == "online" and self.session.input_dataset is None and not args.changes):
+            raise ValueError("TURN_ACTION_DENIED: 本轮不允许联网，不能隐式调用证券代码取数；请使用已保存的结构化输入。")
         self.service.store.save_research(self.session)
         result = self.workspaces.calculate_from_agent(self.session.session_id, args)
+        self.calculation_attempt = {key: result.get(key) for key in ("status", "run_id", "gaps", "error")}
         fresh = self.service.store.get_research(self.session.session_id)
         for field in type(fresh).model_fields:
             setattr(self.session, field, getattr(fresh, field))
+        control = self.session.turn_control
+        if (result.get("status") in {"completed", "completed_with_warnings"} and control
+                and {"value", "report"} & set(control.decision.actions) and "artifacts" in control.effects):
+            guard_tool(self.session, "write_workspace_report", {"format": "md"}, self.tool_effects)
+            try:
+                report = write_report(self.service, self.session, ReportWrite(format="md"))
+            except (ValueError, OSError) as exc:
+                result["report_delivery"] = {"status": "failed", "error": self.service._redact_text(str(exc)),
+                    "instruction": "计算结果已保存，但报告文件生成失败；只修复文件交付并重试write_workspace_report，不把旧文件或正文当本次报告，也不要重复计算。"}
+            else:
+                result["report_delivery"] = {**report, "status": "saved",
+                    "instruction": "已按本轮估值/报告请求保存当前计算的Markdown文件，无需再次调用模型来保存相同文件。用户明确要求其他格式时另行导出；部分方法结果不等于全部完成，仍按method_completion推进剩余工作。"}
+                self.service.store.append_event(self.session.session_id, type="report.auto_delivered", stage="reporting", status="completed",
+                    summary="按当前用户估值/报告请求保存计算产物；不扩大文件权限，不代表所有方法已完成",
+                    payload={"run_id": result.get("run_id"), "artifact_id": report["artifact_id"], "sha256": report["sha256"]})
         return result
 
     def read_valuation(self, args):
@@ -398,37 +587,53 @@ class WorkspaceAgentRuntime:
         return self.workspaces.read_valuation(self.session.session_id, args.section)
 
     def working_state(self):
-        plan = research_plan(self.session, self.service.valuation_assembler)
+        from valuationagent.llm.agent import valuation_checkpoint
+
+        active_effects = set(self.session.turn_control.effects) if self.session.turn_control else set()
+        plan = self.research_plan() if active_effects & {"inputs", "network", "calculate"} else {}
         overview = {key: plan[key] for key in (
             "methods", "required_metrics", "annual_report_years", "history_policy", "evidence_counts",
-            "method_readiness", "capital_structure", "model_scope_issue", "sources",
+            "method_readiness", "method_completion", "capital_structure", "model_scope_issue", "sources",
             "peer_coverage", "peer_pricing", "acquisition_targets", "next_work",
-        )}
+        ) if key in plan}
         overview["instruction"] = "这是最新持久状态，每次工具执行后更新；完整字段字典、年度覆盖和修复清单用inspect_requirements读取。"
         return {"context": DEFAULT_CONTEXT_MANAGER.snapshot(
                     self.session, self.service.store.list_messages(self.session.session_id)).model_dump(mode="json"),
                 "plan": self.session.plan, "research_plan": overview,
+                "input_dataset": input_overview(self.session),
+                "user_input_access": {"read_with": "read_user_input", "numbered_message_read": self.user_input_read,
+                    "instruction": "用户数据先read_user_input读取编号原话，再用record_user_inputs按表保存。不要猜行号或重写引文；这不是联网核验。"},
                 "resume_context": self.session.resume_context, "current_date": date.today().isoformat(),
+                "provider_sources": acquisition_sources(self.session),
+                "input_acquisition": {key: self.session.input_acquisition.get(key) for key in (
+                    "status", "target", "years", "pricing_date", "new_input_count", "active_input_count", "issues", "instruction")}
+                    if self.session.input_acquisition else None,
+                "data_services": self.service.data_service_status(self.session.session_id, default_market=getattr(getattr(self.workspaces, "runner", None), "data", None)),
                 "file_capabilities": {"image_input_enabled": self.image_enabled, "arbitrary_code_execution": False},
                 "status_polling": {"temporarily_unavailable": self.exhausted_status_tools(),
                                    "instruction": "同一状态已读取两次的检查工具暂不提供；根据已有结果执行读取/提取/补证，或finish_response说明阻断。实际证据或任务状态改变后自动恢复，不扩大预算。"},
-                "valuation": self.read_valuation(ReadValuation())}
+                "valuation": valuation_checkpoint(self.read_valuation(ReadValuation()))}
 
     def run(self, llm):
         from valuationagent.application.observation_consistency import invalidate_conflicting_periods, invalidate_unread_periods, retire_contradicted_entities
 
+        latest = next((item for item in reversed(self.service.store.list_messages(self.session.session_id))
+                       if item.role == "user"), None)
+        if latest is None or self.session.turn_control is None or self.session.turn_control.message_id != latest.message_id:
+            prepare_turn(self.service, self.session, llm)
+        may_update_inputs = "inputs" in self.session.turn_control.effects
         self.session.prompt_version = AGENT_PROMPT_VERSION
-        if changed := invalidate_unread_periods(self.session):
+        if may_update_inputs and (changed := invalidate_unread_periods(self.session)):
             self.service.store.save_research(self.session)
             self.service.store.append_event(self.session.session_id, type="evidence.consistency", stage="evidence", status="completed",
                 summary="旧时点复核缺少原文日期复读，退回待复核而非直接沿用年末推断",
                 payload={"fact_ids": changed, "admission": "blocked", "reason": "PERIOD_READBACK_REQUIRED"})
-        if rejected := retire_contradicted_entities(self.session.facts):
+        if may_update_inputs and (rejected := retire_contradicted_entities(self.session.facts)):
             self.service.store.save_research(self.session)
             self.service.store.append_event(self.session.session_id, type="evidence.disposition", stage="evidence", status="completed",
                 summary="撤回已被原文复核明确判定主体矛盾的解释，保留原文与更正路径",
                 payload={"fact_ids": rejected, "reason": "entity_contradicted", "actor": "semantic_review_policy"})
-        if changed := invalidate_conflicting_periods(self.session):
+        if may_update_inputs and (changed := invalidate_conflicting_periods(self.session)):
             self.service.store.save_research(self.session)
             self.service.store.append_event(self.session.session_id, type="evidence.consistency", stage="evidence",
                 status="completed", summary="原文数值位置存在跨期间冲突，相关字段退回待复核；不修改原文或自动选择年份",
@@ -436,6 +641,14 @@ class WorkspaceAgentRuntime:
         self.image_enabled = bool(getattr(getattr(llm, "config", None), "supports_images", False))
         state = self.working_state()
         registry = ToolRegistry([
+            ToolSpec("load_tools", "按需加载本步骤的工具参数定义；只选择工具，不执行业务、不修改权限。", LoadTools, self.tool_catalog.load),
+            ToolSpec("record_user_inputs", "把已读取的用户数值按表录入：同批共享单位/年度/时点，行只需metric及amount_ref；日期与引用必须成对。不联网，不猜数，不允许API/文件冒充用户输入。", UserInputTable, lambda args: record_user_table(self, args)),
+            ToolSpec("read_user_input", "按行读取原始用户消息及数值位置；不解析财务含义、不联网。数字/单位/日期用返回引用录入，不重抄原话。", ReadUserInput, lambda args: read_user_input(self, args)),
+            ToolSpec("revise_turn_plan", "纠正本轮动作误判，例如用户要求估值却被判为讨论而隐藏计算工具。必须引用当前用户原话；不绕过联网/计算/文件权限，不执行业务。", ReviseTurnPlan, self.revise_turn_plan),
+            ToolSpec("acquire_financial_inputs", "执行有界API输入任务：按年度批量取得目标及已选可比数据，绑定有明确契约的标准字段及raw.*原始科目，保留来源、冲突与缺项。可同次声明可比选择及理由。程序处理路径/单位/日期，不需逐字段搬运；raw.*须由LLM用record_inputs(calculations=...)解释组合，不能直接冒充最终指标。已有输入用inspect_inputs读取，不重抄JSON；不自动预测或计算估值，无契约科目仍保留原始报表供解释。", AcquireFinancialInputs, lambda args: acquire_financial_inputs(self, args)),
+            ToolSpec("record_inputs", "保存模型输入：user_values仅用户原话数值；provider_values选择已保存API文件通过list_input_candidates展示的candidate_id，不重抄字段；source_values选择完成原文绑定与语义复核的fact_id。acquire_financial_inputs已保存的输入不重复录入，calculations引用inspect_inputs返回的input_id声明原始科目口径及组合。comparables记录选样理由。来源不冒充用户原话，缺失不补零；更正用replaces指定旧input_id。", RecordInputs, lambda args: record_inputs(self, args)),
+            ToolSpec("list_input_candidates", "分页读取已保存API文件的直接输入候选，按指标、年度或行情日过滤。返回原值与candidate_id，可直接record_inputs；无需重读JSON、下载或手填映射。读取不等于入模。", InputCandidateQuery, lambda args: list_input_candidates(self, args)),
+            ToolSpec("inspect_inputs", "分页读取已保存的模型输入、可比选择或最近取数任务的缺口/年度覆盖/来源。默认records，可按指标、证券代码、年度、股数时点或input_id查询；不是重新下载。读取不改变任何值。", InspectInputs, lambda args: inspect_inputs(self.session, args)),
             ToolSpec("begin_file_task", "进入有界单文件阅读阶段：隔离其他文档和旧失败叙述，保留原用户要求，由同一LLM自行检索/读取/提取/复核，完成后返回主循环；不新增模型实例，不重置时间或步骤预算。", FileTask, self.document_focus.begin),
             ToolSpec("end_file_task", "结束单文件阅读并返回主循环；程序返回真实事实状态，不直接结束用户对话。", FileTaskEnd, self.document_focus.end),
             ToolSpec("list_files", "列出当前工作区原文文件和来源等级；上传和检索资料使用同一组读取工具。", FileList, lambda args: list_files(self.service.store, self.session, args)),
@@ -446,7 +659,7 @@ class WorkspaceAgentRuntime:
             ToolSpec("read_file", "按需读取原文：text检索已存片段；财务PDF优先pdf_geometry按字形坐标分隔粘连列，pdf_layout/pdf_plain提供其他单页视图；sheet读工作表矩形区域。返回可引用块和原始行号，不解释财务含义，不把公式缓存当重新计算。", FileRead, lambda args: read_file(self.service.store, self.session, args, self.service._check_execution)),
             ToolSpec("view_pdf_page", "文字错序、粘连、扫描件时查看原始页图，由你理解布局。需用户启用图片接口且安装vision依赖；每轮最多8页，视觉读数不自动入模。", PageView, self.view_page),
             ToolSpec("write_workspace_report", "保存系统生成的结果或缺口报告（md/json/html/pdf），状态和数值仅来自确定性计算，不接受自造估值。返回可下载artifact_id。", ReportWrite, lambda args: write_report(self.service, self.session, args)),
-            ToolSpec("write_research_note", "保存你撰写的研究笔记，明确标注未审阅而不是正式估值。可引用当前工作区原文，不能把笔记回灌为事实。", NoteWrite, lambda args: write_note(self.service, self.session, args)),
+            ToolSpec("write_research_note", "保存未审阅研究笔记而非确定性估值。数据研究必须在evidence_ids提供读到的真实block_id，不允许空引用。仅不涉及公司数据的概念说明可用basis=concept_note。不能把笔记回灌为事实。", NoteWrite, lambda args: write_note(self.service, self.session, args)),
             ToolSpec("list_artifacts", "列出本工作区已保存的报告和研究笔记。", NoArguments, lambda _: {"artifacts": self.service.store.list_artifacts(self.session.session_id)}),
             ToolSpec("read_artifact", "回读已生成文件，检查内容和文件哈希；PDF可下载人工检查版式。", ArtifactRead, lambda args: read_artifact(self.service.store, self.session.session_id, args)),
             ToolSpec("inspect_context", "按需检索任务、事实、记忆、文档与用户输入。", InspectContext, self.inspect),
@@ -458,14 +671,14 @@ class WorkspaceAgentRuntime:
             ToolSpec("prepare_observation_review", "读取观察的当前任务、解释、原文片段和相邻上下文，取得有哈希的packet_id；复核前必须调用。", ObservationSelection, lambda args: prepare_reviews(self, args)),
             ToolSpec("review_observations", "按当前复核包逐维评估主体、金额、期间、单位、口径及映射，supported/ambiguous/contradicted。没有置信分通行证；原文冲突、日期、来源等级和模型约束不能由复核清除。", ReviewObservations, lambda args: review_observations(self, args)),
             ToolSpec("read_financial_evidence", "批量读取最多4个来源及局部表头，返回原始行号/单元格；download=true先下载搜索结果。用作LLM批量语义提取的证据包。", EvidenceRequest, lambda args: read_evidence(self, args)),
-            ToolSpec("fetch_financial_history", "如已配置结构化数据服务，批量取得多年三大报表原始快照；没有凭证则改用网页/公告。不自动生成事实或估值。", FinancialHistoryRequest, lambda args: fetch_history(self, args)),
+            ToolSpec("fetch_financial_history", "原始数据研究入口：用已连接Infoway/Tushare取得多年快照，不自动录入模型或计算。估值输入任务使用acquire_financial_inputs。默认目标公司，其他公司显式填ticker；data_services.market.statements列出支持类型。statistics提供带独立日期的股数/市值。快照可read_file/search_file；已展示的契约候选可另行选择，不补造单位、口径或披露日。", FinancialHistoryRequest, lambda args: fetch_history(self, args)),
             ToolSpec("corroborate_facts", "跨来源核对相同字段，严格检查期间/主体/口径/金额/披露日期；非官方字段仍保留C级限制，不能用高分绕过冲突。", FactSelection, lambda args: corroborate(self, args)),
             ToolSpec("reject_candidates", "说明理由后撤回错误的proposed提取，保留审计；不允许撤回confirmed以规避门槛。", FactSelection, lambda args: reject_candidates(self, args)),
             ToolSpec("search_sources", "查找公开资料线索；仅上传模式禁止联网。", SearchSources, self.search),
             ToolSpec("fetch_search_source", "下载搜索结果原文，核验 URL/IP 并保存快照。", FetchSearchSource,
                      lambda args: self.service._fetch_search_source(self.session, args.file_id)),
             ToolSpec("read_document", "检索或分页读取已存文档原文，保留引用位置。", ReadDocument, self.read),
-            ToolSpec("propose_forecast", "保存有证据和理由的十年三情景预测假设。", ProposeForecast,
+            ToolSpec("propose_forecast", "保存有证据的十年预测；单路径用revenue_growth/ebit_margin，三情景用scenarios，不必重复相同路径。", ProposeForecast,
                      lambda args: self.service._propose_forecast(self.session, args)),
             ToolSpec("check_preparation", "返回确定性估值输入缺口；不是停止或审批动作。", NoArguments,
                      lambda _: valuation_progress(self.session, self.service.valuation_assembler)),
@@ -478,6 +691,7 @@ class WorkspaceAgentRuntime:
             *[spec for provider in self.service.tool_providers
               for spec in provider.tool_specs(self.session)],
         ])
+        self.tool_effects = {name: spec.effects for name, spec in registry.specs.items() if spec.effects is not None}
         self.service.store.append_event(
             self.session.session_id, type="agent.started", stage="agent", status="running",
             summary="统一工作区工具循环开始",
@@ -490,6 +704,8 @@ class WorkspaceAgentRuntime:
             eligible = {canonical([fact.metric, fact.standard_metric, fact.semantic_role, fact.period, fact.scope, fact.normalized_value,
                                 fact.ebit_treatment, fact.fcff_treatment, fact.equity_bridge_treatment])
                         for fact in self.session.facts if fact.status == "confirmed" and not fact.warnings and not financial_mapping_issue(fact)}
+            if self.session.input_dataset:
+                eligible.update(row.input_id for row in self.session.input_dataset.active_records())
             observations = {canonical(["observation", fact.metric, fact.period, fact.scope, fact.unit, fact.normalized_value])
                             for fact in self.session.facts if fact.role == "historical" and observation_verified(fact)}
             stalled = any(group["affected_count"] >= 3 for group in repair_groups(self.session.facts))
@@ -510,6 +726,9 @@ class WorkspaceAgentRuntime:
                     image_resolver=self.resolve_page_image,
                     state_provider=lambda: {**self.working_state(), **({"continuation": "当前为最后窗口，总时间预算不重置；继续修复或换来源，不重复相同失败调用。"} if window else {})},
                     request_adapter=self.adapt_request,
+                    response_observer=self.observe_model_response,
+                    phase_recovery=self.document_focus.recover_phase,
+                    allow_text_answer=True,
                 )
             except LlmError as exc:
                 if not str(exc).startswith("AGENT_STEP_LIMIT"):
@@ -531,13 +750,107 @@ class WorkspaceAgentRuntime:
                 payload={"new_facts": len(current[0] - previous[0]), "new_sources": len(current[1] - previous[1])})
             state = {**self.working_state(), "continuation": "当前为最后窗口，总时间预算不重置；继续修复或换来源，不重复相同失败调用。"}
 
+    def observe_model_response(self, metadata):
+        if metadata:
+            self.service.store.append_event(self.session.session_id, type="model.response", stage="agent",
+                status="completed" if metadata.get("response_received") else "failed",
+                summary="模型调用诊断（仅用量与协议状态，不保存私有思考）", payload=metadata)
+
     def adapt_request(self, messages, tools):
+        tools = visible_tools(self.session, tools, self.tool_effects)
+        deferred = {}
+        if (self.session.turn_control and "value" in self.session.turn_control.decision.actions
+                and any(tool["function"]["name"] == "acquire_financial_inputs" for tool in tools)):
+            deferred["fetch_financial_history"] = "本轮估值的API输入统一使用acquire_financial_inputs；它明确绑定契约输入。原始取数函数仍供非估值研究使用，不将旧调用自动重定向或扩大执行权限。"
+            hidden = {"fetch_financial_history"}
+            missing = [field for field in ("ticker", "valuation_date") if not getattr(self.session.draft, field)]
+            if missing:
+                hidden.add("acquire_financial_inputs")
+                deferred["acquire_financial_inputs"] = "先用update_task保存目标的" + ", ".join(missing) + "；代码须对应已识别公司，日期遵守用户要求。未知主体先核实，不先下载再手抄零候选文件。登记后此工具直接可用，不需重复load_tools。"
+            tools = [tool for tool in tools if tool["function"]["name"] not in hidden]
+        grouped_user_input = any(tool["function"]["name"] == "record_user_inputs" for tool in tools)
+        offline_inputs = not self.session.documents and self.session.turn_control and "network" not in self.session.turn_control.effects
+        tools = [json.loads(json.dumps(tool)) if tool["function"]["name"] in {"record_inputs", "propose_forecast", "update_task", "extract_observations", "read_file"} else tool for tool in tools]
+        for tool in tools:
+            if tool["function"]["name"] == "read_file":
+                from valuationagent.llm.file_tools import reading_schema
+
+                tool["function"]["parameters"] = reading_schema(tool["function"]["parameters"], self.session.documents)
+            if tool["function"]["name"] == "extract_observations" and {"Observation", "ReadingBasis"} <= tool["function"]["parameters"].get("$defs", {}).keys():
+                definitions = tool["function"]["parameters"]["$defs"]
+                metric = definitions["Observation"]["properties"]["standard_metric"]
+                metric["anyOf"] = [{"enum": sorted({item["standard_metric"] for item in metric_catalog()})},
+                    {"pattern": r"^raw\.[a-z][a-z0-9_]*$"}]
+                metric["description"] = "从字段目录选择真实含义：营业收入=revenue，营业总收入=total_revenue，归母净利润=net_income_parent；合并净利润不等于归母净利润，可保留为raw.net_income。其他原始科目用raw.小写名称，不能乱改名以通过计算。"
+                basis = definitions["ReadingBasis"]
+                basis["required"] = list(dict.fromkeys([*basis["required"], "currency"]))
+            if tool["function"]["name"] == "update_task" and self.session.turn_control and "value" in self.session.turn_control.decision.actions:
+                draft = tool["function"].get("parameters", {}).get("$defs", {}).get("ResearchDraft")
+                if draft and self.session.draft.valuation_date is None:
+                    draft["required"] = list(dict.fromkeys([*draft.get("required", []), "valuation_date"]))
+                    draft["properties"]["valuation_date"] = {"type": "string", "format": "date",
+                        "description": "估值任务须显式选择YYYY-MM-DD；按用户明确基准日，无另指定时可选择工作区当前日期，不漏掉已提供日期。"}
+                if draft and not self.session.draft.methods:
+                    draft["required"] = list(dict.fromkeys([*draft.get("required", []), "methods"]))
+                    draft["properties"]["methods"]["minItems"] = 1
+            if tool["function"]["name"] == "propose_forecast" and offline_inputs and self.session.input_dataset:
+                references = [row.input_id for row in self.session.input_dataset.active_records() if row.role == "historical"]
+                if 0 < len(references) <= 64:
+                    tool["function"]["parameters"]["properties"]["evidence_ids"]["items"]["enum"] = references
+            if tool["function"]["name"] == "record_inputs":
+                for field in ("user_values", "provider_values", "source_values"):
+                    schema = tool["function"].get("parameters", {}).get("properties", {}).get(field)
+                    if schema:
+                        schema["maxItems"] = min(schema.get("maxItems", 8), 8)
+                parameters = tool["function"].get("parameters", {})
+                if grouped_user_input:
+                    for field in ("user_values", "user_basis"):
+                        parameters.get("properties", {}).pop(field, None)
+                    for definition in ("UserInputValue", "UserInputBasis"):
+                        parameters.get("$defs", {}).pop(definition, None)
+                    tool["function"]["description"] = "选择list_input_candidates展示的API候选provider_values、已复核文档source_values，或保存comparables/calculations。acquire_financial_inputs已绑定的raw.*不用重抄；calculations引用inspect_inputs给出的input_id解释口径与组合。用户原话只用record_user_inputs；不接受文件或API冒充用户数据。"
+                if not grouped_user_input and offline_inputs and self.user_input_read and parameters.get("$defs"):
+                    value = parameters["$defs"]["UserInputValue"]
+                    for field in ("amount_text", "amount_occurrence", "value_context", "unit_quote", "period_quote", "as_of_quote"):
+                        value["properties"].pop(field, None)
+                    value["required"] = [*value.get("required", []), "amount_ref"]
+                    value["properties"]["amount_ref"].update(pattern=r"^[1-9]\d*:[1-9]\d*$", minLength=3)
+                    basis = parameters["$defs"]["UserInputBasis"]
+                    for field in ("unit_quote", "period_quote", "as_of_quote"):
+                        basis["properties"].pop(field, None)
+                    for field in ("provider_values", "source_values"):
+                        parameters["properties"].pop(field, None)
+                    for definition in ("SelectedProviderInput", "SelectedSourceInput"):
+                        parameters["$defs"].pop(definition, None)
+                    choices = self.session.input_dataset.comparables if self.session.input_dataset else {}
+                    if choices:
+                        parameters["$defs"]["ComparableSelection"]["properties"]["ticker"]["enum"] = list(choices)
+                    else:
+                        parameters["properties"].pop("comparables", None)
+                        parameters["$defs"].pop("ComparableSelection", None)
+        if messages and messages[0].get("role") == "system":
+            messages[0] = {"role": "system", "content": USER_INPUT_PROMPT if offline_inputs else AGENT_PROMPT}
+        if not self.session.documents:
+            file_tools = {"begin_file_task", "end_file_task", "inspect_file", "search_file", "read_file",
+                "list_source_links", "follow_source_link", "extract_observations", "review_observations",
+                "prepare_observation_review", "list_input_candidates"}
+            if (not self.user_input_read and self.session.input_dataset is None and self.session.turn_control
+                    and "network" not in self.session.turn_control.effects):
+                file_tools.add("record_inputs")
+            tools = [tool for tool in tools if tool["function"]["name"] not in file_tools]
         exhausted = set(self.exhausted_status_tools())
         tools = [tool for tool in tools if tool["function"]["name"] not in exhausted]
+        if not self.user_input_read:
+            if any(tool["function"]["name"] == "record_user_inputs" for tool in tools):
+                deferred["record_user_inputs"] = "先调用read_user_input读取编号原话，再用record_user_inputs录入；不是权限不足，不要反复load_tools。"
+            tools = [tool for tool in tools if tool["function"]["name"] != "record_user_inputs"]
         focused, selected = focused_review_request(messages, tools)
         if focused is not messages:
             return focused, selected
-        return self.document_focus.adapt(messages, tools)
+        focused, selected = self.document_focus.adapt(messages, tools)
+        if focused is not messages:
+            return focused, selected
+        return self.tool_catalog.adapt(messages, tools, deferred=deferred, suggested=self.reading_tools | self.input_edit_tools())
 
     def read(self, args):
         session = self.session

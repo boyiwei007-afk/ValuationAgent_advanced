@@ -1,6 +1,5 @@
 """Bounded single-file attention mode within the existing model/tool loop."""
 import json
-import copy
 from typing import Literal
 
 from pydantic import Field
@@ -8,7 +7,8 @@ from pydantic import Field
 from valuationagent.application.file_workspace import source_document
 from valuationagent.application.observation_extraction import observation_next_action
 from valuationagent.core.tools import canonical
-from valuationagent.llm.context import AGENT_PROMPT
+from valuationagent.llm.context import DOCUMENT_PROMPT
+from valuationagent.llm.tool_catalog import compact_schema
 from valuationagent.schemas.models import ApiModel
 
 
@@ -34,6 +34,20 @@ class DocumentFocus:
         self.runtime = runtime
         self.task = None
         self.steps = 0
+        self.phase_returns = set()
+
+    def recover_phase(self):
+        if self.task is None:
+            return None
+        identity = (self.task.file_id, self.task.role)
+        if identity in self.phase_returns:
+            return None
+        self.phase_returns.add(identity)
+        result = self.end(FileTaskEnd(summary="局部阅读上下文未提供上一条请求的工具；整条调用未执行，保留已有读取和观察并返回主流程重新决策。"))
+        result["instruction"] = "已退出局部阅读视图，不改变用户权限、不执行被拒绝参数、不代表字段核验或任务完成。按现在提供的工具重新决定：未识别主体可先update_task；需要的目录工具先load_tools。复用已读文件，不重复下载。"
+        self.runtime.service.store.append_event(self.runtime.session.session_id, type="agent.file_phase_return",
+            stage="reading", status="completed", summary="局部工具阶段不匹配，保留进度并返回主流程", payload=result)
+        return result
 
     def begin(self, args):
         if self.task is not None:
@@ -42,6 +56,8 @@ class DocumentFocus:
         if document.provenance_type in {"search_snippet", "official_index"}:
             raise ValueError("SOURCE_NOT_DOWNLOADED: 先取得原文，再开始阅读任务")
         target = self.runtime.session.draft.ticker
+        if args.role == "historical" and not self.runtime.session.draft.company:
+            raise ValueError("FILE_TASK_TARGET_MISSING: historical提取需要先明确已读原文的公司名称；先update_task保存主体并保持valuation_requested=false。尚未识别主体则用reference只读探索，不把任意文件自动设为估值目标。")
         if args.role == "historical" and target and args.entity_ticker != target:
             raise ValueError("FILE_TASK_ENTITY: 其他公司的文件须选择comparable，不将其作为目标公司的historical数据")
         if args.role == "comparable" and (not args.entity_ticker or args.entity_ticker == target):
@@ -106,6 +122,9 @@ class DocumentFocus:
                  "source_permission": session.data_source_preference, "facts": facts,
                  "acquisition_targets": state.get("research_plan", {}).get("acquisition_targets", []),
                  "user_constraints": task_state.get("memory", []),
+                 "current_request": context.get("current_request", {}),
+                 "turn_control": task_state.get("turn_control"),
+                 "execution_permissions": task_state.get("execution_permissions", {}),
                  "user_turns": [turn for turn in context.get("recent_turns", []) if turn.get("role") == "user"][-2:]}
         groups = []
         for message in messages[2:]:
@@ -121,10 +140,10 @@ class DocumentFocus:
                                                     for call in group[0].get("tool_calls", []))][-8:]
         while len(selected) > 1 and len(canonical(selected)) > 42000:
             selected.pop(0)
-        focused = [{"role": "system", "content": AGENT_PROMPT + "\n当前为单文件阅读阶段。只处理当前文件，不计算。先理解原文及真实依据，再提交与复核；完成后end_file_task。若本文件属于可比企业，basis保留其真实名称/代码，rows[].role必须填comparable；historical仅属于draft中的估值目标，不能因主体校验失败而将可比公司改成目标公司。更正旧解释用replaces；确需撤回当前文件的错误候选可用reject_candidates并说明理由，不重复留下已知错误来阻断后续。不要修饰数据来满足模型。"},
+        focused = [{"role": "system", "content": DOCUMENT_PROMPT},
                    {"role": "user", "content": canonical(focus)}, *[message for group in selected for message in group]]
         permitted = {"end_file_task"} if self.steps >= 16 else EXPLORATION_TOOLS if self.task.role == "reference" else READING_TOOLS
-        selected_tools = copy.deepcopy([tool for tool in tools if tool["function"]["name"] in permitted])
+        selected_tools = [compact_schema(tool) for tool in tools if tool["function"]["name"] in permitted]
         for tool in selected_tools:
             if tool["function"]["name"] == "extract_observations":
                 schema = tool["function"]["parameters"]

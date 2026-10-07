@@ -335,7 +335,7 @@ def test_formal_model_runs_through_audited_agent_workflow(tmp_path):
     record = ValuationRunner(store, FinanceTeamModel()).run(request())
 
     assert record.result is not None
-    assert record.result.model_version == "1.4.0-finance-team-production-20260927"
+    assert record.result.model_version == "1.6.2-working-capital-scope-20261004"
     assert record.result.data_quality.confidence in {"low", "medium", "high"}
     assert record.result.assumptions.industry_parameters["industry_id"] == "electronics"
     assert len(record.result.forecast) == 10
@@ -396,13 +396,13 @@ def test_document_formulas_drive_da_capex_nwc_exit_check_and_catalogue():
     assert "DA_REVENUE_RATIO_FALLBACK" not in {item.rule_id for item in findings}
     assumptions = model.resolve_assumptions(req, req.financials)
     assert assumptions.calculation_methods["capex"] == "alpha_da_plus_kappa_delta_revenue"
-    assert assumptions.calculation_methods["change_operating_nwc"] == "dso_dio_dpo"
+    assert assumptions.calculation_methods["change_operating_nwc"] == "operating_nwc_revenue_ratio"
     assert assumptions.calculation_methods["ebit"] == "operating_component_build"
     assert assumptions.wacc_components["equity_weight"] > D("0.99")
 
     forecast = model.forecast(req, req.financials, assumptions)
     assert forecast[0].calculation_methods["depreciation_amortization"] == "asset_rollforward"
-    assert forecast[0].calculation_methods["change_operating_nwc"] == "dso_dio_dpo"
+    assert forecast[0].calculation_methods["change_operating_nwc"] == "operating_nwc_revenue_ratio"
     assert forecast[0].calculation_methods["ebit"] == "operating_component_build"
     assert set(forecast[0].operating_items) >= {
         "operating_cost", "selling_expense", "research_expense", "other_income"
@@ -612,6 +612,13 @@ def test_user_stable_roic_must_exceed_terminal_growth():
     assert "STABLE_ROIC_NOT_ABOVE_GROWTH" in {
         item.rule_id for item in findings if item.severity == "blocking"
     }
+
+
+def test_valid_explicit_roic_is_not_silently_raised_to_a_policy_floor():
+    req = request()
+    req.assumptions = AssumptionInputs(terminal_growth=D("0.03"), stable_roic=D("0.035"))
+    resolved = FinanceTeamModel().resolve_assumptions(req, req.financials)
+    assert resolved.operating_drivers["stable_roic"] == D("0.035")
 
 
 def test_manual_wacc_must_exceed_effective_terminal_growth():

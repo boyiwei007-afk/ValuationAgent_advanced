@@ -17,6 +17,7 @@ from valuationagent.application.workspace_artifacts import ReportWrite, write_re
 from valuationagent.cli.ui import console, welcome, conversation, decision_view, workbench, execute_with_display, panel
 from valuationagent.llm.client import OpenAICompatibleClient
 from valuationagent.market.tushare import TushareApiClient, TushareDataProvider
+from valuationagent.market.infoway import InfowayApiClient, InfowayDataProvider
 from valuationagent.schemas.models import ModelConnectionInput
 from valuationagent.schemas.research import ResearchTurn
 from valuationagent.search.providers import TavilySearchProvider
@@ -26,7 +27,7 @@ app = typer.Typer(no_args_is_help=False, pretty_exceptions_enable=False)
 HELP = """直接输入需求即可对话、检索或估值。
 /model                 配置或更换模型（密钥隐藏，仅本进程保存）
 /search                配置 Tavily 搜索（可稍后配置）
-/market                配置 Tushare 结构化财务数据（可选）
+/market                选择并配置 Infoway / Tushare 结构化财务数据
 /upload 文件路径        上传附件，随下一条消息交给 Agent
 /files                 查看本工作区原文文件
 /read 文件ID            读取已保存原文（精细页码/表格可直接让 Agent 读取）
@@ -64,7 +65,7 @@ def configure_model(current=None):
         default=previous.model if previous else os.getenv("VALUATION_LLM_MODEL", ""),
     )
     tool_call_format = typer.prompt(
-        "工具格式（native 标准 / json_content 文本JSON网关）",
+        "工具格式（native 标准 / json_content JSON网关 / native_json 原生请求+JSON响应 / qwen3_coder Qwen原生标签）",
         default=previous.tool_call_format if previous else os.getenv("VALUATION_LLM_TOOL_CALL_FORMAT", "native"),
     )
     reasoning_protocol = typer.prompt(
@@ -80,10 +81,21 @@ def configure_model(current=None):
         default=previous.temperature if previous and previous.temperature is not None else float(os.getenv("VALUATION_LLM_TEMPERATURE", "0")),
         type=float,
     )
+    sampling = {name: getattr(previous, name) if previous else None for name in ("top_p", "presence_penalty", "top_k")}
+    if tool_call_format.strip() == "qwen3_coder" and typer.confirm("应用 Qwen3.6 通用采样建议（保持所选思考模式，不增大预算）？", default=True):
+        temperature = .7 if thinking.strip() == "disabled" else 1.0
+        sampling = {"top_p": .8 if thinking.strip() == "disabled" else .95, "presence_penalty": 1.5, "top_k": 20}
+    output_token_budget = typer.prompt("单次输出预算（含思考tokens）",
+        default=previous.output_token_budget if previous else int(os.getenv("VALUATION_LLM_OUTPUT_TOKEN_BUDGET", "8192")), type=int)
+    max_output_tokens = typer.prompt("输出耗尽时自动扩展上限（tokens）",
+        default=previous.max_output_tokens if previous else int(os.getenv("VALUATION_LLM_MAX_OUTPUT_TOKENS", "16384")), type=int)
+    timeout_seconds = typer.prompt("单次模型请求超时（秒）",
+        default=previous.timeout_seconds if previous else float(os.getenv("VALUATION_LLM_TIMEOUT_SECONDS", "180")), type=float)
     api_key = typer.prompt("API Key（隐藏输入）", hide_input=True, show_default=False)
     config = ModelConnectionInput(base_url=base_url.strip(), model=model_name.strip(), api_key=api_key.strip(),
                                   tool_call_format=tool_call_format.strip(), reasoning_protocol=reasoning_protocol.strip(),
-                                  thinking=thinking.strip(), temperature=temperature)
+                                  thinking=thinking.strip(), temperature=temperature, output_token_budget=output_token_budget,
+                                  max_output_tokens=max_output_tokens, timeout_seconds=timeout_seconds, **sampling)
     candidate = OpenAICompatibleClient(config)
     candidate.test_connection()
     console.print("模型已连接；密钥不会写入数据库或配置文件。", style="green")
@@ -141,9 +153,14 @@ def run_chat(workspace_id=None, review=False):
                 api_key = typer.prompt("Tavily API Key（隐藏输入）", hide_input=True, show_default=False)
                 service.research.attach_search(session_id, TavilySearchProvider(api_key.strip()))
                 console.print("搜索已配置；未发送测试查询，密钥仅在本进程有效。", style="green")
-            elif content == "/market":
-                token = typer.prompt("Tushare Token（隐藏输入）", hide_input=True, show_default=False)
-                service.research.attach_market(session_id, TushareDataProvider(TushareApiClient(token.strip())))
+            elif content == "/market" or content.startswith("/market "):
+                provider_name = content.partition(" ")[2].strip().lower() or typer.prompt("数据供应商 infoway / tushare", default="infoway").strip().lower()
+                factories = {"infoway": lambda token: InfowayDataProvider(InfowayApiClient(token)),
+                             "tushare": lambda token: TushareDataProvider(TushareApiClient(token))}
+                if provider_name not in factories:
+                    raise ValueError("请选择infoway或tushare；AKShare不是此API Key的供应商。")
+                token = typer.prompt(f"{provider_name} API Key / Token（隐藏输入）", hide_input=True, show_default=False)
+                service.research.attach_market(session_id, factories[provider_name](token.strip()))
                 console.print("结构化数据已配置；尚未请求数据，Token 仅在本进程有效。没有此服务也可继续网页取证。", style="green")
             elif content == "/status --json":
                 console.print_json(data=service.snapshot(workspace.workspace_id))

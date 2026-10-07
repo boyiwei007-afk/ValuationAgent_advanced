@@ -63,6 +63,27 @@ def test_non_template_english_notes_after_rows_are_interpreted_then_reviewed(tmp
     assert fact.verification["semantic_review"]["independent_audit"] is False
 
 
+def test_unit_suffix_cannot_bypass_mapping_guard_even_if_llm_review_says_supported(tmp_path):
+    from observation_fixtures import fixture_observations
+
+    runtime = runtime_at(tmp_path)
+    args = fixture_observations(runtime, [{"metric": "营业收入（元）", "standard_metric": "total_revenue", "raw_value": "1200"}])
+    result = submit(runtime, args)
+    fact = runtime.session.facts[0]
+    assert result["rows"][0]["next_action"]["tool"] == "extract_observations"
+    assert any(warning.startswith("MODEL_MAPPING:") for warning in fact.warnings)
+    review(runtime)
+    assert fact.status == "proposed"
+    assert any("revenue" in warning and "total_revenue" in warning for warning in fact.warnings)
+    args["rows"][0].update(standard_metric="revenue", replaces=[fact.fact_id])
+    submit(runtime, args)
+    corrected = runtime.session.facts[-1]
+    review(runtime, [corrected.fact_id])
+    assert corrected.status == "confirmed"
+    assert corrected.standard_metric == "revenue" and corrected.normalized_value == "1200"
+    assert fact.status == "rejected"
+
+
 def test_peer_identity_error_guides_role_repair_without_rewriting_entity(tmp_path):
     runtime = runtime_at(tmp_path)
     args = example(runtime)

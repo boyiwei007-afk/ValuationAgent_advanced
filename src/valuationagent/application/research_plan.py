@@ -10,10 +10,90 @@ from valuationagent.application.valuation_plan import _build_for_methods, previe
 from valuationagent.application.extraction_recovery import recovery_plan
 
 
-def research_plan(session, assembler):
+def calculation_work(session, readiness, completed=()):
+    if session.pending_action != "valuation" or (session.turn_control and "calculate" not in session.turn_control.effects):
+        return []
+    ready = [item["method"] for item in readiness if item["status"] == "inputs_ready" and item["method"] not in completed]
+    if not ready:
+        return []
+    return [{"kind": "calculate", "methods": ready, "tool": "calculate_valuation",
+        "instruction": "这些已选方法已有可执行输入，先check_preparation再calculate_valuation交付可用部分；review模式仍须批准。其他方法缺项单独披露，不因其未完成而反复读取或阻塞就绪方法。这是建议，不是已执行或新增授权。"}]
+
+
+def user_input_mode(session):
+    return bool(session.turn_control and "network" not in session.turn_control.effects and not session.documents)
+
+
+def user_input_catalog():
+    from valuationagent.application.input_workspace import FINANCIAL_FIELDS, RATIO_FIELDS, RAW_INPUT_FIELDS
+
+    return [{"standard_metric": metric, "input_tool": "record_user_inputs",
+        "source_labels": sorted(METRIC_ALIASES.get(metric, []))}
+        for metric in sorted(FINANCIAL_FIELDS | RATIO_FIELDS | RAW_INPUT_FIELDS)]
+
+
+def calculation_completion(session, assembler, record, readiness):
+    methods = list(session.draft.methods)
+    previous = []
+    current = False
+    if (record is not None and record.run_id == session.valuation_run_id
+            and str(record.status) in {"completed", "completed_with_warnings"}):
+        from valuationagent.application.result_delivery import method_completion
+
+        previous = [method for method in method_completion(record)["completed_methods"] if method in methods]
+        if previous and set(record.request.methods) <= set(methods):
+            try:
+                prepared = _build_for_methods(preview_session(session), assembler, list(record.request.methods))
+                fields = {"company", "valuation_date", "forecast_years", "discount_policy", "analysis_basis",
+                    "financials", "historical_financials", "assumptions", "peers", "peer_screening",
+                    "input_records", "input_calculations", "baseline_selection"}
+                current = prepared.model_dump(mode="json", include=fields) == record.request.model_dump(mode="json", include=fields)
+            except ValueError:
+                pass
+    completed = previous if current else []
+    reasons = {row["method"]: row["reason"] for row in readiness if row["status"] != "inputs_ready"}
+    remaining = {method: reasons.get(method, "当前输入与已计算版本不同或尚未核对；需重新冻结计算" if method in previous
+                 else "输入可用但尚无本方法成功的确定性计算结果") for method in methods if method not in completed}
+    return {"requested_methods": methods, "run_id": record.run_id if record is not None else None,
+        "completed_in_run": previous, "current_inputs_match": current, "completed_methods": completed,
+        "remaining_methods": remaining, "all_requested_methods_completed": bool(methods) and not remaining,
+        "instruction": "历史计算结果不替代当前输入检查。仅补remaining_methods真实缺项；已完成且输入未变的方法不重复计算，不删减原请求方法。此检查不授权联网、录入或计算。"}
+
+
+def research_plan(session, assembler, valuation_record=None):
+    if session.input_dataset is not None or user_input_mode(session):
+        records = session.input_dataset.active_records() if session.input_dataset else []
+        has_sources = any(row.source.kind != "user" for row in records)
+        periods = sorted({row.period_end.year for row in records if row.period_end}, reverse=True)
+        methods = list(session.draft.methods)
+        readiness = []
+        preview = preview_session(session)
+        for method in methods:
+            try:
+                if session.input_dataset is None:
+                    raise ValueError("INPUTS_MISSING: 尚未录入用户数据；先read_user_input，再record_user_inputs，保留原话单位及日期。用户已给预测时不要求补齐自动预测历史，不用联网证明用户假设。")
+                _build_for_methods(preview, assembler, [method])
+                readiness.append({"method": method, "status": "inputs_ready", "reason": "所选来源数据与假设可计算，来源性质逐项保留。" if has_sources else "用户输入情景可计算，不代表已核验历史财务。"})
+            except ValueError as exc:
+                readiness.append({"method": method, "status": "blocked", "reason": str(exc)})
+        completion = calculation_completion(session, assembler, valuation_record, readiness)
+        return {"methods": methods, "required_metrics": sorted(required_financial_metrics(methods)),
+                "method_completion": completion,
+                "analysis_basis": session.input_dataset.analysis_basis if session.input_dataset else "user_scenario", "annual_report_years": periods, "annual_coverage": [],
+                "history_policy": {"target_years": 0, "minimum_automatic_dcf_years": None,
+                    "instruction": "按所选方法准备统一输入；来源取证和用户假设分别保留，不强制重跑检索。", "baseline_policy": "期间与股数时点独立保留，不自动补造。"},
+                "evidence_counts": evidence_counts(session.facts), "extraction_recovery": {}, "table_repairs": [],
+                "method_readiness": readiness, "capital_structure": None, "peer_coverage": [], "peer_pricing": {},
+                "acquisition_targets": [], "next_work": [*calculation_work(session, readiness, completion["completed_methods"]), *[item for item in readiness if item["status"] == "blocked"]],
+                "model_scope_issue": None, "repair_candidates": [], "repair_candidates_total": 0,
+                "sources": {"downloaded_documents": len(session.documents), "search_leads": 0},
+                "next_actions": ["输入齐备后冻结计算；仅补所选方法缺项，不用联网证明用户假设。"]}
     from valuationagent.application.observation_extraction import observation_next_action
 
-    methods = assembler._selected_methods(session) if session.draft.methods else []
+    session = session.model_copy(deep=True, update={
+        "valuation_methods_override": [], "valuation_method_exclusions": {},
+    })
+    methods = list(session.draft.methods)
     cutoff = session.information_cutoff_date or session.draft.valuation_date or date.today()
     baseline_year = cutoff.year - 1
     target_years = 10 if "dcf" in methods else 3 if methods else 0
@@ -98,8 +178,10 @@ def research_plan(session, assembler):
         if item["remaining"] or item["issue"]:
             next_work.append({"kind": "comparable_inputs", **item,
                               "instruction": "按真实可比公司分别取得定价日总市值与匹配完整年度财务，或可核验的直接FY倍数；使用comparable角色。已有利润不必反复核验，不把目标公司当自身可比。"})
+    completion = calculation_completion(session, assembler, valuation_record, readiness)
     return {
         "methods": methods,
+        "method_completion": completion,
         "required_metrics": metrics,
         "annual_report_years": years,
         "history_policy": {
@@ -120,7 +202,7 @@ def research_plan(session, assembler):
                          "pricing_date": str(session.draft.peer_pricing_date or session.draft.valuation_date or ""),
                          "rationale": session.draft.peer_pricing_rationale,
                          "instruction": "所有可比使用同一个已明确选择的行情日。没有估值日行情时，可经update_task说明依据后选择此前七天内的可核验日期，不改估值日/截止日，不混用各公司不同日期。"},
-        "next_work": next_work,
+        "next_work": [*calculation_work(session, readiness, completion["completed_methods"]), *next_work],
         "model_scope_issue": assembler.model_scope_issue(session),
         "repair_candidates": repairs[:12],
         "repair_candidates_total": len(repairs),
@@ -129,7 +211,7 @@ def research_plan(session, assembler):
             "search_leads": sum(doc.provenance_type in {"search_snippet", "official_index"} for doc in session.documents),
         },
         "next_actions": [
-            "先处理next_work中的真实阻断。repair_candidates包含不阻塞当前方法的补充资料，不必为了清零所有候选反复修复。按next_action修正解释或复核，不调用旧表头解析器重试。",
+            "先按next_work处理可执行方法，再处理其他方法真实阻断。repair_candidates包含不阻塞当前方法的补充资料，不必为了清零所有候选反复修复。按next_action修正解释或复核，不调用旧表头解析器重试。",
             "以annual_report_years为覆盖目标，先补方法所需核心年度再扩展历史。可用fetch_financial_history取已连接数据，未配置则直接换网页或多年官方目录。",
             "用read_file或read_financial_evidence读取，再extract_observations批量理解。年报不是唯一载体，第三方历史字段复核后还须corroborate_facts，保留来源等级。",
             "股数、历史年度、可比样本分别推进；单项目标耗尽不代表其他缺口不可检索。",

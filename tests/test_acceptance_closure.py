@@ -17,7 +17,11 @@ from valuationagent.schemas.research import ResearchTurn
 
 @pytest.mark.parametrize("missing_first", [True, False])
 def test_unknown_attachment_does_not_discard_valid_files_or_outcome(tmp_path, missing_first):
+    from test_research_sessions import ScriptedModel
+
     service, session = empty_session(tmp_path)
+    service.attach(session.session_id, ScriptedModel([
+        ("finish_response", {"answer": "有效附件已读取，但尚未形成可计算输入。", "outcome": "insufficient_data"})]))
     meta = service.store.save_upload(
         "可读资料.txt", "historical_financials", "text/plain",
         "合成验收公司 合并报表\n单位：元\n项目 2025年 2024年\n营业收入 100 90".encode(),
@@ -76,3 +80,73 @@ def test_corrupted_cached_report_is_not_silently_served(tmp_path):
                    (json.dumps(corrupt), session.session_id, report["report_id"]))
     with pytest.raises(ValueError, match="完整性校验失败"):
         build_research_export(service, session.session_id)
+
+
+@pytest.mark.parametrize("storage_failure", [False, True])
+def test_automatic_ready_task_cannot_end_with_unexecuted_next_steps(tmp_path, monkeypatch, storage_failure):
+    from test_input_workspace import fixture, values
+    from valuationagent.application.agent_runtime import AgentResponse, CalculateValuation
+    from valuationagent.application.record_inputs import record_inputs
+    from valuationagent.application.workspace_artifacts import ReportWrite, write_report
+
+    _, runtime = fixture(tmp_path)
+    record_inputs(runtime, values())
+    with pytest.raises(ValueError, match="VALUATION_READY_NOT_EXECUTED"):
+        runtime.finish(AgentResponse(answer="数据已经齐备，下一步我将计算。"))
+    assert not runtime.session.valuation_run_id
+    if storage_failure:
+        def unavailable(*args):
+            raise OSError("synthetic report storage failure")
+
+        monkeypatch.setattr("valuationagent.application.agent_runtime.write_report", unavailable)
+    result = runtime.calculate(CalculateValuation())
+    if storage_failure:
+        with pytest.raises(ValueError, match="REPORT_NOT_DELIVERED"):
+            runtime.finish(AgentResponse(answer="估值已经完成。"))
+        write_report(runtime.service, runtime.session, ReportWrite(format="md"))
+    else:
+        metadata, content = runtime.service.store.get_artifact(runtime.session.session_id, result["report_delivery"]["artifact_id"])
+        assert metadata["numeric_result_available"] and metadata["valuation_run_id"] == result["run_id"]
+        assert "40.00" in content.decode("utf-8")
+    assert runtime.finish(AgentResponse(answer="计算及数值报告已经完成。"))["_terminal"]
+
+
+def test_completion_guard_does_not_force_valuation_for_discussion_or_review(tmp_path):
+    from test_input_workspace import fixture, values
+    from valuationagent.application.agent_runtime import AgentResponse
+    from valuationagent.application.record_inputs import record_inputs
+    from valuationagent.application.turn_control import resolve_control
+    from valuationagent.schemas.control import TurnDecision
+
+    app, runtime = fixture(tmp_path)
+    record_inputs(runtime, values())
+    workspace = app.state.store.workspace_for_research(runtime.session.session_id)
+    workspace.run_policy = "review"
+    app.state.store.save_workspace(workspace)
+    assert runtime.finish(AgentResponse(answer="输入准备完成，等待审阅批准。", outcome="needs_input"))["_terminal"]
+    workspace.run_policy = "automatic"
+    app.state.store.save_workspace(workspace)
+    message = app.state.store.add_message(runtime.session.session_id, "user", "先只讨论，不要计算。", "agent")
+    runtime.session.turn_control, runtime.session.execution_permissions = resolve_control(runtime.session, message,
+        TurnDecision(summary="仅讨论", actions=["discuss"]))
+    assert runtime.finish(AgentResponse(answer="只讨论方法，不运行计算。"))["_terminal"]
+    assert not runtime.session.valuation_run_id
+
+
+def test_file_extraction_cannot_claim_saved_data_with_only_prose(tmp_path):
+    from test_input_workspace import fixture
+    from test_multisource_extraction import attach
+    from valuationagent.application.agent_runtime import AgentResponse
+    from valuationagent.application.turn_control import resolve_control
+    from valuationagent.schemas.control import TurnDecision
+
+    app, runtime = fixture(tmp_path)
+    attach(runtime, "report.txt", "营业收入100元")
+    message = app.state.store.add_message(runtime.session.session_id, "user", "提取文件数据，不估值", "agent")
+    runtime.session.turn_control, runtime.session.execution_permissions = resolve_control(runtime.session, message,
+        TurnDecision(summary="提取数据", actions=["ingest"]))
+    with pytest.raises(ValueError, match="INGESTION_NOT_SAVED"):
+        runtime.finish(AgentResponse(answer="已提取收入100元。"))
+    assert runtime.finish(AgentResponse(answer="文件没有提供年度，尚不能保存完整年度数据。", outcome="insufficient_data"))["_terminal"]
+    runtime.session.turn_control.decision.actions = ["read"]
+    assert runtime.finish(AgentResponse(answer="原文只写营业收入100元，没有年度。"))["_terminal"]

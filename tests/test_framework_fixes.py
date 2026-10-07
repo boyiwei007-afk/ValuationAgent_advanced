@@ -229,6 +229,10 @@ class ToolLLM:
         self.calls = []
 
     def chat(self, messages, **kwargs):
+        from control_fixtures import control_reply
+
+        if reply := control_reply(kwargs):
+            return reply
         self.calls.append((messages, kwargs))
         name, args = next(self.actions)
         return {

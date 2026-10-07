@@ -7,6 +7,23 @@ from test_multisource_extraction import runtime_at
 from test_observation_extraction import review, submit
 
 
+def test_ready_method_appears_before_other_method_gaps_without_executing(tmp_path):
+    from test_input_workspace import fixture, values
+    from valuationagent.application.record_inputs import record_inputs
+
+    _, runtime = fixture(tmp_path)
+    record_inputs(runtime, values())
+    runtime.session.draft.methods = ["dcf", "pe"]
+    plan = research_plan(runtime.session, runtime.service.valuation_assembler)
+    first = plan["next_work"][0]
+    assert first["kind"] == "calculate" and first["methods"] == ["pe"]
+    assert first["tool"] == "calculate_valuation" and "review" in first["instruction"]
+    assert any(item.get("method") == "dcf" and item["status"] == "blocked" for item in plan["next_work"])
+    assert runtime.session.valuation_run_id is None
+    runtime.session.pending_action = None
+    assert not any(item.get("kind") == "calculate" for item in research_plan(runtime.session, runtime.service.valuation_assembler)["next_work"])
+
+
 def test_empty_workspace_exposes_current_year_and_share_window_without_claiming_availability(tmp_path):
     runtime = runtime_at(tmp_path)
     plan = research_plan(runtime.session, runtime.service.valuation_assembler)

@@ -229,6 +229,10 @@ def test_report_is_immutable_and_not_a_numeric_valuation(tmp_path, format_name):
 
 def test_note_references_and_generated_files_do_not_become_sources(tmp_path):
     runtime = runtime_at(tmp_path)
+    with pytest.raises(ValueError, match="NOTE_REFERENCES_REQUIRED"):
+        write_note(runtime.service, runtime.session, NoteWrite(title="资料分析", body="没有引用的公司数据不能这样交付。"))
+    concept = write_note(runtime.service, runtime.session, NoteWrite(title="方法概念", body="只是概念说明。", basis="concept_note"))
+    assert concept["basis"] == "concept_note" and not concept["evidence_refs"]
     block = attach(runtime, "source.txt", "原文数字 123")[0]
     with pytest.raises(ValueError, match="NOTE_REFERENCE_INVALID"):
         write_note(runtime.service, runtime.session, NoteWrite(title="笔记", body="说明", evidence_ids=["another_workspace:1"]))

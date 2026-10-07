@@ -34,7 +34,8 @@ def acceptance_checks(snapshot, failure=None):
         if value.is_finite():
             numeric_methods.append(method)
     calculated = bool(run.get("run_id") and run.get("status") in {"completed", "completed_with_warnings"}
-                      and (run.get("request") or {}).get("mode") == "snapshot" and numeric_methods)
+                      and (run.get("request") or {}).get("mode") == "snapshot"
+                      and (run.get("request") or {}).get("analysis_basis", "research") == "research" and numeric_methods)
     matching_report = bool(calculated and any(
         artifact.get("kind") == "result_report" and artifact.get("numeric_result_available") is True
         and artifact.get("valuation_run_id") == run["run_id"]
@@ -71,7 +72,7 @@ def main():
     parser.add_argument("--objective")
     parser.add_argument("--base-url", default=os.getenv("VALUATION_LLM_BASE_URL"))
     parser.add_argument("--model", default=os.getenv("VALUATION_LLM_MODEL"))
-    parser.add_argument("--tool-call-format", choices=["native", "json_content"],
+    parser.add_argument("--tool-call-format", choices=["native", "json_content", "native_json", "qwen3_coder"],
                         default=os.getenv("VALUATION_LLM_TOOL_CALL_FORMAT", "native"))
     parser.add_argument("--reasoning-protocol", choices=["auto", "chat_template"],
                         default=os.getenv("VALUATION_LLM_REASONING_PROTOCOL", "auto"))
@@ -113,12 +114,22 @@ def main():
     client = OpenAICompatibleClient(ModelConnectionInput(provider="openai_compatible", base_url=args.base_url,
         model=model_name, api_key=key, thinking=os.getenv("VALUATION_LLM_THINKING", "auto"),
         tool_call_format=args.tool_call_format, reasoning_protocol=args.reasoning_protocol,
-        temperature=float(os.getenv("VALUATION_LLM_TEMPERATURE", "0")), timeout_seconds=180))
+        temperature=float(os.getenv("VALUATION_LLM_TEMPERATURE", "0")),
+        top_p=float(os.environ["VALUATION_LLM_TOP_P"]) if os.getenv("VALUATION_LLM_TOP_P") else None,
+        presence_penalty=float(os.environ["VALUATION_LLM_PRESENCE_PENALTY"]) if os.getenv("VALUATION_LLM_PRESENCE_PENALTY") else None,
+        top_k=int(os.environ["VALUATION_LLM_TOP_K"]) if os.getenv("VALUATION_LLM_TOP_K") else None,
+        timeout_seconds=float(os.getenv("VALUATION_LLM_TIMEOUT_SECONDS", "180")),
+        output_token_budget=int(os.getenv("VALUATION_LLM_OUTPUT_TOKEN_BUDGET", "8192")),
+        max_output_tokens=int(os.getenv("VALUATION_LLM_MAX_OUTPUT_TOKENS", "16384"))))
     started = time.monotonic()
 
     class BudgetedModel:
         config = client.config
         calls = 0
+
+        @property
+        def last_response_metadata(self):
+            return client.last_response_metadata
 
         def chat(self, *positional, **keyword):
             if self.calls >= args.calls:
@@ -176,7 +187,9 @@ def main():
     facts = session.get("facts", [])
     checks = acceptance_checks(snapshot, failure)
     calculated = checks["numeric_valuation_completed"]
-    checks.update(report_integrity=False, frozen_input_replay=False)
+    checks.update(report_integrity=False, frozen_input_replay=False, provider_identity_audit=False,
+        response_bound_to_frozen_result=False, baseline_matches_observed_sources=False)
+    identity_audit = None
     validation_error = None
     if calculated:
         try:
@@ -186,7 +199,23 @@ def main():
                        and artifact.get("valuation_run_id") == run_id]
             checks["report_integrity"] = bool(reports) and all(
                 bool(service.store.get_artifact(workspace.research_session_id, artifact["artifact_id"])[1]) for artifact in reports)
-            checks["frozen_input_replay"] = replay_bundle(build_valuation_bundle(service.store, service.store.get_run(run_id)))["passed"]
+            record = service.store.get_run(run_id)
+            checks["frozen_input_replay"] = replay_bundle(build_valuation_bundle(service.store, record))["passed"]
+            delivered = next((event.payload["output"] for event in reversed(events)
+                if event.type == "tool.completed" and event.tool == "finish_response"
+                and event.payload.get("output", {}).get("delivery")), {})
+            delivery = delivered.get("delivery", {})
+            checks["response_bound_to_frozen_result"] = (delivery.get("schema") == "frozen-valuation-delivery-v1"
+                and delivery.get("run_id") == run_id and delivery.get("input_hash") == record.input_hash)
+            baseline = record.request.baseline_selection
+            observed = baseline.get("observed_available_target_periods", [])
+            checks["baseline_matches_observed_sources"] = bool(baseline) and (baseline.get("policy") == "user_selected"
+                or not observed or baseline.get("period_end") == max(observed))
+            from valuationagent.application.issuer_identity import audit_request_identities
+
+            identity_audit = audit_request_identities(service.store,
+                service.store.get_research(workspace.research_session_id), record.request)
+            checks["provider_identity_audit"] = identity_audit["status"] in {"verified", "not_applicable"}
         except (ValueError, KeyError, OSError) as exc:
             validation_error = str(exc)[:500]
     distinct = {(fact.get("peer_ticker", ""), fact["role"], fact["standard_metric"], fact["period"], fact["scope"], fact["normalized_value"])
@@ -197,6 +226,8 @@ def main():
         "source_revision_before": revision_before, "source_revision_after": revision_after,
         "tool_call_format": args.tool_call_format, "thinking": client.config.thinking, "reasoning_protocol": args.reasoning_protocol,
         "temperature": client.config.temperature,
+        "output_token_budget": client.config.output_token_budget, "max_output_tokens": client.config.max_output_tokens,
+        "timeout_seconds": client.config.timeout_seconds,
         "model_calls": model.calls, "elapsed_seconds": round(time.monotonic() - started),
         "fact_statuses": dict(Counter(fact["status"] for fact in facts)),
         "distinct_confirmed_values": len(distinct),
@@ -205,7 +236,7 @@ def main():
         "warnings": dict(Counter(warning for fact in facts for warning in fact.get("warnings", []))),
         "documents": len(session.get("documents", [])), "valuation_calculated": calculated,
         "valuation_and_report_complete": acceptance_exit_code(checks) == 0,
-        "acceptance_checks": checks, "validation_error": validation_error,
+        "acceptance_checks": checks, "validation_error": validation_error, "provider_identity_audit": identity_audit,
         "execution": snapshot.get("execution"),
         "latest_reply": next((item["content"] for item in reversed(snapshot.get("messages", [])) if item["role"] == "assistant"), ""),
         "artifacts": len(snapshot.get("artifacts", [])), "failure": failure,

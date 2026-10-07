@@ -18,7 +18,8 @@ from valuationagent.schemas.agent import ContextSnapshot
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(api[_ -]?key|token|secret|password)\s*[:=]\s*\S+"),
-    re.compile(r"\b(?:sk|tvly)-(?:[A-Za-z0-9_-]{12,})\b"),
+    re.compile(r"(?<![A-Za-z0-9_-])(?:sk|tvly)-(?:[A-Za-z0-9_-]{12,})(?![A-Za-z0-9_-])"),
+    re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{16,}-infoway(?![A-Za-z0-9_-])", re.I),
 )
 
 
@@ -27,6 +28,10 @@ def redact_context_text(value: str) -> str:
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
     return text
+
+
+def sensitive_spans(value: str) -> list[tuple[int, int]]:
+    return sorted({match.span() for pattern in _SECRET_PATTERNS for match in pattern.finditer(value)})
 
 
 def _terms(value: str) -> set[str]:
@@ -164,6 +169,8 @@ class LayeredContextManager:
         return list(reversed(rows))
 
     def snapshot(self, session, messages, *, query: str = "") -> ContextSnapshot:
+        messages = list(messages)
+        latest = next((message for message in reversed(messages) if message.role == "user"), None)
         if not query:
             query = next(
                 (message.content for message in reversed(messages) if message.role == "user"),
@@ -179,6 +186,8 @@ class LayeredContextManager:
             "data_source_preference": session.data_source_preference,
             "information_cutoff_date": str(session.information_cutoff_date or ""),
             "pending_action": session.pending_action,
+            "turn_control": session.turn_control.model_dump(mode="json") if session.turn_control else None,
+            "execution_permissions": {name: item.model_dump() for name, item in session.execution_permissions.items()},
             "pending_decision": session.pending_decision.model_dump() if session.pending_decision else None,
             "recent_searches": [
                 {key: item.get(key) for key in ("query", "purpose", "status", "source_ids")}
@@ -229,6 +238,7 @@ class LayeredContextManager:
             session_id=session.session_id,
             revision=session.revision,
             language=session.language,
+            current_request={"message_id": latest.message_id, "content": redact_context_text(latest.content)} if latest else {},
             summary="" if any(turn["content"] == redact_context_text(session.summary) for turn in recent) else redact_context_text(session.summary),
             task_state=state,
             confirmed_fact_ids=[

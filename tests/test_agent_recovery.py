@@ -35,6 +35,8 @@ class EmptySearch:
 
 
 def runtime_fixture(tmp_path, methods=None):
+    from control_fixtures import allow_tool_testing
+
     provider = EmptySearch()
     service = ResearchService(SQLiteRunStore(tmp_path), search_provider=provider)
     session = service.create()
@@ -43,6 +45,7 @@ def runtime_fixture(tmp_path, methods=None):
     session.draft.valuation_date = date(2026, 9, 30)
     session.draft.methods = methods or ["pe", "ps"]
     session.data_source_preference = "web"
+    allow_tool_testing(session, service.store)
     return WorkspaceAgentRuntime(service, session), provider
 
 
@@ -51,7 +54,10 @@ def test_read_advisory_preserves_sources_and_resets_only_on_saved_progress(tmp_p
     runtime.session.pending_action = "valuation"
     original = {"blocks": [{"text": "样本原文 100"}]}
     for _ in range(5):
-        assert runtime.progress_advisory("read_file", original) == original
+        result = runtime.progress_advisory("read_file", original)
+        assert result["blocks"] == original["blocks"]
+        assert result["reading_handoff"]["executed"] is False
+        assert "progress_advisory" not in result
     advised = runtime.progress_advisory("read_file", original)
     assert advised["blocks"] == original["blocks"]
     assert "progress_advisory" not in original

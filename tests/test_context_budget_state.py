@@ -8,6 +8,66 @@ from valuationagent.llm.agent import compact_tool_history, run_tool_loop
 from valuationagent.llm.client import ContextWindowError, LlmError
 
 
+def test_file_focus_context_recovers_without_repeating_tools_or_losing_current_request():
+    from valuationagent.core.tools import NoArguments, ToolRegistry, ToolSpec
+
+    calls = []
+    registry = ToolRegistry([ToolSpec("read_file", "read", NoArguments, lambda _: calls.append("read") or {"text": "document " * 1800}),
+        ToolSpec("finish", "done", NoArguments, lambda _: {"_terminal": True})])
+
+    class Model:
+        requests = 0
+        oversized = None
+
+        def chat(self, messages, **kwargs):
+            self.requests += 1
+            if self.requests == 3:
+                self.oversized = len(canonical(messages))
+                raise ContextWindowError("LLM_CONTEXT_LIMIT")
+            if self.requests == 4:
+                assert len(canonical(messages)) < self.oversized
+                assert messages[0]["content"] == "file scope authority"
+                assert "keep original date; do not search" in canonical(messages)
+                assert {item["function"]["name"] for item in kwargs["tools"]} == {"read_file", "finish"}
+            name = "read_file" if self.requests < 3 else "finish"
+            return {"tool_calls": [{"id": str(self.requests), "function": {"name": name, "arguments": "{}"}}]}
+
+    def adapt(messages, tools):
+        return [{"role": "system", "content": "file scope authority"},
+            {"role": "user", "content": canonical({"file_task": {"file_id": "owned"}, "current_request": "keep original date; do not search"})}, *messages[2:]], tools
+
+    model = Model()
+    result = run_tool_loop(model, [{"role": "system", "content": "main"}, {"role": "user", "content": "{}"}], registry,
+        lambda name, arguments, invoke: invoke(), request_adapter=adapt, max_rounds=3, max_context_chars=90000)
+    assert calls == ["read", "read"] and model.requests == 4
+    assert result["_agent_trace"]["context_recoveries"] == 1
+
+
+def test_review_context_limit_never_drops_original_proof_to_force_a_verdict():
+    from valuationagent.core.tools import NoArguments, ToolRegistry, ToolSpec
+
+    packet = {"packets": [{"fact_id": "fact"}], "original_context": {"block": "source " * 500}}
+    registry = ToolRegistry([ToolSpec("review_observations", "review", NoArguments, lambda _: pytest.fail("must not execute"))])
+
+    class Model:
+        calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            assert json.loads(messages[-1]["content"]) == packet
+            raise ContextWindowError("LLM_CONTEXT_LIMIT")
+
+    def adapt(messages, tools):
+        return [{"role": "system", "content": "review scope"}, {"role": "user", "content": "{}"},
+            {"role": "assistant", "tool_calls": [{"id": "packet", "function": {"name": "prepare_observation_review", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "packet", "content": canonical(packet)}], tools
+
+    model = Model()
+    with pytest.raises(ContextWindowError):
+        run_tool_loop(model, [], registry, lambda name, arguments, invoke: invoke(), request_adapter=adapt)
+    assert model.calls == 1
+
+
 def workspace_state():
     return {"context": {"summary": "stale narrative " * 100, "recent_turns": [
         {"role": "assistant", "content": "outdated guess " * 100},
@@ -87,3 +147,73 @@ def test_large_workspace_metadata_cannot_crowd_out_latest_tool_error():
     assert output["outcome"]["ok"] is False
     assert output["outcome"]["error"]["code"] == "REPEATED_READ"
     assert "仅使用上传文件" in compacted[1]["content"]
+
+
+def test_omitted_provider_result_retains_typed_candidate_recovery_instead_of_raw_read_loop():
+    from valuationagent.llm.agent import omitted_tool_result
+
+    original = {"documents": [{"file_id": "file_abc", "input_candidates": {"items": [
+        {"candidate_id": "file_abc@0:revenue", "original_amount": "120", "unit": "元"}]}}]}
+    result = json.loads(omitted_tool_result(canonical(original)))
+    assert result["candidate_reads"] == [{"tool": "list_input_candidates", "arguments": {"file_id": "file_abc"}}]
+    assert "original_amount" not in result
+
+
+def test_preparation_projection_preserves_action_not_bulk_input_evidence():
+    from valuationagent.llm.agent import model_tool_result, omitted_tool_result
+
+    original = {"ready_for_review": True, "status": "ready_for_review", "methods": ["pe"],
+        "requested_methods": ["dcf", "pe"], "excluded_methods": {"dcf": "missing cash"},
+        "degraded": True, "instruction": "调用calculate_valuation冻结可执行方法；review模式等待批准。",
+        "input_records": [{"input_id": f"input_{index}", "source": {"quote": "evidence " * 100}}
+                          for index in range(100)], "financials": {"net_income_parent": "100"}}
+    wire = model_tool_result(original)
+    assert len(canonical(wire)) < 1500
+    assert wire["input_records_count"] == 100
+    assert "input_records" not in wire
+    assert wire["input_records_retrieve_with"] == {"tool": "inspect_inputs", "arguments": {"section": "records"}}
+    assert len(original["input_records"]) == 100
+    omitted = json.loads(omitted_tool_result(canonical(wire)))
+    for key in ("ready_for_review", "methods", "requested_methods", "excluded_methods", "degraded", "instruction"):
+        assert omitted["outcome"][key] == original[key]
+
+
+def test_preparation_projection_keeps_blocked_state_and_does_not_rewrite_valuation_results():
+    from valuationagent.llm.agent import model_tool_result, omitted_tool_result
+
+    blocked = {"ready_for_review": False, "status": "building_model", "blocking_reason": "missing shares",
+        "instruction": "录入已有股数，不补零。"}
+    result = json.loads(omitted_tool_result(canonical(blocked)))["outcome"]
+    assert result["ready_for_review"] is False and result["blocking_reason"] == "missing shares"
+    request = {"input_records": [{"input_id": "input_original", "value": "100"}]}
+    assert model_tool_result(request) == request
+
+
+def test_compaction_retains_partial_completion_instead_of_erasing_valuation_progress():
+    completion = {"requested_methods": ["pe", "ev_ebitda"], "completed_methods": ["pe"],
+        "remaining_methods": {"ev_ebitda": "可比B缺少显式租赁负债"}, "all_requested_methods_completed": False}
+    state = workspace_state()
+    state["valuation"] = {"run_id": "run_partial", "status": "completed_with_warnings",
+        "method_completion": completion, "result": {"large_diagnostics": "data " * 10000}}
+    before = copy.deepcopy(state)
+    compacted = compact_tool_history([{"role": "system", "content": "policy"},
+        {"role": "user", "content": canonical(state)}], 2500)
+    projected = json.loads(compacted[1]["content"])["valuation"]
+    assert projected["method_completion"] == completion
+    assert projected["run_id"] == "run_partial" and projected["status"] == "completed_with_warnings"
+    assert projected["retrieve_with"] == "read_valuation"
+    assert state == before and len(canonical(compacted)) <= 2500
+
+
+def test_omitted_calculation_keeps_remaining_methods_and_actual_report_receipt():
+    from valuationagent.llm.agent import omitted_tool_result
+
+    completion = {"completed_methods": ["pe"], "remaining_methods": {"ev_ebitda": "缺少可比B现金"},
+        "all_requested_methods_completed": False}
+    delivery = {"status": "saved", "artifact_id": "artifact_actual", "download_url": "/api/workspaces/work/artifacts/artifact_actual"}
+    original = {"run_id": "run_partial", "status": "completed_with_warnings", "method_completion": completion,
+        "report_delivery": delivery, "result": {"large_diagnostics": "data " * 10000}}
+    outcome = json.loads(omitted_tool_result(canonical(original)))["outcome"]
+    assert outcome["method_completion"] == completion
+    assert outcome["report_delivery"] == delivery
+    assert outcome["run_id"] == "run_partial"

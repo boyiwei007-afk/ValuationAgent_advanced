@@ -22,12 +22,15 @@ from test_agent_recovery import EmptySearch
 
 
 def runtime_at(tmp_path, company="样本科技股份有限公司", ticker="600123"):
+    from control_fixtures import allow_tool_testing
+
     service = ResearchService(SQLiteRunStore(tmp_path), search_provider=EmptySearch())
     session = service.create(data_source_preference="web")
     session.draft.company = company
     session.draft.ticker = ticker
     session.draft.methods = ["pe", "ps"]
     session.draft.valuation_date = date(2026, 9, 30)
+    allow_tool_testing(session, service.store)
     return WorkspaceAgentRuntime(service, session)
 
 
@@ -206,12 +209,20 @@ class RecordsClient:
     def __init__(self):
         self.calls = []
 
-    def query(self, statement, **kwargs):
+    def query_snapshot(self, statement, **kwargs):
+        from valuationagent.market.tushare import TushareSnapshot
+
         self.calls.append((statement, kwargs))
         baseline = {"ts_code": "600123.SH", "report_type": "1", "end_date": "20251231", "f_ann_date": "20260420", "revenue": "1000"}
-        return [baseline, {**baseline, "end_date": "20241231", "f_ann_date": "20250420", "revenue": "900"},
+        rows = [baseline, {**baseline, "end_date": "20241231", "f_ann_date": "20250420", "revenue": "900"},
                 {**baseline, "f_ann_date": "20271010"}, {**baseline, "ts_code": "000999.SZ"},
                 {**baseline, "report_type": "6"}, {**baseline, "f_ann_date": None}]
+        if statement == "stock_basic":
+            baseline = {"ts_code": "600123.SH", "name": "样本科技", "fullname": "样本科技股份有限公司", "industry": "半导体", "list_date": "20100101"}
+            rows = [baseline]
+        fields = list(baseline)
+        raw = json.dumps({"code": 0, "data": {"fields": fields, "items": [[row.get(field) for field in fields] for row in rows]}}).encode()
+        return TushareSnapshot(raw=raw, fields=fields, records=rows)
 
 
 def test_structured_history_is_dated_scoped_cached_evidence_not_automatic_facts(tmp_path):
@@ -223,12 +234,12 @@ def test_structured_history_is_dated_scoped_cached_evidence_not_automatic_facts(
     assert result["documents"][0]["accepted_records"] == 2
     assert result["documents"][0]["excluded_records"] == 4
     assert not runtime.session.facts
-    document = runtime.session.documents[0]
+    document = next(document for document in runtime.session.documents if ":income:" in document.provider)
     assert document.authority_tier == "B" and document.sha256
     raw = runtime.service.store.get_file(document.file_id)
     assert raw["original_name"].endswith(".json")
     assert fetch_history(runtime, request)["documents"][0]["cached"]
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
     blocks = runtime.service.store.research_blocks(runtime.session.session_id, document.file_id)
     result = propose_batch(runtime, FinancialBatch.model_validate({"defaults": {"unit": "元", "scope": "consolidated"},
         "rows": [{"block_id": block["block_id"], "metric": "营业收入", "raw_value": value, "period": period, "start_line": 5, "end_line": 5}

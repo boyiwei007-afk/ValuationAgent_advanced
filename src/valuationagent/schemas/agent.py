@@ -22,6 +22,7 @@ class ContextSnapshot(ApiModel):
     revision: int = Field(default=1, ge=1)
     language: Language = Language.ZH_CN
     summary: str = Field(default="", max_length=4000)
+    current_request: dict[str, str] = Field(default_factory=dict)
     task_state: dict[str, Any] = Field(default_factory=dict)
     confirmed_fact_ids: list[str] = Field(default_factory=list, max_length=500)
     evidence_ids: list[str] = Field(default_factory=list, max_length=500)

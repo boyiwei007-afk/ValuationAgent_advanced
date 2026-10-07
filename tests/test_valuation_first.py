@@ -83,7 +83,7 @@ def test_multiple_batches_to_one_review_to_dcf_sensitivity_reports_and_replay(tm
         ("propose_forecast", forecast(first["file_id"] + ":1")),
         ("calculate_valuation", {}),
         ("finish_response", {"answer": "已完成确定性计算，预测是明确标注的假设。"}),
-    ])
+    ], turn_actions=("value",))
     service._clients[session.session_id] = model
     service.store.save_research(session)
     workspaces = ValuationWorkspaceService(service.store, service, ValuationRunner(service.store, FinanceTeamModel()))
@@ -100,7 +100,8 @@ def test_multiple_batches_to_one_review_to_dcf_sensitivity_reports_and_replay(tm
     assert result.result.dcf and result.result.sensitivity and result.result.sensitivity_studies
     assert len(result.result.forecast) == 10
     assert result.request.financials.revenue == history()[-1].revenue
-    assert "模型推断" in result.request.assumption_evidence["wacc"][0].note
+    assert result.request.assumption_evidence["wacc"][0].source == "forecast_assumption"
+    assert "不是历史事实" in result.request.assumption_evidence["wacc"][0].note
     assert replay_bundle(build_valuation_bundle(service.store, result))["passed"]
     report = ValuationReportExporter()
     assert "预测与FCFF" in load_workbook(BytesIO(report.xlsx(result))).sheetnames

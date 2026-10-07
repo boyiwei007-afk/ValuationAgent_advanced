@@ -60,7 +60,7 @@ def test_bare_command_configures_model_and_uses_workspace_agent(terminal, monkey
 
 
 def test_in_terminal_configuration_hides_key_and_checks_connection(monkeypatch):
-    responses = iter(["https://models.example.test/v1", "test-model", "json_content", "chat_template", "disabled", 0.6, "synthetic-secret"])
+    responses = iter(["https://models.example.test/v1", "test-model", "json_content", "chat_template", "disabled", 0.6, 8192, 16384, 180, "synthetic-secret"])
     prompts = []
     checked = []
 
@@ -80,7 +80,8 @@ def test_in_terminal_configuration_hides_key_and_checks_connection(monkeypatch):
     assert model.config.thinking == "disabled"
 
 
-def test_optional_market_connection_stays_in_process_without_fetching(terminal, monkeypatch):
+@pytest.mark.parametrize("provider_name", ["tushare", "infoway"])
+def test_optional_market_connection_stays_in_process_without_fetching(terminal, monkeypatch, provider_name):
     runner, service = terminal
     monkeypatch.setattr(cli, "configure_model", lambda current=None: ScriptedModel())
     prompts = []
@@ -89,7 +90,8 @@ def test_optional_market_connection_stays_in_process_without_fetching(terminal, 
         return "synthetic-market-token"
     monkeypatch.setattr(cli.typer, "prompt", prompt)
     monkeypatch.setattr(cli.TushareApiClient, "query", lambda *args, **kwargs: pytest.fail("configuration should not fetch"))
-    result = runner.invoke(cli.app, [], input="/market\n/exit\n")
+    monkeypatch.setattr(cli.InfowayApiClient, "query", lambda *args, **kwargs: pytest.fail("configuration should not fetch"))
+    result = runner.invoke(cli.app, [], input=f"/market {provider_name}\n/exit\n")
     assert result.exit_code == 0, result.output
     assert prompts[-1]["hide_input"]
     assert "synthetic-market-token" not in result.output

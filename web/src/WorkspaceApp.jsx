@@ -60,13 +60,25 @@ function InterpretationProgress({ plan }) {
   return <section className="ws-artifacts" aria-label="文档理解与复核"><h3>文档理解与复核</h3><p>{counts.semantic_review_pending || 0} 项待复核 · {counts.semantic_review_supported || 0} 项已获 LLM 支持</p><small>原文定位 ≠ 语义正确 ≠ 模型准入；同一 LLM 的复核不等于独立审计。</small>{recovery.slice(-3).map(item => <div key={item.file_id}><div><b>读取恢复 · {item.failure_count} 次失败</b><small>{item.latest_issues.join('；')}</small><small>下一步候选：{item.next_choices.map(choice => choice.arguments?.view || choice.tool).join(' / ')}。由 Agent 选择，不重复下载。</small></div></div>)}</section>
 }
 
+function UserInputs({ dataset }) {
+  if (!dataset) return null
+  const superseded = new Set(dataset.records.flatMap(item => item.supersedes || []))
+  const active = dataset.records.filter(item => !superseded.has(item.input_id))
+  const hasSources = active.some(item => item.source.kind !== 'user')
+  const heading = hasSources ? '模型输入工作区' : '用户输入情景'
+  return <section className="ws-artifacts" aria-label={heading}><h3>{heading} · {active.length} 项有效输入</h3><p>{hasSources ? '来源数据与用户假设分别保留；供应商契约校验、LLM复核都不等于独立审计。' : '用于按用户给数试算，未经外部事实核验；不要求先搜索年报。'}</p>{active.map(item => <div key={item.input_id}><div><b>{item.role === 'comparable' ? `可比 ${item.entity_ticker || item.entity} · ` : ''}{item.metric} · {item.original_amount}{item.source.kind !== 'user' ? ` ${item.unit}` : ''}</b><small>期间：{item.period_end || '未指定'} · 存量时点：{item.as_of || '未指定'}</small><small>{item.source.kind === 'user' ? '用户消息' : item.source.provider_binding?.contract_version ? '供应商字段契约校验' : '来源解释已复核'}：{item.source.source_id} · {item.source.quote}</small></div></div>)}{Object.values(dataset.comparables || {}).map(peer => <div key={peer.ticker}><div><b>{peer.name} · {peer.ticker} · {peer.enabled ? '可比候选' : '已剔除'}</b><small>Agent选样判断，未独立核验：{peer.rationale}</small></div></div>)}</section>
+}
+
 function ArtifactShelf({ artifacts, onDownload }) {
   if (!artifacts.length) return null
   return <section className="ws-artifacts" aria-label="文件交付"><h3>文件交付 · 可追溯版本</h3><p>研究笔记不是原始证据；敏感性试算不改原模型；结果报告的计算状态由系统标记。</p>{artifacts.slice(0, 12).map(artifact => <div key={artifact.artifact_id}><div><b>{artifact.kind === 'research_note' ? '研究笔记 · 未审阅' : artifact.kind === 'interruption_report' ? '执行中断报告 · 估值未完成' : artifact.kind === 'sensitivity_analysis' ? '敏感性分析 · 假设试算' : '结果 / 缺口报告'} · {artifact.filename}</b><small>v{artifact.number} · {artifact.status} · 输入修订 {artifact.source_revision} · {Math.ceil(artifact.size_bytes / 1024)} KB</small><small>SHA-256 {artifact.sha256.slice(0, 20)}</small></div><button type="button" onClick={() => onDownload(artifact)}>下载</button></div>)}</section>
 }
 
 function ModelModal({ current, onClose, onConnected }) {
-  const [form, setForm] = useState({ provider: 'openai_compatible', base_url: 'https://api.openai.com/v1', model: '', api_key: '', thinking: 'auto', reasoning_protocol: 'auto', temperature: 0, tool_call_format: 'native', supports_images: false })
+  const [form, setForm] = useState(() => {
+    const defaults = { provider: 'openai_compatible', base_url: 'https://api.openai.com/v1', model: '', thinking: 'auto', reasoning_protocol: 'auto', temperature: 0, top_p: null, presence_penalty: null, top_k: null, tool_call_format: 'native', supports_images: false, output_token_budget: 8192, max_output_tokens: 16384, timeout_seconds: 180 }
+    return { ...Object.fromEntries(Object.entries(defaults).map(([key, value]) => [key, current && key in current ? current[key] : value])), api_key: '' }
+  })
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const chooseModel = model => {
@@ -90,9 +102,17 @@ function ModelModal({ current, onClose, onConnected }) {
       <details><summary>自定义接口</summary>
         <label className="field">接口地址<input type="url" required value={form.base_url} onChange={e => setForm(old => ({ ...old, base_url: e.target.value }))}/></label>
         <label className="field">采样温度<input type="number" min="0" max="2" step="0.05" value={form.temperature ?? ''} onChange={e => setForm(old => ({ ...old, temperature: e.target.value === '' ? null : Number(e.target.value) }))}/><small>按模型部署建议填写；留空不发送此参数。固定温度不保证推理可复现。</small></label>
+        <button type="button" className="button secondary" onClick={() => setForm(old => ({ ...old, temperature: old.thinking === 'disabled' ? 0.7 : 1, top_p: old.thinking === 'disabled' ? 0.8 : 0.95, presence_penalty: 1.5, top_k: 20 }))}>应用 Qwen3.6 通用采样建议</button>
+        <small>仅适用于支持这些参数的 Qwen 服务；不修改模型、思考模式、工具协议或预算。采样建议不是估值准确性保证。</small>
+        <label className="field">Top P<input type="number" min="0.01" max="1" step="0.01" value={form.top_p ?? ''} onChange={e => setForm(old => ({ ...old, top_p: e.target.value === '' ? null : Number(e.target.value) }))}/></label>
+        <label className="field">Presence penalty<input type="number" min="-2" max="2" step="0.1" value={form.presence_penalty ?? ''} onChange={e => setForm(old => ({ ...old, presence_penalty: e.target.value === '' ? null : Number(e.target.value) }))}/></label>
+        <label className="field">Top K<input type="number" min="1" max="1000" value={form.top_k ?? ''} onChange={e => setForm(old => ({ ...old, top_k: e.target.value === '' ? null : Number(e.target.value) }))}/><small>可选采样参数留空则不发送；不支持 Top K 的 OpenAI 兼容服务请留空。</small></label>
         <label className="field">思考模式<select value={form.thinking} onChange={e => setForm(old => ({ ...old, thinking: e.target.value }))}><option value="auto">自动</option><option value="enabled">开启</option><option value="disabled">关闭</option></select></label>
+        <label className="field">单次输出预算（tokens）<input type="number" min="512" max="131072" required value={form.output_token_budget} onChange={e => setForm(old => ({ ...old, output_token_budget: Number(e.target.value) }))}/><small>包含思考和工具JSON，不是只计算答案。默认8192；仍受远端模型总上下文限制。</small></label>
+        <label className="field">自动扩展上限（tokens）<input type="number" min={form.output_token_budget} max="131072" required value={form.max_output_tokens} onChange={e => setForm(old => ({ ...old, max_output_tokens: Number(e.target.value) }))}/><small>仅思考耗尽且该调用未执行工具时有限扩展；不切换模型或思考模式。增大会增加延迟与计费。</small></label>
+        <label className="field">单次模型请求超时（秒）<input type="number" min="2" max="600" required value={form.timeout_seconds} onChange={e => setForm(old => ({ ...old, timeout_seconds: Number(e.target.value) }))}/></label>
         <label className="field">推理参数协议<select value={form.reasoning_protocol} onChange={e => setForm(old => ({ ...old, reasoning_protocol: e.target.value }))}><option value="auto">自动 / 默认接口</option><option value="chat_template">chat_template（SGLang / vLLM）</option></select><small>部署支持 enable_thinking 时选择 chat_template，思考模式才会传给该网关；不会修改远端启动参数。</small></label>
-        <label className="field">工具调用格式<select value={form.tool_call_format} onChange={e => setForm(old => ({ ...old, tool_call_format: e.target.value }))}><option value="native">标准 tool_calls（默认）</option><option value="json_content">JSON 内容工具调用（网关兼容）</option></select><small>仅当服务把工具调用返回在文本内容中时选择 JSON；不解析普通聊天文字，也不改变财务准入。</small></label>
+        <label className="field">工具调用格式<select value={form.tool_call_format} onChange={e => setForm(old => ({ ...old, tool_call_format: e.target.value }))}><option value="native">标准 tool_calls（默认）</option><option value="json_content">JSON 内容工具调用（网关兼容）</option><option value="native_json">原生工具请求 + JSON 响应（显式适配）</option><option value="qwen3_coder">Qwen 原生标签（本地严格解析）</option></select><small>仅按服务实际格式选择。Qwen 模式使用原生工具提示而不强制服务端 JSON 解码，仍须完整调用、已注册参数和全部后端校验；不解析普通聊天文字，不自动更改模型或思考模式。</small></label>
       </details>
       <label className="field">API Key<input type="password" autoComplete="off" required value={form.api_key} onChange={e => setForm(old => ({ ...old, api_key: e.target.value }))}/></label>
       <label className="field"><span><input type="checkbox" checked={form.supports_images} onChange={e => setForm(old => ({ ...old, supports_images: e.target.checked }))}/> 此接口支持图片，并允许发送选定页图（可选，可能增加计费）</span><small>不会自动切换模型。只支持文本的接口请保持关闭。</small></label>
@@ -104,23 +124,25 @@ function ModelModal({ current, onClose, onConnected }) {
 
 function DataModal({ current, onClose, onConnected }) {
   const [tavily, setTavily] = useState('')
-  const [tushare, setTushare] = useState('')
+  const [marketProvider, setMarketProvider] = useState('infoway')
+  const [marketKey, setMarketKey] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const submit = async event => {
     event.preventDefault(); setBusy(true); setError('')
     try {
-      await onConnected({ ...(tavily.trim() ? { tavily_api_key: tavily.trim(), verify_search: true } : {}), ...(tushare.trim() ? { tushare_token: tushare.trim() } : {}) })
+      await onConnected({ ...(tavily.trim() ? { tavily_api_key: tavily.trim(), verify_search: true } : {}), ...(marketKey.trim() ? { [marketProvider === 'infoway' ? 'infoway_api_key' : 'tushare_token']: marketKey.trim() } : {}) })
     } catch (err) { setError(err.message) } finally { setBusy(false) }
   }
   return <Modal title="连接数据服务" onClose={busy ? () => {} : onClose}>
-    <p className="modal-intro">Tavily 用于公开网页与行业资料，交易所公告检索无需密钥；Tushare 用于 A 股结构化取数。没有完整数据时系统会有界搜索、降级方法或输出缺口说明，不会无限轮询。</p>
+    <p className="modal-intro">Tavily 用于公开网页与行业资料，交易所公告检索无需密钥；Infoway / Tushare 用于结构化财务取数。连接配置不代表数据已经核验，缺失的单位、口径与披露时间需补证。密钥只在服务进程中保存。</p>
     <div className="ws-service-state"><span className={current?.search?.available ? 'on' : ''}>网页检索 {current?.search?.available ? '可用' : '未连接'}</span><span className={current?.market?.available ? 'on' : ''}>结构化行情 {current?.market?.available ? '可用' : '未连接'}</span></div>
     <form onSubmit={submit}>
       <label className="field">Tavily API Key<input type="password" autoComplete="off" value={tavily} onChange={e => setTavily(e.target.value)}/></label>
-      <label className="field">Tushare Token（可选）<input type="password" autoComplete="off" value={tushare} onChange={e => setTushare(e.target.value)}/></label>
+      <label className="field">结构化数据供应商<select value={marketProvider} onChange={e => { setMarketProvider(e.target.value); setMarketKey('') }}><option value="infoway">Infoway</option><option value="tushare">Tushare</option></select></label>
+      <label className="field">{marketProvider === 'infoway' ? 'Infoway API Key' : 'Tushare Token'}（可选）<input type="password" autoComplete="off" value={marketKey} onChange={e => setMarketKey(e.target.value)}/></label>
       <ErrorNotice message={error}/>
-      <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={busy || (!tavily.trim() && !tushare.trim())}>{busy ? '正在连接…' : '连接服务'}</button></div>
+      <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={busy || (!tavily.trim() && !marketKey.trim())}>{busy ? '正在连接…' : '连接服务'}</button></div>
     </form>
   </Modal>
 }
@@ -206,8 +228,8 @@ function ResultOverview({ run, report, findings, decision, onRevise, onDownload,
   if (!result) return <div className="ws-empty-panel"><Icon name="chart" size={32}/><h3>{working ? '正在形成估值结果' : terminalReport?.status_label || '尚未形成数值估值'}</h3><p>{working ? 'Agent 正在按模型缺口自动取证与核验；完成后只呈现可计算结果，或一次性说明无法计算的原因。' : terminalReport?.conclusion || 'Agent 会先完成取证和模型准备，集中复核后才进入确定性计算。'}</p>{terminalReport && <button className="button secondary" onClick={() => onDownload('pdf')}>下载当前说明报告</button>}</div>
   const relative = result.relative?.filter(item => item.status === 'success') || []
   return <div className="ws-result"><div className="ws-result-hero"><div><small>综合结论</small><h2>{result.executive_summary}</h2><p>{result.reconciliation?.conclusion}</p></div><span className={`grade grade-${result.data_quality?.result_grade}`}>质量 {result.data_quality?.result_grade}<small>{result.data_quality?.confidence} confidence</small></span></div>
-    <div className="ws-value-cards">{result.dcf && <div><span>DCF 每股价值</span><b>{Number(result.dcf.per_share_value).toFixed(2)}</b><small>{Number(result.dcf.range_low).toFixed(2)} – {Number(result.dcf.range_high).toFixed(2)} {result.currency}</small></div>}{relative.map(item => <div key={item.method}><span>{item.method.toUpperCase()} 每股价值</span><b>{Number(item.per_share_value).toFixed(2)}</b><small>{Number(item.range_low).toFixed(2)} – {Number(item.range_high).toFixed(2)} · {item.sample_size} 家样本</small></div>)}</div>
-    <div className="ws-summary-grid"><section><h3>核心假设</h3><p>WACC <b>{(Number(result.assumptions.wacc) * 100).toFixed(2)}%</b></p><p>永续增长率 <b>{(Number(result.assumptions.terminal_growth) * 100).toFixed(2)}%</b></p><p>证据覆盖率 <b>{(Number(result.data_quality.evidence_coverage) * 100).toFixed(0)}%</b></p></section><section><h3>挑战层结论</h3><p>{decision?.selected_action || '挑战层将在结果完成后独立检查数据、终值、方法与敏感性。'}</p><small>{findings?.filter(item => ['high', 'blocking'].includes(item.severity)).length || 0} 项高风险 / 阻塞发现</small></section></div>
+    <div className="ws-value-cards">{result.dcf && <div><span>DCF 每股价值</span><b>{Number(result.dcf.per_share_value).toFixed(2)}</b><small>{Number(result.dcf.range_low).toFixed(2)} – {Number(result.dcf.range_high).toFixed(2)} {result.currency}</small></div>}{relative.map(item => <div key={item.method}><span>{item.method.toUpperCase()} 每股价值</span><b>{Number(item.per_share_value).toFixed(2)}</b><small>{item.valuation_basis === 'explicit_multiple' ? `指定倍数 ${item.selected_multiple} · 情景点值，非统计区间` : `${Number(item.range_low).toFixed(2)} – ${Number(item.range_high).toFixed(2)} · ${item.sample_size} 家样本`}</small></div>)}</div>
+    <div className="ws-summary-grid"><section><h3>核心假设</h3>{result.dcf ? <><p>WACC <b>{(Number(result.assumptions.wacc) * 100).toFixed(2)}%</b></p><p>永续增长率 <b>{(Number(result.assumptions.terminal_growth) * 100).toFixed(2)}%</b></p></> : <p>相对估值不使用 WACC 或永续增长率。</p>}{relative.filter(item => item.valuation_basis === 'explicit_multiple').map(item => <p key={item.method}>{item.method.toUpperCase()} 指定倍数 <b>{item.selected_multiple}</b> · 用户假设</p>)}<p>证据覆盖率 <b>{(Number(result.data_quality.evidence_coverage) * 100).toFixed(0)}%</b></p></section><section><h3>挑战层结论</h3><p>{decision?.selected_action || '挑战层将在结果完成后独立检查数据、终值、方法与敏感性。'}</p><small>{findings?.filter(item => ['high', 'blocking'].includes(item.severity)).length || 0} 项高风险 / 阻塞发现</small></section></div>
     <div className="ws-inline-actions"><button className="button primary" onClick={onRevise}>调整参数并重算</button><button className="button secondary" onClick={() => onDownload('xlsx')}>下载 Excel 底稿</button><button className="button secondary" onClick={() => onDownload('pdf')}>下载 PDF 报告</button></div>
   </div>
 }
@@ -468,9 +490,10 @@ export default function WorkspaceApp() {
           {messages.filter(item => ['user', 'assistant'].includes(item.role)).map(message => <article key={message.message_id} className={`ws-message ${message.role}`}><span>{message.role === 'user' ? '我' : <Icon name="spark" size={16}/>}</span><div><small>{message.role === 'user' ? '你' : 'ValuationAgent'}</small>{message.role === 'assistant' ? <MessageBody content={message.content}/> : <p>{message.content}</p>}</div></article>)}
           {snapshot?.plan?.length > 0 && <ol className="ws-agent-plan" aria-label="Agent 任务计划">{snapshot.plan.map((step, index) => <li key={index} data-status={step.status}><span>{step.status === 'completed' ? '✓' : step.status === 'in_progress' ? '◉' : '○'}</span>{step.title}</li>)}</ol>}
           {session?.pending_decision && !isWorking && <section className="ws-decision-prompt" aria-label="方案选择"><h3>{session.pending_decision.question}</h3><div>{session.pending_decision.options.map((option, index) => <button key={option.label} disabled={!modelAvailable} onClick={() => setInput(`关于“${session.pending_decision.question}”，我选择${option.label}。${option.description ? `具体方案：${option.description}` : ''}`)}><strong>{String.fromCharCode(65 + index)} · {option.label}</strong><span>{option.description}</span></button>)}</div><small>点击方案填入下方输入框，补充或修改后发送；也可以直接输入自己的方案。选择不等于批准数值计算。</small></section>}
-          {session?.resume_context?.reason && !isWorking && <section className="ws-resume-card"><b>已保存续做检查点 · {session.resume_context.reason}</b><p>下一轮先核验已有资料与字段修复，再继续尚未处理的年度或可比样本，不重跑上一轮检索。</p><button className="button secondary" disabled={!modelAvailable} onClick={() => send({ content: '从保存的检查点继续，先检查已有事实修复和逐年覆盖，再处理其他未完成目标；不要重复上轮无进展检索。' })}>从检查点继续</button></section>}
+          {session?.resume_context?.reason && !isWorking && <section className="ws-resume-card"><b>已保存续做检查点 · {session.resume_context.reason}</b><p>{session.resume_context.instruction || '保留已完成工作，继续未完成目标；不重复已成功的工具。'}</p><button className="button secondary" disabled={!modelAvailable} onClick={() => send({ content: '从保存的检查点继续完成原请求，遵守已有约束；不重复已成功的工具，不把模型调用失败误判成资料缺失。' })}>从检查点继续</button></section>}
           <EvidenceProgress plan={snapshot?.research_plan}/>
           <InterpretationProgress plan={snapshot?.research_plan}/>
+          <UserInputs dataset={snapshot?.research?.session?.input_dataset}/>
           <ArtifactShelf artifacts={snapshot?.artifacts || []} onDownload={downloadSaved}/>
           {isWorking && <div className="ws-working"><span className="mini-spinner"/><div><b>{run && ['created', 'running'].includes(run.status) ? '确定性金融模型正在计算' : 'Agent 正在推进估值任务'}</b><small>{execution?.stage ? `当前步骤：${execution.stage}` : '正在根据模型需要取证、核验或生成结果'}</small></div></div>}
           {run?.result && <div className="ws-suggestions"><button onClick={() => send({ content: '解释本次 WACC 的计算依据和每个组成部分' })}>为什么 WACC 是这个数？</button><button onClick={() => send({ content: '下钻解释企业价值到股权价值的桥接过程' })}>下钻权益桥</button><button onClick={() => setModal('revision')}>调参重算</button></div>}

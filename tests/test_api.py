@@ -28,7 +28,7 @@ def test_api_run_events_results_and_conversation(tmp_path):
     from valuationagent.schemas.research import ResearchTurn
 
     app, service, workspace, _ = completed_workspace(
-        tmp_path, ScriptedModel(("read_valuation", {}), ("finish_response", {"answer": "WACC 已列在计算假设中。"}))
+        tmp_path, ScriptedModel(("read_valuation", {}), ("finish_response", {"answer": "WACC 已列在计算假设中。"}), actions=("discuss",))
     )
     record = app.state.store.get_run(workspace.active_run_id)
     with TestClient(app) as client:

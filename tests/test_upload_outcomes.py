@@ -63,8 +63,10 @@ def payload(extension):
 
 @pytest.mark.parametrize("extension", ["pdf", "docx", "xlsx", "csv", "tsv", "html", "json", "txt", "md"])
 def test_uploaded_formats_reach_evidence_checked_candidate(tmp_path, extension):
+    from test_research_sessions import ScriptedModel
+
     service = ResearchService(SQLiteRunStore(tmp_path))
-    session = service.create(data_source_preference="web")
+    session = service.create(data_source_preference="web", llm=ScriptedModel([]))
     session.draft = ResearchDraft(company="测试股份", ticker="600123", industry="电子", methods=["ps"], valuation_date=date(2026, 6, 30))
     service.store.save_research(session)
     meta = service.store.save_upload("财务." + extension, "historical_financials", None, payload(extension))
@@ -86,8 +88,11 @@ def test_uploaded_formats_reach_evidence_checked_candidate(tmp_path, extension):
 
 @pytest.mark.parametrize("kind", ["broken_pdf", "encrypted_pdf", "no_text_pdf", "bad_docx", "bad_xlsx", "bad_json"])
 def test_bad_upload_is_isolated_other_files_and_report_survive(tmp_path, kind):
+    from test_research_sessions import ScriptedModel
+
     service = ResearchService(SQLiteRunStore(tmp_path))
-    session = service.create(data_source_preference="web")
+    session = service.create(data_source_preference="web", llm=ScriptedModel([
+        ("finish_response", {"answer": "尚未形成可计算输入，不生成估值。", "outcome": "insufficient_data"})]))
     session.draft = ResearchDraft(company="测试股份", methods=["dcf"], valuation_date=date(2026, 6, 30))
     service.store.save_research(session)
     suffix = kind.rsplit("_", 1)[-1]

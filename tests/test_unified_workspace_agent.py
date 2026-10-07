@@ -15,11 +15,16 @@ from valuationagent.schemas.workspace import WorkspaceFact
 
 
 class ScriptedModel:
-    def __init__(self, *steps):
+    def __init__(self, *steps, actions=("research", "value", "sensitivity", "report")):
         self.steps = list(steps)
         self.calls = []
+        self.actions = actions
 
     def chat(self, messages, **kwargs):
+        from control_fixtures import control_reply
+
+        if reply := control_reply(kwargs, actions=self.actions):
+            return reply
         self.calls.append(messages)
         name, arguments = self.steps.pop(0)
         return {"tool_calls": [{"id": "call_" + str(len(self.calls)),
@@ -58,7 +63,7 @@ def completed_workspace(tmp_path, model=None):
 
 def test_every_turn_uses_same_agent_after_calculation_and_reconnect(tmp_path):
     first = ScriptedModel(("read_valuation", {"section": "summary"}),
-                          ("finish_response", {"answer": "已读取确定性结果，不需要再次估值。"}))
+                          ("finish_response", {"answer": "已读取确定性结果，不需要再次估值。"}), actions=("discuss",))
     app, service, workspace, _ = completed_workspace(tmp_path, first)
     service.message(workspace.workspace_id, ResearchTurn(content="解释本次结果"))
     snapshot = service.snapshot(workspace.workspace_id)
@@ -66,7 +71,7 @@ def test_every_turn_uses_same_agent_after_calculation_and_reconnect(tmp_path):
     assert len(first.calls) == 2
     assert not any(message.content == "解释本次结果"
         for message in app.state.store.list_messages(workspace.active_run_id))
-    second = ScriptedModel(("finish_response", {"answer": "新的模型仍在同一对话中。"}))
+    second = ScriptedModel(("finish_response", {"answer": "新的模型仍在同一对话中。"}), actions=("discuss",))
     service.research.attach(workspace.research_session_id, second)
     service.message(workspace.workspace_id, ResearchTurn(content="先聊聊方法，不重算"))
     assert service.snapshot(workspace.workspace_id)["messages"][-1]["content"] == "新的模型仍在同一对话中。"
@@ -78,6 +83,7 @@ def test_result_question_can_read_source_without_revising(tmp_path):
     model = ScriptedModel(
         ("read_document", {"file_id": upload["file_id"]}),
         ("finish_response", {"answer": "已核对保存的来源。", "evidence_ids": [upload["file_id"] + ":1"]}),
+        actions=("read",),
     )
     service.research.attach(workspace.research_session_id, model)
     service.message(workspace.workspace_id, ResearchTurn(content="核对结果引用的原文"))

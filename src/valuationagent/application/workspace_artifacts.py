@@ -21,7 +21,8 @@ class ReportWrite(ApiModel):
 class NoteWrite(ApiModel):
     title: str = Field(min_length=1, max_length=160)
     body: str = Field(min_length=1, max_length=12000)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=30)
+    basis: Literal["source_analysis", "concept_note"] = Field(default="source_analysis", description="source_analysis为基于资料的数据研究，必须引用真实原文块；concept_note仅为不声称公司数据的概念/方法说明。")
+    evidence_ids: list[str] = Field(default_factory=list, max_length=30, description="资料型笔记必填引用的真实block_id；不能只写文件名或空列表。")
 
 
 class ArtifactRead(ApiModel):
@@ -30,35 +31,60 @@ class ArtifactRead(ApiModel):
     limit: int = Field(default=8000, ge=1, le=16000)
 
 
+def report_delivery(service, session, metadata):
+    workspace = service.store.workspace_for_research(session.session_id)
+    return {**metadata, "download_url": f"/api/workspaces/{workspace.workspace_id}/artifacts/{metadata['artifact_id']}" if workspace else None,
+            "instruction": "已保存报告，可使用真实download_url或文件卡片下载；不要编造sandbox:/mnt/data路径。状态来自系统，不代表所有事实或假设已由用户批准。"}
+
+
 def write_report(service, session, args):
     service._check_execution()
     document = ensure_result_document(service, session)
+    input_hash = service.store.get_run(document["valuation_run_id"]).input_hash if document["numeric_result_available"] and document["valuation_run_id"] else None
+    payload, media_type = None, None
+    identity_document = document
+    if input_hash and args.format != "json":
+        identity_document = {key: value for key, value in document.items()
+            if key not in {"report_id", "source_revision", "generated_at"}}
+    identity = {"policy": "substantive-report-v1", "format": args.format,
+        "document": identity_document, "input_hash": input_hash}
+    if args.format == "json":
+        content, media_type = build_research_export(service, session.session_id, args.format, session=session)
+        payload = content.encode("utf-8")
+        identity["export_sha256"] = hashlib.sha256(payload).hexdigest()
+    report_identity = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    service._check_execution()
     for artifact in service.store.list_artifacts(session.session_id):
-        if artifact.get("kind") == "result_report" and artifact.get("report_id") == document["report_id"] and artifact["filename"] == "valuation-report." + args.format:
-            service.store.get_artifact(session.session_id, artifact["artifact_id"])
-            return artifact
+        if artifact.get("kind") == "result_report" and artifact.get("report_identity") == report_identity and artifact["filename"] == "valuation-report." + args.format:
+            metadata, _ = service.store.get_artifact(session.session_id, artifact["artifact_id"])
+            service._check_execution()
+            return report_delivery(service, session, metadata)
     if args.format == "md":
         content = "# 估值研究报告\n\n" + document["status_label"] + "\n\n"
         for heading, paragraphs in document_sections(document):
             content += "## " + heading + "\n\n" + "\n\n".join(paragraphs) + "\n\n"
         content += f"报告标识：{document['report_id']}\n输入修订：{document['source_revision']}\n"
         media_type = "text/markdown"
-    else:
+    elif payload is None:
         content, media_type = build_research_export(service, session.session_id, args.format, session=session)
-    payload = content.encode("utf-8") if isinstance(content, str) else content
+    if payload is None:
+        payload = content.encode("utf-8") if isinstance(content, str) else content
     service._check_execution()
     metadata = service.store.save_artifact(session.session_id, {
         "kind": "result_report", "filename": "valuation-report." + args.format, "media_type": media_type,
         "source_revision": document["source_revision"], "report_id": document["report_id"],
+        "report_identity": report_identity, "input_hash": input_hash,
         "status": document["status"], "numeric_result_available": document["numeric_result_available"],
         "valuation_run_id": document["valuation_run_id"], "prompt_version": session.prompt_version,
     }, payload)
-    return {**metadata, "instruction": "已保存不可覆盖的报告文件；状态来自系统，不代表所有事实或假设已由用户批准。"}
+    return report_delivery(service, session, metadata)
 
 
 def save_interruption_report(service, session, document, request_id):
     """Persist terminal bookkeeping without more model, network or parsing work."""
-    if session.pending_action != "valuation" or document["numeric_result_available"]:
+    from valuationagent.application.turn_control import artifact_output_allowed
+
+    if not artifact_output_allowed(session) or session.pending_action != "valuation" or document["numeric_result_available"]:
         return None
     for artifact in service.store.list_artifacts(session.session_id):
         if artifact.get("kind") == "interruption_report" and artifact.get("request_id") == request_id:
@@ -82,6 +108,8 @@ def save_interruption_report(service, session, document, request_id):
 
 
 def write_note(service, session, args):
+    if args.basis == "source_analysis" and not args.evidence_ids:
+        raise ValueError("NOTE_REFERENCES_REQUIRED: 资料型研究笔记须提供读到的真实block_id作为evidence_ids；正文中的文件名不是可追溯引用。无公司数据的概念说明才可用concept_note。")
     blocks = service._blocks(session)
     if any(block_id not in blocks for block_id in args.evidence_ids):
         raise ValueError("NOTE_REFERENCE_INVALID: 笔记引用必须来自当前工作区的原文。")
@@ -92,15 +120,21 @@ def write_note(service, session, args):
         document = documents.get(block_id.rsplit(":", 1)[0])
         reference["source_sha256"] = document.sha256 if document else ""
         reference["block_text_sha256"] = hashlib.sha256(blocks[block_id]["text"].encode("utf-8")).hexdigest()
+        reference["location"] = blocks[block_id].get("location", {})
     body = service._redact_text(args.body)
     title = service._redact_text(args.title).replace("\n", " ").replace("\r", " ")
     content = f"# {title}\n\n> LLM研究笔记 · 未审阅 · 不是确定性估值报告。正文观点与数值未因保存文件而通过核验。\n\n{body}\n\n## 原文定位\n\n"
-    content += "\n".join(f"- {item['name']} · 第{item['page'] or '?'}页 · {item['block_id']}" for item in references)
+    for item in references:
+        location = item["location"]
+        position = location.get("json_pointer") or (f"第{item['page']}页" if item["page"] else location.get("cell_range") or "原文块")
+        content += f"- {item['name']} · {position} · {item['block_id']}\n"
+    if not references:
+        content += "概念说明，无外部公司数据引用。\n"
     service._check_execution()
     return service.store.save_artifact(session.session_id, {
         "kind": "research_note", "filename": "research-note.md", "media_type": "text/markdown",
         "status": "unreviewed", "numeric_result_available": False, "source_revision": session.revision,
-        "prompt_version": session.prompt_version, "evidence_refs": references,
+        "prompt_version": session.prompt_version, "evidence_refs": references, "basis": args.basis,
     }, content.encode("utf-8"))
 
 
